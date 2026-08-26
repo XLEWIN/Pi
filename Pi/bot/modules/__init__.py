@@ -1,0 +1,1 @@
+"""Modules package — every module here is auto-loaded at startup."""

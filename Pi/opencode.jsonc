@@ -1,0 +1,13 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "default_agent": "openwork",
+  "plugin": [
+    "opencode-chrome-devtools"
+  ],
+  "permission": {
+    "external_directory": {
+      "C:/Users/pixlb/Downloads/AyuGram Desktop/boa2 (2)/*": "allow",
+      "C:/Users/pixlb/Downloads/MainSmash-update-ui-fix/*": "allow"
+    }
+  }
+}
