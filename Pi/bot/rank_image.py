@@ -38,6 +38,22 @@ COLOR_WHITE = (245, 245, 245)    # F5F5F5
 COLOR_MUTED = (220, 220, 220)    # DCDCDC
 COLOR_ICON = (8, 8, 8)           # 080808
 
+# ----------------------------- theme palettes --------------------------------
+# Maps template_id to (accent, pill_bg, track, fill, bright) colors
+THEME_COLORS = {
+    1: {"accent": (190, 45, 255), "pill": (80, 20, 100), "track": (100, 30, 120), "fill": (190, 45, 255), "bright": (190, 45, 255)},
+    2: {"accent": (255, 30, 35),  "pill": (100, 19, 22), "track": (128, 21, 25), "fill": (255, 30, 35),  "bright": (255, 30, 35)},
+    3: {"accent": (100, 200, 255),"pill": (30, 80, 120), "track": (40, 100, 140),"fill": (100, 200, 255),"bright": (100, 200, 255)},
+    4: {"accent": (115, 220, 45), "pill": (40, 80, 20),  "track": (50, 100, 30), "fill": (115, 220, 45), "bright": (115, 220, 45)},
+    5: {"accent": (220, 180, 50), "pill": (90, 70, 20),  "track": (110, 90, 30), "fill": (220, 180, 50), "bright": (220, 180, 50)},
+    6: {"accent": (210, 145, 40), "pill": (85, 60, 15),  "track": (105, 75, 25), "fill": (210, 145, 40), "bright": (210, 145, 40)},
+}
+
+
+def _get_theme_colors(template_id: int) -> dict:
+    """Get theme colors for a template, fallback to default red theme."""
+    return THEME_COLORS.get(template_id, THEME_COLORS[2])
+
 # ----------------------------- canvas metrics -------------------------------
 CANVAS_W, CANVAS_H = 1708, 750
 PAD_X = 95
@@ -280,6 +296,7 @@ def create_rank_card(
     global_messages,
     output_path,
     avatar_path=None,
+    template_id=2,
 ):
     """
     Build the rank card.
@@ -293,8 +310,16 @@ def create_rank_card(
       messages              statistic pill 2 value
       global_messages       statistic pill 3 value
       output_path           where the PNG is written
+      template_id           theme template (1-6)
     Returns output_path on success, None on failure.
     """
+    # Get theme colors
+    theme = _get_theme_colors(template_id)
+    c_bright = theme["bright"]
+    c_track = theme["track"]
+    c_fill = theme["fill"]
+    c_pill = theme["pill"]
+
     try:
         avatar_img = None
         if avatar_path and os.path.exists(avatar_path):
@@ -318,7 +343,7 @@ def create_rank_card(
         draw.text((TEXT_STACK_X * SCALE, (AVATAR_Y + 62) * SCALE), name_txt,
                   font=name_font, fill=COLOR_WHITE, anchor="lm")
         draw.text((TEXT_STACK_X * SCALE, (AVATAR_Y + 122) * SCALE), user_txt,
-                  font=user_font, fill=COLOR_BRIGHT, anchor="lm")
+                  font=user_font, fill=c_bright, anchor="lm")
 
         _draw_badge_text(canvas, badge_x, badge_y, rank_text)
 
@@ -329,23 +354,23 @@ def create_rank_card(
                   font=lf, fill=COLOR_WHITE, anchor="lm")
         num_w = draw.textlength(str(level), font=lf)
         draw.text(((PAD_X + 16) * SCALE + draw.textlength(label, font=lf), LEVEL_LABEL_Y * SCALE),
-                  str(level), font=lf, fill=COLOR_BRIGHT, anchor="lm")
+                  str(level), font=lf, fill=c_bright, anchor="lm")
 
         tx, ty, tw, th = BAR_X, BAR_Y, BAR_W, BAR_H
         _rounded(draw, (tx * SCALE, ty * SCALE, (tx + tw) * SCALE, (ty + th) * SCALE),
-                 th // 2 * SCALE, COLOR_TRACK)
+                 th // 2 * SCALE, c_track)
 
         pct = max(0.0, min(100.0, float(progress_pct or 0)))
         fill_w = int(tw * pct / 100)
         fill_w = min(max(fill_w, th // 2), tw - INDICATOR_R // 2)
         if pct > 0:
             _rounded(draw, (tx * SCALE, ty * SCALE, (tx + fill_w) * SCALE, (ty + th) * SCALE),
-                     th // 2 * SCALE, COLOR_RED)
+                     th // 2 * SCALE, c_fill)
         icx = min(tx + fill_w, tx + tw - INDICATOR_R - 6)
         icy = ty + th // 2
         draw.ellipse(((icx - INDICATOR_R) * SCALE, (icy - INDICATOR_R) * SCALE,
                       (icx + INDICATOR_R) * SCALE, (icy + INDICATOR_R) * SCALE),
-                     fill=COLOR_BRIGHT)
+                     fill=c_bright)
 
         nf = _font(NEXT_NUM_PAD * SCALE)
         num_txt = str(next_level)
@@ -370,13 +395,13 @@ def create_rank_card(
 
             px, py = col_x, PILL_Y
             _rounded(draw, (px * SCALE, py * SCALE, (px + PILL_W) * SCALE, (py + PILL_H) * SCALE),
-                     PILL_RADIUS * SCALE, COLOR_BURGUNDY)
+                     PILL_RADIUS * SCALE, c_pill)
 
             ccx = px + ICON_MARGIN_X + ICON_DIA // 2
             ccy = py + PILL_H // 2
             draw.ellipse(((ccx - ICON_DIA // 2) * SCALE, (ccy - ICON_DIA // 2) * SCALE,
                           (ccx + ICON_DIA // 2) * SCALE, (ccy + ICON_DIA // 2) * SCALE),
-                         fill=COLOR_BRIGHT)
+                         fill=c_bright)
             ICONS[icon_key](draw, ccx * SCALE, ccy * SCALE)
 
             val_txt, _ = _fit_text(draw, str(value), VALUE_SIZE * SCALE,
