@@ -1,15 +1,15 @@
-"""Start module — /start command with colored inline buttons via Telethon.
+"""Start module — /start command with colored inline buttons.
 
-Works in both private chats and groups.
+Works in both private chats and groups. Pure PTB implementation.
 """
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
 
 from bot.constants import BOT_DESCRIPTION, START_TEXT, URL_ADD_TO_GROUP, URL_OFFICIAL_CHANNEL, URL_NETWORK
 from bot.database import db
-from bot.telethon_client import get_client, btn_primary, btn_success, btn_danger, btn_url, build_keyboard
+from bot.keyboards.colored import btn_primary, btn_success, btn_url, build_keyboard
 
 # Log channel configuration
 LOG_CHANNEL_ID = -1003963429635
@@ -43,7 +43,7 @@ def format_user_log(user, action: str, chat_title: str = None) -> str:
 
 
 def build_start_keyboard():
-    """Build the start menu keyboard with colored buttons via Telethon."""
+    """Build the start menu keyboard with colored buttons."""
     buttons = [
         [
             btn_url("➕ Add Bot To Chat", URL_ADD_TO_GROUP),
@@ -92,40 +92,19 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             chat_title=chat.title
         )
     
-    # Send via Telethon with colored buttons
-    telethon_client = get_client()
+    # Send with colored buttons
     username = context.bot_data.get("username", "Phi π")
     text = START_TEXT.format(username=f"@{username}", description=BOT_DESCRIPTION)
     
-    if telethon_client:
-        try:
-            await telethon_client.send_message(
-                entity=chat.id,
-                message=text,
-                buttons=build_start_keyboard(),
-                parse_mode="html",
-            )
-            await update.message.delete()
-            return
-        except Exception as e:
-            print(f"Telethon send failed, falling back to Bot API: {e}")
-    
-    # Fallback to Bot API (no colors)
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    keyboard = [
-        [
-            InlineKeyboardButton("➕ Add Bot To Chat", url=URL_ADD_TO_GROUP),
-            InlineKeyboardButton("📖 Help Menu", callback_data="start:help"),
-        ],
-        [
-            InlineKeyboardButton("🌐 Dashboard", callback_data="start:dashboard"),
-        ],
-        [
-            InlineKeyboardButton("📢 Channel", url=URL_OFFICIAL_CHANNEL),
-            InlineKeyboardButton("🕸️ Network", url=URL_NETWORK),
-        ],
-    ]
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    try:
+        await update.message.reply_text(
+            text,
+            reply_markup=build_start_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+        await update.message.delete()
+    except Exception as e:
+        print(f"Failed to send start message: {e}")
 
 
 async def start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

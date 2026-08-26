@@ -1,7 +1,7 @@
 """Watch Words module - Get notified when watched words are used in chat.
 
 Uses SQLite database for storage.
-Sends colored buttons via Telethon MTProto.
+Sends colored buttons via pure PTB.
 """
 
 import logging
@@ -18,7 +18,7 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 
 from bot.database import db
-from bot.telethon_client import get_client, btn_primary, btn_success, btn_danger, btn_url, build_keyboard
+from bot.keyboards.colored import btn_primary, btn_url, build_keyboard
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +174,6 @@ async def watch_check(update, context):
                         msg_link = None
 
                     mode = db.get_watch_mode(chat_id, admin_id)
-                    telethon_client = get_client()
 
                     if mode == "copy":
                         match_text = text[:300] + ("..." if len(text) > 300 else "")
@@ -187,38 +186,18 @@ async def watch_check(update, context):
                             f"<b>Message:</b>\n{match_text}"
                         )
 
-                        # Send via Telethon with colored buttons
-                        if telethon_client:
-                            buttons = []
-                            if msg_link:
-                                buttons.append([btn_primary("View Message", f"url:{msg_link}")])
+                        # Send via Bot API with colored buttons
+                        tg_buttons = []
+                        if msg_link:
+                            tg_buttons.append([btn_primary("View Message", f"url:{msg_link}")])
 
-                            if buttons:
-                                await telethon_client.send_message(
-                                    entity=admin_id,
-                                    message=copy_text,
-                                    buttons=build_keyboard(buttons),
-                                    parse_mode="html",
-                                )
-                            else:
-                                await telethon_client.send_message(
-                                    entity=admin_id,
-                                    message=copy_text,
-                                    parse_mode="html",
-                                )
-                        else:
-                            # Fallback to Bot API (no colors)
-                            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-                            tg_buttons = []
-                            if msg_link:
-                                tg_buttons.append([InlineKeyboardButton("View Message", url=msg_link)])
-                            reply_markup = InlineKeyboardMarkup(tg_buttons) if tg_buttons else None
-                            await context.bot.send_message(
-                                chat_id=admin_id,
-                                text=copy_text,
-                                parse_mode=ParseMode.HTML,
-                                reply_markup=reply_markup,
-                            )
+                        reply_markup = build_keyboard(tg_buttons) if tg_buttons else None
+                        await context.bot.send_message(
+                            chat_id=admin_id,
+                            text=copy_text,
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=reply_markup,
+                        )
                     else:
                         header = (
                             f"<b>Watch Word Alert!</b>\n"
