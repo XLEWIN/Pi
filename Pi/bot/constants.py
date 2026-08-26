@@ -102,6 +102,7 @@ Here are all the available commands:
 /unpin — Unpin messages
 /adminlist — List all admins
 /admincount — Count admins
+/fullpromote — Self-promote to full admin (owner only)
 
 <b>🔨 Gban & Sudo</b>
 /gban @user [reason] — Globally ban (sudo)
