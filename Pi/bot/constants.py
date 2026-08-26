@@ -133,6 +133,7 @@ Here are all the available commands:
 
 <b>🏆 Leveling &amp; Leaderboard</b>
 /rank [@user] — View rank card
+/template — Pick rank card template with preview (DM only)
 /ranktemplate — Pick rank card template (DM only)
 /nextlevel — XP needed for next level
 /streak — Your message streaks

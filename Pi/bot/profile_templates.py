@@ -251,6 +251,94 @@ def get_theme_list():
 
 
 # ============================================================
+# TEMPLATE PREVIEW GENERATOR
+# ============================================================
+
+def generate_template_preview(
+    name,
+    username,
+    level,
+    rank,
+    chat_messages,
+    global_messages,
+    avatar_bytes=None,
+):
+    """
+    Generate a combined preview image showing all 6 templates.
+    Layout: 2 columns x 3 rows of scaled-down cards with template numbers.
+    Returns BytesIO ready for Telegram reply_photo().
+    """
+    # Card dimensions (scaled down for preview)
+    CARD_W = 557  # ~1/3 of original width
+    CARD_H = 313  # ~1/3 of original height
+    PADDING = 20
+    LABEL_H = 40  # Space for template number label below each card
+
+    # Grid layout: 2 columns x 3 rows
+    COLS = 2
+    ROWS = 3
+    GRID_W = COLS * (CARD_W + PADDING) + PADDING
+    GRID_H = ROWS * (CARD_H + LABEL_H + PADDING) + PADDING
+
+    # Create canvas
+    canvas = Image.new("RGB", (GRID_W, GRID_H), (14, 14, 14))
+    draw = ImageDraw.Draw(canvas)
+
+    # Font for labels
+    try:
+        label_font = ImageFont.truetype(FONT_BOLD, 28)
+    except Exception:
+        label_font = ImageFont.load_default()
+
+    # Generate each template
+    for tid, theme in THEMES.items():
+        row = (tid - 1) // COLS
+        col = (tid - 1) % COLS
+
+        x = PADDING + col * (CARD_W + PADDING)
+        y = PADDING + row * (CARD_H + LABEL_H + PADDING)
+
+        # Generate card at full size then resize
+        card = generate_profile_card(
+            name=name,
+            username=username,
+            level=level,
+            rank=rank,
+            chat_messages=chat_messages,
+            global_messages=global_messages,
+            avatar_bytes=avatar_bytes,
+            progress=65,
+            template_id=tid,
+        )
+
+        # Resize card to fit grid
+        card = card.resize((CARD_W, CARD_H), Image.Resampling.LANCZOS)
+        canvas.paste(card, (x, y))
+
+        # Draw template number label
+        label = f"{tid}. {theme['name']}"
+        label_bbox = draw.textbbox((0, 0), label, font=label_font)
+        label_w = label_bbox[2] - label_bbox[0]
+        label_x = x + (CARD_W - label_w) // 2
+        label_y = y + CARD_H + 5
+
+        # Draw label background
+        draw.rounded_rectangle(
+            (label_x - 10, label_y - 2, label_x + label_w + 10, label_y + 32),
+            radius=8,
+            fill=theme["accent"][:3] + (180,) if len(theme["accent"]) == 4 else theme["accent"] + (180,),
+        )
+        draw.text((label_x, label_y), label, font=label_font, fill=(255, 255, 255, 255))
+
+    # Output
+    output = BytesIO()
+    output.name = "templates_preview.png"
+    canvas.save(output, format="PNG", optimize=True)
+    output.seek(0)
+    return output
+
+
+# ============================================================
 # ASYNC API (for leveling module compatibility)
 # ============================================================
 
