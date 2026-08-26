@@ -30,11 +30,6 @@ class Settings:
     owner_id: int = _int_env("OWNER_ID", 0)
     bot_username: str = os.getenv("BOT_USERNAME", "Phi_RoBot")
 
-    # Telethon MTProto
-    telethon_api_id: int = _int_env("TELETHON_API_ID", 0)
-    telethon_api_hash: str = os.getenv("TELETHON_API_HASH", "")
-    telethon_session: str = os.getenv("TELETHON_SESSION", "Phi_bot")
-
 
 settings = Settings()
 

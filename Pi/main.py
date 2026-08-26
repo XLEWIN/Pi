@@ -1,9 +1,9 @@
-"""Phi pi - Hybrid entry point.
+"""Phi pi - Pure Bot API entry point.
 
-Runs both python-telegram-bot (Bot API) and Telethon (MTProto) together.
+Runs python-telegram-bot (Bot API) with colored inline buttons.
+No Telethon dependency.
 """
 
-import asyncio
 import signal
 import sys
 from datetime import datetime
@@ -16,8 +16,6 @@ from bot.constants import BOT_NAME
 from bot.loader import load_modules
 from bot.logger import logger
 from bot.database import db
-from bot import telethon_client
-from bot.modules import testcolors
 
 
 # ── Startup log ──────────────────────────────────────────
@@ -25,20 +23,11 @@ LOG_CHANNEL_ID = -1003963429635  # Phi_Logs
 
 
 async def post_init(app: Application) -> None:
-    """Fetch bot identity and start Telethon client."""
+    """Fetch bot identity and send startup log."""
     me = await app.bot.get_me()
     app.bot_data["username"] = me.username
     app.bot_data["name"] = me.full_name
     logger.info(f"Bot API connected as @{me.username} — {me.full_name}")
-
-    # Start Telethon client
-    telethon_ok = await telethon_client.init_client()
-    if telethon_ok:
-        logger.info("Hybrid mode: Bot API + Telethon (MTProto) active")
-        # Register Telethon callback handlers after client init
-        testcolors.register_telethon_handlers()
-    else:
-        logger.warning("Hybrid mode: Bot API only (Telethon disabled)")
 
     # Send startup log
     try:
@@ -49,7 +38,7 @@ async def post_init(app: Application) -> None:
             f"<b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
             f"<b>Modules:</b> Loaded\n"
             f"<b>Database:</b> Connected\n"
-            f"<b>Telethon:</b> {'Active' if telethon_ok else 'Disabled'}\n"
+            f"<b>Colored Buttons:</b> Active (Pure PTB)\n"
             f"<b>Logging:</b> Active\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━"
         )
@@ -66,12 +55,11 @@ async def post_init(app: Application) -> None:
 
 async def post_shutdown(app: Application) -> None:
     """Cleanup on shutdown."""
-    await telethon_client.disconnect_client()
     logger.info("Shutdown complete")
 
 
 def main() -> None:
-    logger.info(f"Starting {BOT_NAME} (Hybrid Mode)...")
+    logger.info(f"Starting {BOT_NAME} (Pure Bot API Mode)...")
 
     app = (
         Application.builder()
