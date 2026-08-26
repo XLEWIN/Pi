@@ -18,7 +18,7 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 
 from bot.database import db
-from bot.keyboards.colored import btn_primary, btn_url, build_keyboard
+from bot.keyboards.colored import btn_url, build_keyboard
 
 logger = logging.getLogger(__name__)
 
@@ -189,7 +189,7 @@ async def watch_check(update, context):
                         # Send via Bot API with colored buttons
                         tg_buttons = []
                         if msg_link:
-                            tg_buttons.append([btn_primary("View Message", f"url:{msg_link}")])
+                            tg_buttons.append([btn_url("View Message", msg_link)])
 
                         reply_markup = build_keyboard(tg_buttons) if tg_buttons else None
                         await context.bot.send_message(

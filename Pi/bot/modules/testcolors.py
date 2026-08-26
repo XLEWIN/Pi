@@ -1,11 +1,11 @@
-"""Test module — Demonstrates colored buttons via pure PTB.
+"""Test module — Demonstrates colored buttons via Bot API 9.4+.
 
 Sends a message with colored inline buttons and handles callback queries.
 """
 
 import logging
 
-from telegram import Update, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, filters
 from telegram.constants import ParseMode
 
