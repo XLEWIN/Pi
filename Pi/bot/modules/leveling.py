@@ -113,6 +113,7 @@ async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global_msgs = user_data.get("global_messages", 0)
     chat_msgs = chat_data.get("messages", 0)
     xp = user_data.get("global_xp", 0)
+    template_id = user_data.get("template", 2)
     needed = _get_xp_needed(level)
     progress_pct = min(int((xp % needed) / needed * 100), 100) if needed > 0 else 0
 
@@ -141,6 +142,7 @@ async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             global_messages=f"{global_msgs:,}",
             output_path=output_path,
             avatar_path=avatar_path,
+            template_id=template_id,
         )
 
         if result and os.path.exists(output_path):
