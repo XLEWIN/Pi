@@ -1,9 +1,9 @@
 """Start module — /start command with colored inline buttons.
 
-Works in both private chats and groups. Pure PTB implementation.
+Works in both private chats and groups. Uses Bot API 9.4+ button styling.
 """
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
 

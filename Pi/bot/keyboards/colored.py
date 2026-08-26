@@ -1,46 +1,38 @@
-"""Pure PTB colored inline button helpers.
+"""Colored inline keyboards (Bot API 9.4+ style via api_kwargs).
 
-Telegram's Bot API doesn't support colored button backgrounds (that's a
-premium MTProto feature). This module provides clean helpers that use
-emoji-based visual indicators to achieve a similar look.
-
-Usage:
-    from bot.keyboards.colored import btn_primary, btn_success, build_keyboard
-    from telegram import InlineKeyboardMarkup
-
-    buttons = [
-        [btn_primary("Help", "start:help"), btn_success("Dashboard", "start:dashboard")],
-    ]
-    markup = InlineKeyboardMarkup(build_keyboard(buttons))
+Uses Telegram's native button styling:
+- primary  → Blue
+- success  → Green
+- danger   → Red
 """
 
-from typing import List, Optional, Union
+from typing import List
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 
 # ── Button builders ──────────────────────────────────────
 def btn_primary(text: str, data: str) -> InlineKeyboardButton:
-    """Blue/primary styled button."""
-    return InlineKeyboardButton(f"🔵 {text}", callback_data=data)
+    """Blue/primary colored button."""
+    return InlineKeyboardButton(text, callback_data=data, api_kwargs={"style": "primary"})
 
 
 def btn_success(text: str, data: str) -> InlineKeyboardButton:
-    """Green/success styled button."""
-    return InlineKeyboardButton(f"🟢 {text}", callback_data=data)
+    """Green/success colored button."""
+    return InlineKeyboardButton(text, callback_data=data, api_kwargs={"style": "success"})
 
 
 def btn_danger(text: str, data: str) -> InlineKeyboardButton:
-    """Red/danger styled button."""
-    return InlineKeyboardButton(f"🔴 {text}", callback_data=data)
+    """Red/danger colored button."""
+    return InlineKeyboardButton(text, callback_data=data, api_kwargs={"style": "danger"})
 
 
 def btn_default(text: str, data: str) -> InlineKeyboardButton:
-    """Default/white styled button."""
-    return InlineKeyboardButton(f"⚪ {text}", callback_data=data)
+    """Default/white colored button."""
+    return InlineKeyboardButton(text, callback_data=data)
 
 
 def btn_url(text: str, url: str) -> InlineKeyboardButton:
-    """URL button (no color indicator)."""
+    """URL button."""
     return InlineKeyboardButton(text, url=url)
 
 
@@ -62,20 +54,7 @@ async def send_colored_buttons(
     delete_original: bool = False,
     original_message=None,
 ):
-    """Send a message with colored buttons via Bot API.
-
-    Args:
-        context: PTB ContextTypes.DEFAULT_TYPE
-        chat_id: Target chat
-        message: Message text
-        buttons: 2D list of InlineKeyboardButton
-        parse_mode: Parse mode for message text
-        delete_original: If True, delete the original command message
-        original_message: The original message to delete
-
-    Returns:
-        Sent Message or None on failure
-    """
+    """Send a message with colored buttons via Bot API."""
     try:
         reply_markup = build_keyboard(buttons)
         result = await context.bot.send_message(
