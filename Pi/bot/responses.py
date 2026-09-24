@@ -1,12 +1,11 @@
 """Pi Bot action reply cards — branded success/error layouts.
 
-Style (structure inspired by community promote cards, emojis = Pi set only):
+Style (mixed case + tree branches):
 
-    ✅ PROMOTION SUCCESSFUL~
-
-    👤 USER: Name (123456789)
-    👑 PROMOTED BY: Actor
-    💼 TITLE: ADMIN
+    ✅ Promotion Successful
+    ├ 👤 User: Name (123456789)
+    ├ 👑 Promoted By: Actor
+    ├ 💼 Title: Admin
 
 All HTML uses bot.emojis.E / custom <tg-emoji> — never stock foreign emoji.
 """
@@ -68,9 +67,9 @@ def actor_label(user: Optional[UserLike]) -> str:
 
 
 def _header_line(icon: str, title: str) -> str:
-    # Trailing ~ matches the reference card style; title always UPPER + bold.
-    clean = escape(title.strip().upper())
-    return f"{icon} <b>{clean}~</b>"
+    # Mixed-case header (no forced UPPER, no trailing ~).
+    clean = escape(title.strip())
+    return f"{icon} {clean}"
 
 
 def action_card(
@@ -81,15 +80,21 @@ def action_card(
 ) -> str:
     """Build a branded action card.
 
-    title: e.g. "PROMOTION SUCCESSFUL" (forced UPPER)
-    fields: list of (emoji_html, "LABEL", "value_html") — LABEL forced UPPER
+    title: e.g. "Promotion Successful" (casing preserved)
+    fields: list of (emoji_html, "Label", "value_html") — casing preserved;
+            each field line is prefixed with ├ to match the tree style:
+
+        🏆 Rank: Trainer
+        ├ Next: Elite Trainer
+        ├ Progress: 139 / 6,000 XP
+
     icon: header icon; defaults to first field icon or E.CHECK
     """
     head_icon = icon or (fields[0][0] if fields else E.CHECK)
-    lines = [_header_line(head_icon, title), ""]
+    lines = [_header_line(head_icon, title)]
     for em, label, value in fields:
-        lab = escape(label.strip().rstrip(":").upper())
-        lines.append(f"{em} {lab}: {value}")
+        lab = escape(label.strip().rstrip(":"))
+        lines.append(f"├ {em} {lab}: {value}")
     return "\n".join(lines)
 
 
@@ -105,7 +110,7 @@ def success_card(
 def error_card(title: str, detail: str, *, icon: Optional[str] = None) -> str:
     return action_card(
         title,
-        [(E.INFO, "DETAIL", detail)],
+        [(E.INFO, "Detail", detail)],
         icon=icon or E.ERROR,
     )
 
@@ -113,22 +118,22 @@ def error_card(title: str, detail: str, *, icon: Optional[str] = None) -> str:
 # ── Field builders ─────────────────────────────────────────────
 
 def field_user(user: Optional[UserLike]) -> Field:
-    return (E.USER, "USER", user_label(user))
+    return (E.USER, "User", user_label(user))
 
 
-def field_by(user: Optional[UserLike], label: str = "BY") -> Field:
-    """e.g. PROMOTED BY / BANNED BY / MUTED BY / WARNED BY"""
+def field_by(user: Optional[UserLike], label: str = "By") -> Field:
+    """e.g. Promoted By / Banned By / Muted By / Warned By"""
     return (E.CROWN, label, actor_label(user))
 
 
 def field_reason(reason: Optional[str]) -> Field:
     text = escape(reason or "No reason provided")
-    return (E.INFO, "REASON", text)
+    return (E.INFO, "Reason", text)
 
 
 def field_duration(duration: Optional[str]) -> Field:
     text = escape(str(duration)) if duration else "Permanent"
-    return (E.TIME, "DURATION", text)
+    return (E.TIME, "Duration", text)
 
 
 def field_extra(emoji: str, label: str, value: str) -> Field:
@@ -136,15 +141,15 @@ def field_extra(emoji: str, label: str, value: str) -> Field:
 
 
 def field_count(current: int, limit: int) -> Field:
-    return (E.WARN, "WARNINGS", f"{current}/{limit}")
+    return (E.WARN, "Warnings", f"{current}/{limit}")
 
 
 def field_title(role: str) -> Field:
-    return (E.SETTINGS, "TITLE", escape(str(role).upper()))
+    return (E.SETTINGS, "Title", escape(str(role)))
 
 
 def field_status(value: str) -> Field:
-    return (E.INFO, "STATUS", escape(str(value).upper()))
+    return (E.INFO, "Status", escape(str(value)))
 
 
 # ── Common one-liners (still branded) ──────────────────────────

@@ -101,15 +101,15 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     fields = [
         field_user(display_user),
-        field_extra(E.STAR, "REPUTATION", _fmt(score)),
-        field_extra(E.INFO, "MESSAGES", _fmt(messages)),
-        field_extra(E.TIME, "ACTIVE SINCE", f"{active_days} days"),
-        field_extra(E.MEDAL_1, "RANK", f"#{rank}"),
-        field_extra(E.CHECK, "POSITIVE ACTIONS", str(pos)),
-        field_extra(E.WARN, "WARNINGS", str(warns)),
-        field_extra(E.BAN, "RESTRICTIONS", str(restr)),
+        field_extra(E.STAR, "Reputation", _fmt(score)),
+        field_extra(E.INFO, "Messages", _fmt(messages)),
+        field_extra(E.TIME, "Active Since", f"{active_days} days"),
+        field_extra(E.MEDAL_1, "Rank", f"#{rank}"),
+        field_extra(E.CHECK, "Positive Actions", str(pos)),
+        field_extra(E.WARN, "Warnings", str(warns)),
+        field_extra(E.BAN, "Restrictions", str(restr)),
     ]
-    text = action_card("USER PROFILE", fields, icon=E.USER)
+    text = action_card("User Profile", fields, icon=E.USER)
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 

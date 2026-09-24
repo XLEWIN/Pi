@@ -165,7 +165,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg_sum = stats.get("messages", 0)
 
     active = db.get_active_member_count(chat_id, days=days)
-    label = period.upper()
+    label = period.capitalize()
 
     # Trend: compare to previous equal window when we have history.
     trend = "—"
@@ -189,16 +189,16 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     fields = [
-        field_extra(E.FIRE, "MESSAGES", f"{_fmt(msg_sum)} ({label})"),
-        field_extra(E.INFO, "TREND", escape(trend)),
-        field_extra(E.USER, "ACTIVE MEMBERS", str(active)),
-        field_extra(E.NEW, "NEW MEMBERS", str(stats.get("new_members", 0))),
-        field_extra(E.GOODBYE, "LEFT MEMBERS", str(stats.get("left_members", 0))),
-        field_extra(E.WARN, "MOD ACTIONS", str(stats.get("mod_actions", 0))),
-        field_extra(E.CROSS, "SPAM ATTEMPTS", str(stats.get("spam_attempts", 0))),
-        field_extra(E.WEB, "BIND FAILS", str(stats.get("bind_fails", 0))),
+        field_extra(E.FIRE, "Messages", f"{_fmt(msg_sum)} ({label})"),
+        field_extra(E.INFO, "Trend", escape(trend)),
+        field_extra(E.USER, "Active Members", str(active)),
+        field_extra(E.NEW, "New Members", str(stats.get("new_members", 0))),
+        field_extra(E.GOODBYE, "Left Members", str(stats.get("left_members", 0))),
+        field_extra(E.WARN, "Mod Actions", str(stats.get("mod_actions", 0))),
+        field_extra(E.CROSS, "Spam Attempts", str(stats.get("spam_attempts", 0))),
+        field_extra(E.WEB, "Bind Fails", str(stats.get("bind_fails", 0))),
     ]
-    text = action_card("ANALYTICS DASHBOARD", fields, icon=E.SETTINGS)
+    text = action_card("Analytics Dashboard", fields, icon=E.SETTINGS)
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
@@ -228,7 +228,7 @@ async def topactive_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     medals = [E.MEDAL_1, E.MEDAL_2, E.MEDAL_3]
-    lines = [f"{E.FIRE} <b>TOP ACTIVE ({period.upper()})~</b>", ""]
+    lines = [f"{E.FIRE} <b>Top Active ({period.capitalize()})</b>", ""]
     for i, entry in enumerate(top):
         name = entry.get("first_name") or entry.get("username") or str(entry["user_id"])
         medal = medals[i] if i < 3 else f"{i+1}."
@@ -264,7 +264,7 @@ async def peakhours_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    lines = [f"{E.TIME} <b>PEAK HOURS ({days}D)~</b>", ""]
+    lines = [f"{E.TIME} <b>Peak Hours ({days}d)</b>", ""]
     for i, p in enumerate(peaks):
         h = int(p["hour"])
         medal = [E.MEDAL_1, E.MEDAL_2, E.MEDAL_3][i] if i < 3 else f"{i+1}."

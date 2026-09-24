@@ -63,7 +63,7 @@ def format_user_log(user, action: str, chat_title: str = None) -> str:
     username = f"@{escape(user.username)}" if user.username else "No username"
     raw_name = user.full_name or user.first_name or "Unknown"
     # Uppercase BEFORE escaping so we don't produce &LT; entities.
-    name = escape(raw_name.upper())
+    name = escape(raw_name)
 
     log_text = f"👤 <b>{name}</b> {escape(action)}\n"
     log_text += f"🆔 User ID: <code>{user.id}</code>\n"

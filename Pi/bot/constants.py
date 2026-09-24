@@ -42,6 +42,21 @@ Here are all the available commands:
 /topactive [day|week|month] — Most active users (admin)
 /peakhours [days] — Busiest hours (admin)
 
+<b>{web} Instagram Downloader</b>
+/igdl &lt;url&gt; — Download a post/reel (or reply to a link)
+/igsettings [auto on|off] [max N] — Auto-download settings (admin)
+/igstats — Downloader metrics (admin)
+/igcache [clear] — file_id cache (owner)
+/igbenchmark &lt;url&gt; — Time a resolve (owner)
+Auto: Instagram links in groups/DMs download automatically when enabled.
+
+<b>{announce} Mass Tagging</b>
+/all — Tag members (reply to a message) (admin)
+/tagabort — Stop a running tag (admin)
+/allsettings [mode|window|max|batch|send|registry] [value] — Tag settings (admin)
+/tagstats — Tagging stats (admin)
+Tags order by presence &amp; recent activity; admins &amp; bots are never tagged.
+
 <b>{mute} Moderation</b>
 
 <b>Mute Commands</b>
