@@ -1,15 +1,29 @@
 """Admin module — Promote, demote, pin, admin list, and admin-only actions.
 
 Adapted from boa2's admin for Pi bot (python-telegram-bot).
+Success replies use bot.responses action cards (Pi emoji set).
 """
 
 import logging
+from html import escape
 
 from telegram import Update, ChatMember, ChatPermissions
 from telegram.ext import Application, CommandHandler, ContextTypes, filters
 from telegram.constants import ParseMode
 
 from bot.emojis import E
+from bot.responses import (
+    action_card,
+    actor_label,
+    field_by,
+    field_extra,
+    field_title,
+    field_user,
+    mention,
+    plain_error,
+    reply_card,
+    user_label,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,12 +108,21 @@ async def promote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             can_promote_members=False,
             can_manage_video_chats=True,
         )
-        await update.message.reply_text(
-            f"{E.CHECK} Promoted <a href='tg://user?id={target.id}'>{target.first_name}</a> to admin.",
-            parse_mode=ParseMode.HTML,
+        await reply_card(
+            update.message,
+            action_card(
+                "PROMOTION SUCCESSFUL",
+                [
+                    field_user(target),
+                    field_by(update.effective_user, "PROMOTED BY"),
+                    field_title("ADMIN"),
+                ],
+                icon=E.CHECK,
+            ),
+            user=target,
         )
     except Exception as e:
-        await update.message.reply_text(f"{E.ERROR} Failed to promote: {e}",
+        await update.message.reply_text(plain_error(f"Failed to promote: {e}"),
             parse_mode=ParseMode.HTML)
 
 
@@ -135,12 +158,21 @@ async def demote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             can_promote_members=False,
             can_manage_video_chats=False,
         )
-        await update.message.reply_text(
-            f"{E.CHECK} Demoted <a href='tg://user?id={target.id}'>{target.first_name}</a>.",
-            parse_mode=ParseMode.HTML,
+        await reply_card(
+            update.message,
+            action_card(
+                "DEMOTION SUCCESSFUL",
+                [
+                    field_user(target),
+                    field_by(update.effective_user, "DEMOTED BY"),
+                    field_title("MEMBER"),
+                ],
+                icon=E.CROSS,
+            ),
+            user=target,
         )
     except Exception as e:
-        await update.message.reply_text(f"{E.ERROR} Failed to demote: {e}",
+        await update.message.reply_text(plain_error(f"Failed to demote: {e}"),
             parse_mode=ParseMode.HTML)
 
 
@@ -169,13 +201,31 @@ async def pin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             disable_notification=silent,
         )
         if silent:
-            await update.message.reply_text(f"{E.PIN} Message pinned silently.",
-            parse_mode=ParseMode.HTML)
+            await reply_card(
+                update.message,
+                action_card(
+                    "MESSAGE PINNED",
+                    [
+                        field_by(update.effective_user, "PINNED BY"),
+                        field_extra(E.INFO, "MODE", "SILENT"),
+                    ],
+                    icon=E.PIN,
+                ),
+            )
         else:
-            await update.message.reply_text(f"{E.PIN} Message pinned.",
-            parse_mode=ParseMode.HTML)
+            await reply_card(
+                update.message,
+                action_card(
+                    "MESSAGE PINNED",
+                    [
+                        field_by(update.effective_user, "PINNED BY"),
+                        field_extra(E.INFO, "MODE", "NOTIFICATION ON"),
+                    ],
+                    icon=E.PIN,
+                ),
+            )
     except Exception as e:
-        await update.message.reply_text(f"{E.ERROR} Failed to pin: {e}",
+        await update.message.reply_text(plain_error(f"Failed to pin: {e}"),
             parse_mode=ParseMode.HTML)
 
 
@@ -199,10 +249,23 @@ async def unpin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await context.bot.unpin_all_chat_messages(update.effective_chat.id)
-        await update.message.reply_text(f"{E.PIN} Message unpinned.",
-            parse_mode=ParseMode.HTML)
+        await reply_card(
+            update.message,
+            action_card(
+                "MESSAGE UNPINNED",
+                [
+                    field_by(update.effective_user, "UNPINNED BY"),
+                    field_extra(
+                        E.INFO,
+                        "SCOPE",
+                        "Single message" if update.message.reply_to_message else "All pins",
+                    ),
+                ],
+                icon=E.PIN,
+            ),
+        )
     except Exception as e:
-        await update.message.reply_text(f"{E.ERROR} Failed to unpin: {e}",
+        await update.message.reply_text(plain_error(f"Failed to unpin: {e}"),
             parse_mode=ParseMode.HTML)
 
 
@@ -224,19 +287,25 @@ async def adminlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 admin_list.append(admin.user)
 
-        text = f"{E.CROWN} <b>Admins in {update.effective_chat.title}:</b>\n\n"
+        text = action_card(
+            "ADMIN LIST",
+            [
+                field_extra(E.INFO, "GROUP", escape(update.effective_chat.title or "")),
+            ],
+            icon=E.CROWN,
+        ) + "\n\n"
 
         if owner:
-            name = f"@{owner.username}" if owner.username else owner.first_name
+            name = f"@{escape(owner.username)}" if owner.username else escape(owner.first_name)
             text += f"{E.CROWN} <b>Owner:</b> <a href='tg://user?id={owner.id}'>{name}</a>\n"
 
         if admin_list:
             text += f"\n{E.ADMIN} <b>Administrators:</b>\n"
             for admin in admin_list:
-                name = f"@{admin.username}" if admin.username else admin.first_name
+                name = f"@{escape(admin.username)}" if admin.username else escape(admin.first_name)
                 text += f"• <a href='tg://user?id={admin.id}'>{name}</a>\n"
 
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+        await reply_card(update.message, text)
     except Exception as e:
         await update.message.reply_text(f"{E.ERROR} Failed to get admin list: {e}",
             parse_mode=ParseMode.HTML)
@@ -254,12 +323,18 @@ async def admin_count_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         owner_count = sum(1 for a in admins if a.status == "creator")
         admin_count = len(admins) - owner_count
 
-        await update.message.reply_text(
-            f"{E.INFO} <b>Admin Count for {update.effective_chat.title}:</b>\n\n"
-            f"{E.CROWN} Owner: {owner_count}\n"
-            f"{E.ADMIN} Admins: {admin_count}\n"
-            f"{E.USER} Total: {len(admins)}",
-            parse_mode=ParseMode.HTML,
+        await reply_card(
+            update.message,
+            action_card(
+                "ADMIN COUNT",
+                [
+                    field_extra(E.INFO, "GROUP", escape(update.effective_chat.title or "")),
+                    field_extra(E.CROWN, "OWNER", str(owner_count)),
+                    field_extra(E.ADMIN, "ADMINS", str(admin_count)),
+                    field_extra(E.USER, "TOTAL", str(len(admins))),
+                ],
+                icon=E.ADMIN,
+            ),
         )
     except Exception as e:
         await update.message.reply_text(f"{E.ERROR} Failed to count admins: {e}",
@@ -286,10 +361,19 @@ async def setchatphoto_command(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         photo = update.message.reply_to_message.photo[-1]
         await context.bot.set_chat_photo(update.effective_chat.id, photo.file_id)
-        await update.message.reply_text(f"{E.CHECK} Chat photo updated.",
-            parse_mode=ParseMode.HTML)
+        await reply_card(
+            update.message,
+            action_card(
+                "CHAT PHOTO UPDATED",
+                [
+                    field_by(update.effective_user, "UPDATED BY"),
+                    field_extra(E.INFO, "CHAT", escape(update.effective_chat.title or "")),
+                ],
+                icon=E.CHECK,
+            ),
+        )
     except Exception as e:
-        await update.message.reply_text(f"{E.ERROR} Failed to set photo: {e}",
+        await update.message.reply_text(plain_error(f"Failed to set photo: {e}"),
             parse_mode=ParseMode.HTML)
 
 
@@ -312,9 +396,19 @@ async def setchatname_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     name = " ".join(context.args)
     try:
         await context.bot.set_chat_title(update.effective_chat.id, name)
-        await update.message.reply_text(f"{E.CHECK} Chat name set to: <b>{name}</b>", parse_mode=ParseMode.HTML)
+        await reply_card(
+            update.message,
+            action_card(
+                "CHAT NAME UPDATED",
+                [
+                    field_by(update.effective_user, "UPDATED BY"),
+                    field_extra(E.INFO, "NEW NAME", escape(name)),
+                ],
+                icon=E.CHECK,
+            ),
+        )
     except Exception as e:
-        await update.message.reply_text(f"{E.ERROR} Failed to set name: {e}",
+        await update.message.reply_text(plain_error(f"Failed to set name: {e}"),
             parse_mode=ParseMode.HTML)
 
 
@@ -337,10 +431,19 @@ async def setchatdescription_command(update: Update, context: ContextTypes.DEFAU
     desc = " ".join(context.args)
     try:
         await context.bot.set_chat_description(update.effective_chat.id, desc)
-        await update.message.reply_text(f"{E.CHECK} Chat description updated.",
-            parse_mode=ParseMode.HTML)
+        await reply_card(
+            update.message,
+            action_card(
+                "CHAT DESCRIPTION UPDATED",
+                [
+                    field_by(update.effective_user, "UPDATED BY"),
+                    field_extra(E.INFO, "DESCRIPTION", escape(desc[:200])),
+                ],
+                icon=E.CHECK,
+            ),
+        )
     except Exception as e:
-        await update.message.reply_text(f"{E.ERROR} Failed to set description: {e}",
+        await update.message.reply_text(plain_error(f"Failed to set description: {e}"),
             parse_mode=ParseMode.HTML)
 
 

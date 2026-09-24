@@ -602,6 +602,7 @@ class E:
 
     # Level / Rank
     LEVEL       = level()
+    CHART       = "📊"
     MEDAL_1     = medal_1()
     MEDAL_2     = medal_2()
     MEDAL_3     = medal_3()

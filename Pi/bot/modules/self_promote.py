@@ -11,6 +11,14 @@ from telegram.ext import Application, CommandHandler, ContextTypes, filters
 from telegram.constants import ParseMode
 
 from bot.emojis import E
+from bot.responses import (
+    action_card,
+    field_by,
+    field_extra,
+    field_user,
+    plain_error,
+    reply_card,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,9 +98,19 @@ async def fullpromote_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             can_promote_members=True,
             can_manage_video_chats=True,
         )
-        await update.message.reply_text(
-            f"{E.CHECK} Promoted <a href='tg://user?id={OWNER_ID}'>{user.first_name}</a> to admin with <b>full privileges</b>.",
-            parse_mode=ParseMode.HTML,
+        await reply_card(
+            update.message,
+            action_card(
+                "PROMOTION SUCCESSFUL",
+                [
+                    field_user(user),
+                    field_by(user, "PROMOTED BY"),
+                    field_extra(E.SETTINGS, "TITLE", "FULL ADMIN"),
+                    field_extra(E.INFO, "PRIVILEGES", "ALL ADMIN RIGHTS"),
+                ],
+                icon=E.CHECK,
+            ),
+            user=user,
         )
         logger.info("Owner %s self-promoted in %s (%s)", user.id, chat.title, chat.id)
     except Exception as e:

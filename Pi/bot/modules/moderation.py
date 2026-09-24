@@ -1,18 +1,33 @@
 """Moderation module — Mute, Ban, Kick, Warnings, Rules commands.
 
 Works in groups only. Requires admin permissions.
+Success replies use bot.responses action cards (Pi emoji set).
 """
 
 import logging
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 from enum import Enum
+from html import escape
 
 from telegram import Update, ChatMember, ChatPermissions, User
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
 
 from bot.emojis import E
+from bot.responses import (
+    action_card,
+    field_by,
+    field_count,
+    field_duration,
+    field_extra,
+    field_reason,
+    field_user,
+    mention,
+    plain_error,
+    reply_card,
+    user_label,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -235,7 +250,7 @@ async def execute_action(
     duration: Optional[timedelta] = None,
     reason: str = "",
 ):
-    """Execute moderation action on a user."""
+    """Execute moderation action on a user. Returns (ok: bool, detail: str)."""
     chat_id = update.effective_chat.id
 
     try:
@@ -246,22 +261,20 @@ async def execute_action(
                 chat_id, user_id, permissions, until_date=until_date
             )
             if duration:
-                return f"{E.MUTE} Muted <a href='tg://user?id={user_id}'>{user_id}</a> for {duration}."
-            else:
-                return f"{E.MUTE} Muted <a href='tg://user?id={user_id}'>{user_id}</a> permanently."
+                return True, f"Muted for {duration}."
+            return True, "Muted permanently."
 
         elif action == WarningAction.KICK:
             await context.bot.ban_chat_member(chat_id, user_id)
             await context.bot.unban_chat_member(chat_id, user_id)
-            return f"{E.KICK} Kicked <a href='tg://user?id={user_id}'>{user_id}</a>."
+            return True, "Kicked from the group."
 
         elif action == WarningAction.BAN:
             until_date = datetime.now() + duration if duration else None
             await context.bot.ban_chat_member(chat_id, user_id, until_date=until_date)
             if duration:
-                return f"{E.BAN} Banned <a href='tg://user?id={user_id}'>{user_id}</a> for {duration}."
-            else:
-                return f"{E.BAN} Banned <a href='tg://user?id={user_id}'>{user_id}</a> permanently."
+                return True, f"Banned for {duration}."
+            return True, "Banned permanently."
 
         elif action == WarningAction.TIMEOUT:
             if not duration:
@@ -271,13 +284,90 @@ async def execute_action(
             await context.bot.restrict_chat_member(
                 chat_id, user_id, permissions, until_date=until_date
             )
-            return f"{E.TIME} Timed out <a href='tg://user?id={user_id}'>{user_id}</a> for {duration}."
+            return True, f"Timed out for {duration}."
 
     except Exception as e:
         logger.warning(f"Error executing action: {e}")
-        return f"{E.ERROR} Failed to execute action: {str(e)}"
+        return False, str(e)
 
-    return ""
+    return False, "Unknown action."
+
+
+# Action result → card title + header icon
+_ACTION_META = {
+    WarningAction.MUTE: ("MUTE SUCCESSFUL", E.MUTE),
+    WarningAction.KICK: ("KICK SUCCESSFUL", E.KICK),
+    WarningAction.BAN: ("BAN SUCCESSFUL", E.BAN),
+    WarningAction.TIMEOUT: ("TIMEOUT SUCCESSFUL", E.TIME),
+}
+
+
+def moderation_card(
+    action: WarningAction,
+    target: User,
+    actor: Optional[User],
+    reason: str,
+    *,
+    duration: Optional[timedelta] = None,
+    extra_fields=None,
+    ok: bool = True,
+    detail: str = "",
+) -> str:
+    """Shared success/error card for mute/ban/kick/timeout."""
+    if not ok:
+        return action_card(
+            "ACTION FAILED",
+            [
+                field_user(target),
+                field_by(actor, "REQUESTED BY"),
+                field_reason(detail or reason),
+            ],
+            icon=E.ERROR,
+        )
+    title, icon = _ACTION_META.get(action, ("ACTION COMPLETE", E.CHECK))
+    fields = [
+        field_user(target),
+        field_by(actor, f"{action.value.upper()}ED BY" if action != WarningAction.KICK else "KICKED BY"),
+        field_reason(reason),
+        field_duration(str(duration) if duration else None),
+    ]
+    # Fix awkward double-E: MUTEED etc.
+    fields[1] = field_by(
+        actor,
+        {
+            WarningAction.MUTE: "MUTED BY",
+            WarningAction.BAN: "BANNED BY",
+            WarningAction.KICK: "KICKED BY",
+            WarningAction.TIMEOUT: "TIMED OUT BY",
+        }.get(action, "ACTION BY"),
+    )
+    if extra_fields:
+        fields.extend(extra_fields)
+    return action_card(title, fields, icon=icon)
+
+
+def warn_card(
+    target: User,
+    actor: Optional[User],
+    reason: str,
+    count: int,
+    limit: int,
+    *,
+    triggered: Optional[str] = None,
+    extra_fields=None,
+) -> str:
+    title = "WARNING LIMIT REACHED" if triggered else "WARNING ISSUED"
+    fields = [
+        field_user(target),
+        field_by(actor, "WARNED BY"),
+        field_reason(reason),
+        field_count(count, limit),
+    ]
+    if triggered:
+        fields.append(field_extra(E.ALERT, "ACTION", escape(triggered.upper())))
+    if extra_fields:
+        fields.extend(extra_fields)
+    return action_card(title, fields, icon=E.WARN)
 
 
 # ============================================
@@ -345,12 +435,22 @@ async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 reason = " ".join(remaining_args) or reason
 
-    result = await execute_action(
+    ok, detail = await execute_action(
         update, context, target_user.id, WarningAction.MUTE, duration, reason
     )
-
-    reply_text = f"{result}\n<b>Reason:</b> {reason}"
-    await update.message.reply_text(reply_text, parse_mode=ParseMode.HTML)
+    if ok:
+        try:
+            from bot.database import db as _pdb
+            chat_id = update.effective_chat.id
+            _pdb.bump_mod_actions(chat_id, 1)
+            _pdb.record_reputation_event(target_user.id, "restriction", 1)
+        except Exception:
+            pass
+    reply_text = moderation_card(
+        WarningAction.MUTE, target_user, update.effective_user, reason,
+        duration=duration, ok=ok, detail=detail,
+    )
+    await reply_card(update.message, reply_text, user=target_user)
 
 
 async def dmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -417,14 +517,17 @@ async def dmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 reason = " ".join(context.args) or reason
 
-    result = await execute_action(
+    ok, detail = await execute_action(
         update, context, target_user.id, WarningAction.MUTE, duration, reason
     )
-
-    reply_text = f"{result}\n<b>Reason:</b> {reason}"
+    extras = []
     if message_deleted:
-        reply_text += "\n🗑️ Deleted the offending message."
-    await update.message.reply_text(reply_text, parse_mode=ParseMode.HTML)
+        extras.append(field_extra(E.CROSS, "MESSAGE", "DELETED"))
+    reply_text = moderation_card(
+        WarningAction.MUTE, target_user, update.effective_user, reason,
+        duration=duration, extra_fields=extras, ok=ok, detail=detail,
+    )
+    await reply_card(update.message, reply_text, user=target_user)
 
 
 async def smute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -533,16 +636,17 @@ async def tmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    result = await execute_action(
+    ok, detail = await execute_action(
         update, context, target_user.id, WarningAction.MUTE, duration, reason
     )
-
     unmute_time = datetime.now() + duration
-    reply_text = (
-        f"{result}\n<b>Reason:</b> {reason}\n"
-        f"<b>Auto-unmute:</b> {unmute_time.strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    reply_text = moderation_card(
+        WarningAction.MUTE, target_user, update.effective_user, reason,
+        duration=duration,
+        extra_fields=[field_extra(E.TIME, "AUTO-UNMUTE", unmute_time.strftime("%Y-%m-%d %H:%M:%S"))],
+        ok=ok, detail=detail,
     )
-    await update.message.reply_text(reply_text, parse_mode=ParseMode.HTML)
+    await reply_card(update.message, reply_text, user=target_user)
 
 
 async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -595,12 +699,20 @@ async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.restrict_chat_member(
             update.effective_chat.id, target_user.id, permissions
         )
-        await update.message.reply_text(
-            f"🔊 Unmuted <a href='tg://user?id={target_user.id}'>{get_user_display(target_user)}</a>.",
-            parse_mode=ParseMode.HTML,
+        await reply_card(
+            update.message,
+            action_card(
+                "UNMUTE SUCCESSFUL",
+                [
+                    field_user(target_user),
+                    field_by(update.effective_user, "UNMUTED BY"),
+                ],
+                icon=E.MUTE,
+            ),
+            user=target_user,
         )
     except Exception as e:
-        await update.message.reply_text(f"{E.ERROR} Failed to unmute user: {str(e)}")
+        await update.message.reply_text(plain_error(f"Failed to unmute user: {str(e)}"))
 
 
 # ============================================
@@ -679,12 +791,22 @@ async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 reason = " ".join(context.args[args_start:]) or reason
 
-    result = await execute_action(
+    ok, detail = await execute_action(
         update, context, target_user.id, WarningAction.BAN, duration, reason
     )
-
-    reply_text = f"{result}\n<b>Reason:</b> {reason}"
-    await update.message.reply_text(reply_text, parse_mode=ParseMode.HTML)
+    if ok:
+        try:
+            from bot.database import db as _pdb
+            chat_id = update.effective_chat.id
+            _pdb.bump_mod_actions(chat_id, 1)
+            _pdb.record_reputation_event(target_user.id, "restriction", 1)
+        except Exception:
+            pass
+    reply_text = moderation_card(
+        WarningAction.BAN, target_user, update.effective_user, reason,
+        duration=duration, ok=ok, detail=detail,
+    )
+    await reply_card(update.message, reply_text, user=target_user)
 
 
 async def dban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -751,14 +873,17 @@ async def dban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 reason = " ".join(context.args) or reason
 
-    result = await execute_action(
+    ok, detail = await execute_action(
         update, context, target_user.id, WarningAction.BAN, duration, reason
     )
-
-    reply_text = f"{result}\n<b>Reason:</b> {reason}"
+    extras = []
     if message_deleted:
-        reply_text += "\n🗑️ Deleted the offending message."
-    await update.message.reply_text(reply_text, parse_mode=ParseMode.HTML)
+        extras.append(field_extra(E.CROSS, "MESSAGE", "DELETED"))
+    reply_text = moderation_card(
+        WarningAction.BAN, target_user, update.effective_user, reason,
+        duration=duration, extra_fields=extras, ok=ok, detail=detail,
+    )
+    await reply_card(update.message, reply_text, user=target_user)
 
 
 async def sban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -867,16 +992,17 @@ async def tban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    result = await execute_action(
+    ok, detail = await execute_action(
         update, context, target_user.id, WarningAction.BAN, duration, reason
     )
-
     unban_time = datetime.now() + duration
-    reply_text = (
-        f"{result}\n<b>Reason:</b> {reason}\n"
-        f"<b>Auto-unban:</b> {unban_time.strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    reply_text = moderation_card(
+        WarningAction.BAN, target_user, update.effective_user, reason,
+        duration=duration,
+        extra_fields=[field_extra(E.TIME, "AUTO-UNBAN", unban_time.strftime("%Y-%m-%d %H:%M:%S"))],
+        ok=ok, detail=detail,
     )
-    await update.message.reply_text(reply_text, parse_mode=ParseMode.HTML)
+    await reply_card(update.message, reply_text, user=target_user)
 
 
 async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -911,12 +1037,20 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await context.bot.unban_chat_member(update.effective_chat.id, target_user.id)
-        await update.message.reply_text(
-            f"{E.CHECK} Unbanned <a href='tg://user?id={target_user.id}'>{get_user_display(target_user)}</a>.",
-            parse_mode=ParseMode.HTML,
+        await reply_card(
+            update.message,
+            action_card(
+                "UNBAN SUCCESSFUL",
+                [
+                    field_user(target_user),
+                    field_by(update.effective_user, "UNBANNED BY"),
+                ],
+                icon=E.UNBAN,
+            ),
+            user=target_user,
         )
     except Exception as e:
-        await update.message.reply_text(f"{E.ERROR} Failed to unban user: {str(e)}")
+        await update.message.reply_text(plain_error(f"Failed to unban user: {str(e)}"))
 
 
 # ============================================
@@ -988,12 +1122,22 @@ async def kick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(context.args) > args_start:
             reason = " ".join(context.args[args_start:]) or reason
 
-    result = await execute_action(
+    ok, detail = await execute_action(
         update, context, target_user.id, WarningAction.KICK, reason=reason
     )
-
-    reply_text = f"{result}\n<b>Reason:</b> {reason}"
-    await update.message.reply_text(reply_text, parse_mode=ParseMode.HTML)
+    if ok:
+        try:
+            from bot.database import db as _pdb
+            chat_id = update.effective_chat.id
+            _pdb.bump_mod_actions(chat_id, 1)
+            _pdb.record_reputation_event(target_user.id, "restriction", 1)
+        except Exception:
+            pass
+    reply_text = moderation_card(
+        WarningAction.KICK, target_user, update.effective_user, reason,
+        ok=ok, detail=detail,
+    )
+    await reply_card(update.message, reply_text, user=target_user)
 
 
 async def dkick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1051,14 +1195,17 @@ async def dkick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
         reason = " ".join(context.args) or reason
 
-    result = await execute_action(
+    ok, detail = await execute_action(
         update, context, target_user.id, WarningAction.KICK, reason=reason
     )
-
-    reply_text = f"{result}\n<b>Reason:</b> {reason}"
+    extras = []
     if message_deleted:
-        reply_text += "\n🗑️ Deleted the offending message."
-    await update.message.reply_text(reply_text, parse_mode=ParseMode.HTML)
+        extras.append(field_extra(E.CROSS, "MESSAGE", "DELETED"))
+    reply_text = moderation_card(
+        WarningAction.KICK, target_user, update.effective_user, reason,
+        extra_fields=extras, ok=ok, detail=detail,
+    )
+    await reply_card(update.message, reply_text, user=target_user)
 
 
 async def skick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1144,31 +1291,39 @@ async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings = await get_chat_settings(chat_id)
 
     warning_count = await add_warning(chat_id, target_user.id, reason)
+    try:
+        from bot.database import db as _pdb
+        _pdb.bump_mod_actions(chat_id, 1)
+        _pdb.record_reputation_event(target_user.id, "warning", 1)
+    except Exception:
+        pass
 
     if warning_count >= settings["warn_limit"]:
         action = settings["warn_mode"]
         duration = settings.get("warn_mode_duration")
 
-        result = await execute_action(
+        ok, detail = await execute_action(
             update, context, target_user.id, action, duration, reason
         )
-
-        reply_text = (
-            f"{E.WARN} Warning issued to <a href='tg://user?id={target_user.id}'>{get_user_display(target_user)}</a> "
-            f"({warning_count}/{settings['warn_limit']}).\n"
-            f"<b>Reason:</b> {reason}\n\n"
-            f"{E.ALERT} Action triggered: {result}"
+        action_name = {
+            WarningAction.MUTE: "MUTE",
+            WarningAction.KICK: "KICK",
+            WarningAction.BAN: "BAN",
+            WarningAction.TIMEOUT: "TIMEOUT",
+        }.get(action, action.value.upper())
+        reply_text = warn_card(
+            target_user, update.effective_user, reason,
+            warning_count, settings["warn_limit"],
+            triggered=f"{action_name} ({detail})" if ok else f"FAILED ({detail})",
         )
-
         await reset_warnings(chat_id, target_user.id)
     else:
-        reply_text = (
-            f"{E.WARN} Warning issued to <a href='tg://user?id={target_user.id}'>{get_user_display(target_user)}</a> "
-            f"({warning_count}/{settings['warn_limit']}).\n"
-            f"<b>Reason:</b> {reason}"
+        reply_text = warn_card(
+            target_user, update.effective_user, reason,
+            warning_count, settings["warn_limit"],
         )
 
-    await update.message.reply_text(reply_text, parse_mode=ParseMode.HTML)
+    await reply_card(update.message, reply_text, user=target_user)
 
 
 async def dwarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1223,35 +1378,47 @@ async def dwarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings = await get_chat_settings(chat_id)
 
     warning_count = await add_warning(chat_id, target_user.id, reason)
+    try:
+        from bot.database import db as _pdb
+        _pdb.bump_mod_actions(chat_id, 1)
+        _pdb.record_reputation_event(target_user.id, "warning", 1)
+    except Exception:
+        pass
 
     if warning_count >= settings["warn_limit"]:
         action = settings["warn_mode"]
         duration = settings.get("warn_mode_duration")
 
-        result = await execute_action(
+        ok, detail = await execute_action(
             update, context, target_user.id, action, duration, reason
         )
-
-        reply_text = (
-            f"⚠️ Warning issued to <a href='tg://user?id={target_user.id}'>{get_user_display(target_user)}</a> "
-            f"({warning_count}/{settings['warn_limit']}).\n"
-            f"<b>Reason:</b> {reason}"
-        )
+        action_name = {
+            WarningAction.MUTE: "MUTE",
+            WarningAction.KICK: "KICK",
+            WarningAction.BAN: "BAN",
+            WarningAction.TIMEOUT: "TIMEOUT",
+        }.get(action, action.value.upper())
+        extras = []
         if message_deleted:
-            reply_text += "\n🗑️ Deleted the offending message."
-        reply_text += f"\n\n🚨 Action triggered: {result}"
-
+            extras.append(field_extra(E.CROSS, "MESSAGE", "DELETED"))
+        reply_text = warn_card(
+            target_user, update.effective_user, reason,
+            warning_count, settings["warn_limit"],
+            triggered=f"{action_name} ({detail})" if ok else f"FAILED ({detail})",
+            extra_fields=extras,
+        )
         await reset_warnings(chat_id, target_user.id)
     else:
-        reply_text = (
-            f"⚠️ Warning issued to <a href='tg://user?id={target_user.id}'>{get_user_display(target_user)}</a> "
-            f"({warning_count}/{settings['warn_limit']}).\n"
-            f"<b>Reason:</b> {reason}"
-        )
+        extras = []
         if message_deleted:
-            reply_text += "\n🗑️ Deleted the offending message."
+            extras.append(field_extra(E.CROSS, "MESSAGE", "DELETED"))
+        reply_text = warn_card(
+            target_user, update.effective_user, reason,
+            warning_count, settings["warn_limit"],
+            extra_fields=extras,
+        )
 
-    await update.message.reply_text(reply_text, parse_mode=ParseMode.HTML)
+    await reply_card(update.message, reply_text, user=target_user)
 
 
 async def swarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1283,6 +1450,12 @@ async def swarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings = await get_chat_settings(chat_id)
 
     warning_count = await add_warning(chat_id, target_user.id, reason)
+    try:
+        from bot.database import db as _pdb
+        _pdb.bump_mod_actions(chat_id, 1)
+        _pdb.record_reputation_event(target_user.id, "warning", 1)
+    except Exception:
+        pass
 
     if warning_count >= settings["warn_limit"]:
         action = settings["warn_mode"]
@@ -1320,25 +1493,27 @@ async def warns_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if warnings:
         warning_list = "\n".join(
             [
-                f"• {w['reason']} ({w['timestamp'].strftime('%Y-%m-%d %H:%M')})"
+                f"• {escape(str(w['reason']))} ({w['timestamp'].strftime('%Y-%m-%d %H:%M')})"
                 for w in warnings
             ]
         )
-        reply_text = (
-            f"{E.WARN} Active warnings for <a href='tg://user?id={target_user.id}'>{get_user_display(target_user)}</a>:\n"
-            f"{warning_list}\n\n"
-            f"<b>Total:</b> {len(warnings)}/{settings['warn_limit']}"
+        reply_text = action_card(
+            "ACTIVE WARNINGS",
+            [
+                field_user(target_user),
+                field_count(len(warnings), settings["warn_limit"]),
+                field_extra(E.INFO, "LIST", warning_list),
+            ],
+            icon=E.WARN,
         )
     else:
-        if target_user.id == update.effective_user.id:
-            reply_text = f"{E.CHECK} You have no active warnings."
-        else:
-            reply_text = (
-                f"{E.CHECK} <a href='tg://user?id={target_user.id}'>{get_user_display(target_user)}</a> "
-                f"has no active warnings."
-            )
+        reply_text = action_card(
+            "NO ACTIVE WARNINGS",
+            [field_user(target_user)],
+            icon=E.CHECK,
+        )
 
-    await update.message.reply_text(reply_text, parse_mode=ParseMode.HTML)
+    await reply_card(update.message, reply_text, user=target_user)
 
 
 async def rmwarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1371,18 +1546,28 @@ async def rmwarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if success:
         warnings = await get_warnings(chat_id, target_user.id)
-        reply_text = (
-            f"{E.CHECK} Removed the latest warning for "
-            f"<a href='tg://user?id={target_user.id}'>{get_user_display(target_user)}</a>.\n"
-            f"<b>Warnings remaining:</b> {len(warnings)}/{settings['warn_limit']}"
+        try:
+            from bot.database import db as _pdb
+            _pdb.record_reputation_event(target_user.id, "positive", 1)
+        except Exception:
+            pass
+        reply_text = action_card(
+            "WARNING REMOVED",
+            [
+                field_user(target_user),
+                field_by(update.effective_user, "REMOVED BY"),
+                field_count(len(warnings), settings["warn_limit"]),
+            ],
+            icon=E.CHECK,
         )
     else:
-        reply_text = (
-            f"⚠️ <a href='tg://user?id={target_user.id}'>{get_user_display(target_user)}</a> "
-            f"has no active warnings to remove."
+        reply_text = action_card(
+            "NO WARNING TO REMOVE",
+            [field_user(target_user)],
+            icon=E.WARNING,
         )
 
-    await update.message.reply_text(reply_text, parse_mode=ParseMode.HTML)
+    await reply_card(update.message, reply_text, user=target_user)
 
 
 async def resetwarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1414,18 +1599,29 @@ async def resetwarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     count = await reset_warnings(chat_id, target_user.id)
 
     if count > 0:
-        reply_text = (
-            f"{E.CHECK} Cleared all {count} warnings for "
-            f"<a href='tg://user?id={target_user.id}'>{get_user_display(target_user)}</a>.\n"
-            f"<b>Warnings reset to 0/{settings['warn_limit']}.</b>"
+        try:
+            from bot.database import db as _pdb
+            _pdb.record_reputation_event(target_user.id, "positive", count)
+        except Exception:
+            pass
+        reply_text = action_card(
+            "WARNINGS CLEARED",
+            [
+                field_user(target_user),
+                field_by(update.effective_user, "CLEARED BY"),
+                field_count(0, settings["warn_limit"]),
+                field_extra(E.INFO, "REMOVED", str(count)),
+            ],
+            icon=E.CHECK,
         )
     else:
-        reply_text = (
-            f"⚠️ <a href='tg://user?id={target_user.id}'>{get_user_display(target_user)}</a> "
-            f"has no active warnings to clear."
+        reply_text = action_card(
+            "NO WARNINGS TO CLEAR",
+            [field_user(target_user)],
+            icon=E.WARNING,
         )
 
-    await update.message.reply_text(reply_text, parse_mode=ParseMode.HTML)
+    await reply_card(update.message, reply_text, user=target_user)
 
 
 async def resetallwarns_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1445,11 +1641,22 @@ async def resetallwarns_command(update: Update, context: ContextTypes.DEFAULT_TY
     count = await reset_all_warnings(chat_id)
 
     if count > 0:
-        reply_text = f"{E.CHECK} Cleared all {count} active warnings in this chat."
+        reply_text = action_card(
+            "ALL WARNINGS CLEARED",
+            [
+                field_by(update.effective_user, "CLEARED BY"),
+                field_extra(E.WARN, "REMOVED", str(count)),
+            ],
+            icon=E.CHECK,
+        )
     else:
-        reply_text = f"{E.CHECK} No active warnings found in this chat."
+        reply_text = action_card(
+            "NO ACTIVE WARNINGS",
+            [field_extra(E.INFO, "CHAT", escape(update.effective_chat.title or ""))],
+            icon=E.INFO,
+        )
 
-    await update.message.reply_text(reply_text, parse_mode=ParseMode.HTML)
+    await reply_card(update.message, reply_text)
 
 
 # ============================================
@@ -1497,10 +1704,17 @@ async def warnlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings["warn_limit"] = limit
     settings_db[chat_id] = settings
 
-    await update.message.reply_text(
-        f"{E.SETTINGS} Warning limit set to <b>{limit}</b>.\n"
-        f"Action will trigger on the {get_ordinal(limit)} warning.",
-        parse_mode=ParseMode.HTML,
+    await reply_card(
+        update.message,
+        action_card(
+            "WARN LIMIT UPDATED",
+            [
+                field_by(update.effective_user, "UPDATED BY"),
+                field_extra(E.WARN, "LIMIT", str(limit)),
+                field_extra(E.INFO, "TRIGGERS ON", get_ordinal(limit)),
+            ],
+            icon=E.SETTINGS,
+        ),
     )
 
 
@@ -1560,13 +1774,18 @@ async def warnmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         WarningAction.TIMEOUT: "Restrict the user temporarily",
     }
 
-    duration_text = f" for {duration}" if duration else ""
-    reply_text = (
-        f"{E.SETTINGS} Warning mode set to: <b>{mode.value}</b>{duration_text}\n"
-        f"{mode_descriptions[mode]}"
+    reply_text = action_card(
+        "WARN MODE UPDATED",
+        [
+            field_by(update.effective_user, "UPDATED BY"),
+            field_extra(E.SETTINGS, "MODE", str(mode.value).upper()),
+            field_duration(str(duration) if duration else None),
+            field_extra(E.INFO, "EFFECT", mode_descriptions[mode]),
+        ],
+        icon=E.SETTINGS,
     )
 
-    await update.message.reply_text(reply_text, parse_mode=ParseMode.HTML)
+    await reply_card(update.message, reply_text)
 
 
 async def warntime_command(update: Update, context: ContextTypes.DEFAULT_TYPE):

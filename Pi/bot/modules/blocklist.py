@@ -282,6 +282,15 @@ async def blocklist_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for b in blocklist:
         if b["word"] in text:
+            def _count_spam() -> None:
+                try:
+                    db.bump_spam_attempts(chat_id, 1)
+                    db.record_reputation_event(user_id, "warning", 1)
+                except Exception as e:
+                    logger.debug(f"spam counter failed: {e}")
+
+            import asyncio
+            asyncio.get_running_loop().run_in_executor(None, _count_spam)
             await _take_action(update, context, user_id, action, reason)
             return
 
