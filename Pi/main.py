@@ -4,12 +4,14 @@ Runs python-telegram-bot (Bot API) with colored inline buttons.
 No Telethon dependency.
 """
 
+import asyncio
+import logging
 import signal
 import sys
 from datetime import datetime
 
 from telegram import Update
-from telegram.ext import Application
+from telegram.ext import Application, ContextTypes
 
 from bot.config import settings
 from bot.constants import BOT_NAME
@@ -19,38 +21,57 @@ from bot.database import db
 
 
 # ── Startup log ──────────────────────────────────────────
-LOG_CHANNEL_ID = -1003963429635  # Phi_Logs
+LOG_CHANNEL_ID = -1003845687680  # Pi_Logs
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log handler exceptions so failures never disappear silently."""
+    err = context.error
+    # Expected/soft failures — one line, no traceback noise.
+    if isinstance(err, Exception) and type(err).__name__ in {"TimedOut", "NetworkError", "BadRequest"}:
+        logger.warning(f"Handler network/API issue: {err}")
+        return
+    logger.error("Handler error", exc_info=err)
+    if isinstance(update, Update) and update.effective_message:
+        logger.error(
+            "  update=%s chat=%s user=%s",
+            update.update_id,
+            getattr(update.effective_chat, "id", "?"),
+            getattr(update.effective_user, "id", "?"),
+        )
 
 
 async def post_init(app: Application) -> None:
-    """Fetch bot identity and send startup log."""
+    """Fetch bot identity; never block polling on the startup log."""
     me = await app.bot.get_me()
     app.bot_data["username"] = me.username
     app.bot_data["name"] = me.full_name
     logger.info(f"Bot API connected as @{me.username} — {me.full_name}")
 
-    # Send startup log
-    try:
-        startup_msg = (
-            f"<b>Bot Started Successfully!</b>\n\n"
-            f"<b>Bot:</b> @{me.username}\n"
-            f"<b>Bot ID:</b> <code>{me.id}</code>\n"
-            f"<b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-            f"<b>Modules:</b> Loaded\n"
-            f"<b>Database:</b> Connected\n"
-            f"<b>Colored Buttons:</b> Active (Pure PTB)\n"
-            f"<b>Logging:</b> Active\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━"
-        )
+    async def _startup_log() -> None:
+        try:
+            startup_msg = (
+                f"<b>Bot Started Successfully!</b>\n\n"
+                f"<b>Bot:</b> @{me.username}\n"
+                f"<b>Bot ID:</b> <code>{me.id}</code>\n"
+                f"<b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"<b>Modules:</b> Loaded\n"
+                f"<b>Database:</b> Connected\n"
+                f"<b>Colored Buttons:</b> Active (Pure PTB)\n"
+                f"<b>Logging:</b> Active\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━"
+            )
+            await app.bot.send_message(
+                chat_id=LOG_CHANNEL_ID,
+                text=startup_msg,
+                parse_mode="HTML",
+            )
+            logger.info("Startup log sent to channel")
+        except Exception as e:
+            logger.warning(f"Startup log not sent: {e}")
 
-        await app.bot.send_message(
-            chat_id=LOG_CHANNEL_ID,
-            text=startup_msg,
-            parse_mode="HTML",
-        )
-        logger.info("Startup log sent to channel")
-    except Exception as e:
-        logger.error(f"Failed to send startup log: {e}")
+    # Fire-and-forget: start listening for updates immediately.
+    asyncio.create_task(_startup_log())
 
 
 async def post_shutdown(app: Application) -> None:
@@ -66,17 +87,28 @@ def main() -> None:
         .token(settings.bot_token)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
+        # Regular Bot API HTTP timeouts (sendMessage, etc.) — PTB defaults
+        # are often ~5s and fail on slow routes to api.telegram.org.
+        .read_timeout(30)
+        .write_timeout(30)
+        .connect_timeout(30)
+        .pool_timeout(30)
+        .connection_pool_size(20)
+        # Long-poll getUpdates (separate from ordinary API calls).
+        .get_updates_read_timeout(30)
+        .get_updates_connect_timeout(30)
+        .get_updates_write_timeout(30)
+        .get_updates_pool_timeout(30)
         .build()
     )
+    app.add_error_handler(on_error)
 
     count = load_modules(app)
     logger.info(f"Loaded {count} module(s) — {BOT_NAME} is ready")
 
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
-        read_timeout=30,
-        connect_timeout=30,
-        write_timeout=30,
+        drop_pending_updates=True,
     )
 
 

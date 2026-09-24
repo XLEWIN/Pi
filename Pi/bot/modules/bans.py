@@ -10,6 +10,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
 
 from bot.database import db
+from bot.emojis import E
 
 logger = logging.getLogger(__name__)
 
@@ -46,64 +47,75 @@ async def _get_target_user(update, context):
 
 async def addsudo_command(update, context):
     if not is_owner(update.effective_user.id):
-        await update.message.reply_text("Only the bot owner can manage sudo users.")
+        await update.message.reply_text(f"{E.CROWN} Only the bot owner can manage sudo users.",
+            parse_mode=ParseMode.HTML)
         return
     target = await _get_target_user(update, context)
     if not target:
-        await update.message.reply_text("Specify a user: /addsudo @user or /addsudo USER_ID")
+        await update.message.reply_text(f"{E.ERROR} Specify a user: /addsudo @user or /addsudo USER_ID",
+            parse_mode=ParseMode.HTML)
         return
     db.add_sudo_user(target.id, update.effective_user.id)
     await update.message.reply_text(
-        f"Added <a href='tg://user?id={target.id}'>{target.first_name}</a> as sudo user.",
+        f"{E.CHECK} Added <a href='tg://user?id={target.id}'>{target.first_name}</a> as sudo user.",
         parse_mode=ParseMode.HTML,
     )
 
 
 async def rmsudo_command(update, context):
     if not is_owner(update.effective_user.id):
-        await update.message.reply_text("Only the bot owner can manage sudo users.")
+        await update.message.reply_text(f"{E.CROWN} Only the bot owner can manage sudo users.",
+            parse_mode=ParseMode.HTML)
         return
     target = await _get_target_user(update, context)
     if not target:
-        await update.message.reply_text("Specify a user: /rmsudo @user or /rmsudo USER_ID")
+        await update.message.reply_text(f"{E.ERROR} Specify a user: /rmsudo @user or /rmsudo USER_ID",
+            parse_mode=ParseMode.HTML)
         return
     if db.remove_sudo_user(target.id):
         await update.message.reply_text(
-            f"Removed <a href='tg://user?id={target.id}'>{target.first_name}</a> from sudo users.",
+            f"{E.CHECK} Removed <a href='tg://user?id={target.id}'>{target.first_name}</a> from sudo users.",
             parse_mode=ParseMode.HTML,
         )
     else:
-        await update.message.reply_text("User is not a sudo user.")
+        await update.message.reply_text(f"{E.WARNING} User is not a sudo user.",
+            parse_mode=ParseMode.HTML)
 
 
 async def sudolist_command(update, context):
     if not is_owner(update.effective_user.id):
-        await update.message.reply_text("Only the bot owner can view sudo users.")
+        await update.message.reply_text(f"{E.CROWN} Only the bot owner can view sudo users.",
+            parse_mode=ParseMode.HTML)
         return
     sudo_ids = db.get_sudo_users()
     if not sudo_ids:
-        await update.message.reply_text("No sudo users configured.")
+        await update.message.reply_text(f"{E.INFO} No sudo users configured.",
+            parse_mode=ParseMode.HTML)
         return
     sudo_list = "\n".join([f"  - <code>{uid}</code>" for uid in sorted(sudo_ids)])
     await update.message.reply_text(
-        f"<b>Sudo Users:</b>\n{sudo_list}\n\n<b>Owner:</b> <code>{OWNER_ID}</code>",
+        f"{E.ADMIN} <b>Sudo Users:</b>\n{sudo_list}\n\n{E.CROWN} <b>Owner:</b> <code>{OWNER_ID}</code>",
         parse_mode=ParseMode.HTML,
     )
 
 
 async def gban_command(update, context):
     if not is_sudo(update.effective_user.id):
-        await update.message.reply_text("Only sudo/owner users can use gban.")
+        await update.message.reply_text(f"{E.ERROR} Only sudo/owner users can use gban.",
+            parse_mode=ParseMode.HTML)
         return
     target = await _get_target_user(update, context)
     if not target:
-        await update.message.reply_text("Specify a user: /gban @user [reason]")
+        await update.message.reply_text(f"{E.ERROR} Specify a user: /gban @user [reason]",
+            parse_mode=ParseMode.HTML)
         return
     if target.id == OWNER_ID:
-        await update.message.reply_text("Cannot gban the bot owner.")
+        await update.message.reply_text(f"{E.CROWN} Cannot gban the bot owner.",
+            parse_mode=ParseMode.HTML)
         return
     if target.id == context.bot.id:
-        await update.message.reply_text("I cannot gban myself.")
+        await update.message.reply_text(f"{E.ERROR} I cannot gban myself.",
+            parse_mode=ParseMode.HTML)
         return
     reason = " ".join(context.args[1:]) if len(context.args) > 1 else "No reason provided"
     db.add_gban(target.id, reason, update.effective_user.id)
@@ -113,7 +125,7 @@ async def gban_command(update, context):
         pass
     total = len(db.get_gbanned_users())
     await update.message.reply_text(
-        f"<b>Globally Banned</b> <a href='tg://user?id={target.id}'>{target.first_name}</a>\n"
+        f"{E.BAN} <b>Globally Banned</b> <a href='tg://user?id={target.id}'>{target.first_name}</a>\n"
         f"<b>Reason:</b> {reason}\n<b>Total Gbanned:</b> {total}",
         parse_mode=ParseMode.HTML,
     )
@@ -121,11 +133,13 @@ async def gban_command(update, context):
 
 async def ungban_command(update, context):
     if not is_sudo(update.effective_user.id):
-        await update.message.reply_text("Only sudo/owner users can use ungban.")
+        await update.message.reply_text(f"{E.ERROR} Only sudo/owner users can use ungban.",
+            parse_mode=ParseMode.HTML)
         return
     target = await _get_target_user(update, context)
     if not target:
-        await update.message.reply_text("Specify a user: /ungban @user")
+        await update.message.reply_text(f"{E.ERROR} Specify a user: /ungban @user",
+            parse_mode=ParseMode.HTML)
         return
     if db.remove_gban(target.id):
         try:
@@ -133,34 +147,39 @@ async def ungban_command(update, context):
         except Exception:
             pass
         await update.message.reply_text(
-            f"<b>Globally Unbanned</b> <a href='tg://user?id={target.id}'>{target.first_name}</a>.",
+            f"{E.UNBAN} <b>Globally Unbanned</b> <a href='tg://user?id={target.id}'>{target.first_name}</a>.",
             parse_mode=ParseMode.HTML,
         )
     else:
-        await update.message.reply_text("User is not gbanned.")
+        await update.message.reply_text(f"{E.WARNING} User is not gbanned.",
+            parse_mode=ParseMode.HTML)
 
 
 async def gbanlist_command(update, context):
     if not is_sudo(update.effective_user.id):
-        await update.message.reply_text("Only sudo/owner users can view gbans.")
+        await update.message.reply_text(f"{E.ERROR} Only sudo/owner users can view gbans.",
+            parse_mode=ParseMode.HTML)
         return
     gbanned = db.get_gbanned_users()
     if not gbanned:
-        await update.message.reply_text("No gbanned users.")
+        await update.message.reply_text(f"{E.INFO} No gbanned users.",
+            parse_mode=ParseMode.HTML)
         return
     ban_list = "\n".join([f"  - <code>{g['user_id']}</code> ({g.get('reason', 'N/A')})" for g in gbanned])
     await update.message.reply_text(
-        f"<b>Gbanned Users ({len(gbanned)}):</b>\n{ban_list}",
+        f"{E.BAN} <b>Gbanned Users ({len(gbanned)}):</b>\n{ban_list}",
         parse_mode=ParseMode.HTML,
     )
 
 
 async def massban_command(update, context):
     if not is_owner(update.effective_user.id):
-        await update.message.reply_text("Only the bot owner can mass ban.")
+        await update.message.reply_text(f"{E.CROWN} Only the bot owner can mass ban.",
+            parse_mode=ParseMode.HTML)
         return
     if not context.args:
-        await update.message.reply_text("Provide user IDs: /massban 123456 789012 345678")
+        await update.message.reply_text(f"{E.ERROR} Provide user IDs: /massban 123456 789012 345678",
+            parse_mode=ParseMode.HTML)
         return
     banned = 0
     failed = 0
@@ -172,16 +191,19 @@ async def massban_command(update, context):
             banned += 1
         except (ValueError, Exception):
             failed += 1
-    await update.message.reply_text(f"<b>Mass Ban:</b> Banned: {banned}, Failed: {failed}")
+    await update.message.reply_text(f"{E.BAN} <b>Mass Ban:</b> Banned: {banned}, Failed: {failed}",
+            parse_mode=ParseMode.HTML)
 
 
 async def sudopromote_command(update, context):
     if not is_sudo(update.effective_user.id):
-        await update.message.reply_text("Only sudo/owner users can use this.")
+        await update.message.reply_text(f"{E.ERROR} Only sudo/owner users can use this.",
+            parse_mode=ParseMode.HTML)
         return
     target = await _get_target_user(update, context)
     if not target:
-        await update.message.reply_text("Specify a user: /sudopromote @user")
+        await update.message.reply_text(f"{E.ERROR} Specify a user: /sudopromote @user",
+            parse_mode=ParseMode.HTML)
         return
     try:
         await context.bot.promote_chat_member(
@@ -192,11 +214,12 @@ async def sudopromote_command(update, context):
             can_manage_video_chats=True,
         )
         await update.message.reply_text(
-            f"Promoted <a href='tg://user?id={target.id}'>{target.first_name}</a>.",
+            f"{E.CHECK} Promoted <a href='tg://user?id={target.id}'>{target.first_name}</a>.",
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
-        await update.message.reply_text(f"Failed to promote: {e}")
+        await update.message.reply_text(f"{E.ERROR} Failed to promote: {e}",
+            parse_mode=ParseMode.HTML)
 
 
 def setup(app: Application) -> list:

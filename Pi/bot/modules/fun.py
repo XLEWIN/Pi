@@ -11,6 +11,8 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
 
+from bot.emojis import E
+
 logger = logging.getLogger(__name__)
 
 # ── Reaction lists ───────────────────────────────────────
@@ -115,10 +117,11 @@ async def slap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif update.message.reply_to_message:
         target = update.message.reply_to_message.from_user.first_name
     else:
-        await update.message.reply_text("❌ Who do you want to slap?")
+        await update.message.reply_text(f"{E.ERROR} Who do you want to slap?",
+            parse_mode=ParseMode.HTML)
         return
 
-    text = f"👋 <b>{user.first_name}</b> slaps <b>{target}</b>!\n{_get_random(SLAP_REACTIONS)}"
+    text = f"{E.WAVE} <b>{user.first_name}</b> slaps <b>{target}</b>!\n{_get_random(SLAP_REACTIONS)}"
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
@@ -174,7 +177,7 @@ async def wave_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         target = "everyone"
 
-    text = f"👋 <b>{user.first_name}</b> waves at <b>{target}</b>!\nHey there! 😄"
+    text = f"{E.WAVE} <b>{user.first_name}</b> waves at <b>{target}</b>!\nHey there! 😄"
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
@@ -200,10 +203,11 @@ async def punch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif update.message.reply_to_message:
         target = update.message.reply_to_message.from_user.first_name
     else:
-        await update.message.reply_text("❌ Who do you want to punch?")
+        await update.message.reply_text(f"{E.ERROR} Who do you want to punch?",
+            parse_mode=ParseMode.HTML)
         return
 
-    text = f"👊 <b>{user.first_name}</b> punches <b>{target}</b>!\n{_get_random(PUNCH_REACTIONS)}"
+    text = f"{E.KICK} <b>{user.first_name}</b> punches <b>{target}</b>!\n{_get_random(PUNCH_REACTIONS)}"
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
@@ -215,10 +219,11 @@ async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif update.message.reply_to_message:
         target = update.message.reply_to_message.from_user.first_name
     else:
-        await update.message.reply_text("❌ Who do you want to eliminate?")
+        await update.message.reply_text(f"{E.ERROR} Who do you want to eliminate?",
+            parse_mode=ParseMode.HTML)
         return
 
-    text = f"🔫 <b>{user.first_name}</b> points a gun at <b>{target}</b>!\n{_get_random(KILL_REACTIONS)}"
+    text = f"{E.SPARKLE} <b>{user.first_name}</b> points a gun at <b>{target}</b>!\n{_get_random(KILL_REACTIONS)}"
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
@@ -230,10 +235,11 @@ async def yeet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif update.message.reply_to_message:
         target = update.message.reply_to_message.from_user.first_name
     else:
-        await update.message.reply_text("❌ Who do you want to yeet?")
+        await update.message.reply_text(f"{E.ERROR} Who do you want to yeet?",
+            parse_mode=ParseMode.HTML)
         return
 
-    text = f"🏈 <b>{user.first_name}</b> YEETS <b>{target}</b> into the void!\n{_get_random(YEET_REACTIONS)}"
+    text = f"{E.FIRE} <b>{user.first_name}</b> YEETS <b>{target}</b> into the void!\n{_get_random(YEET_REACTIONS)}"
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 

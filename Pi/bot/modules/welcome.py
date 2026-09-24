@@ -17,6 +17,7 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 
 from bot.database import db
+from bot.emojis import E
 
 logger = logging.getLogger(__name__)
 
@@ -63,16 +64,18 @@ def format_welcome(text: str, user, chat) -> str:
 async def setwelcome_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /setwelcome — set custom welcome message."""
     if update.effective_chat.type == "private":
-        await update.message.reply_text("This command only works in groups.")
+        await update.message.reply_text(f"{E.INFO} This command only works in groups.",
+            parse_mode=ParseMode.HTML)
         return
 
     if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can change welcome settings.")
+        await update.message.reply_text(f"{E.ERROR} Only admins can change welcome settings.",
+            parse_mode=ParseMode.HTML)
         return
 
     if not context.args and not update.message.reply_to_message:
         await update.message.reply_text(
-            "<b>Set Welcome Message</b>\n\n"
+            f"{E.WAVE} <b>Set Welcome Message</b>\n\n"
             "<b>Usage:</b>\n"
             "  /setwelcome &lt;text&gt; — Set welcome text\n"
             "  Reply to a message with /setwelcome\n\n"
@@ -98,22 +101,25 @@ async def setwelcome_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     chat_id = update.effective_chat.id
     db.set_welcome_text(chat_id, text)
-    await update.message.reply_text("Welcome message saved!")
+    await update.message.reply_text(f"{E.CHECK} Welcome message saved!",
+            parse_mode=ParseMode.HTML)
 
 
 async def setgoodbye_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /setgoodbye — set custom goodbye message."""
     if update.effective_chat.type == "private":
-        await update.message.reply_text("This command only works in groups.")
+        await update.message.reply_text(f"{E.INFO} This command only works in groups.",
+            parse_mode=ParseMode.HTML)
         return
 
     if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can change goodbye settings.")
+        await update.message.reply_text(f"{E.ERROR} Only admins can change goodbye settings.",
+            parse_mode=ParseMode.HTML)
         return
 
     if not context.args and not update.message.reply_to_message:
         await update.message.reply_text(
-            "<b>Set Goodbye Message</b>\n\n"
+            f"{E.GOODBYE} <b>Set Goodbye Message</b>\n\n"
             "<b>Usage:</b>\n"
             "  /setgoodbye &lt;text&gt; — Set goodbye text\n"
             "  Reply to a message with /setgoodbye\n\n"
@@ -134,12 +140,14 @@ async def setgoodbye_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         text = update.message.reply_to_message.text or update.message.reply_to_message.caption or text
 
     if not text:
-        await update.message.reply_text("Please provide goodbye text.")
+        await update.message.reply_text(f"{E.ERROR} Please provide goodbye text.",
+            parse_mode=ParseMode.HTML)
         return
 
     chat_id = update.effective_chat.id
     db.set_goodbye_text(chat_id, text)
-    await update.message.reply_text("Goodbye message saved!")
+    await update.message.reply_text(f"{E.CHECK} Goodbye message saved!",
+            parse_mode=ParseMode.HTML)
 
 
 async def resetwelcome_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -153,7 +161,8 @@ async def resetwelcome_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     db.reset_welcome(update.effective_chat.id)
-    await update.message.reply_text("Welcome message reset to default!")
+    await update.message.reply_text(f"{E.CHECK} Welcome message reset to default!",
+            parse_mode=ParseMode.HTML)
 
 
 async def resetgoodbye_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -167,7 +176,8 @@ async def resetgoodbye_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     db.reset_goodbye(update.effective_chat.id)
-    await update.message.reply_text("Goodbye message reset to default!")
+    await update.message.reply_text(f"{E.CHECK} Goodbye message reset to default!",
+            parse_mode=ParseMode.HTML)
 
 
 async def welcome_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -188,15 +198,17 @@ async def welcome_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         arg = context.args[0].lower()
         if arg == "on":
             db.set_welcome_enabled(chat_id, True)
-            await update.message.reply_text("Welcome messages enabled!")
+            await update.message.reply_text(f"{E.CHECK} Welcome messages enabled!",
+            parse_mode=ParseMode.HTML)
             return
         elif arg == "off":
             db.set_welcome_enabled(chat_id, False)
-            await update.message.reply_text("Welcome messages disabled!")
+            await update.message.reply_text(f"{E.CROSS} Welcome messages disabled!",
+            parse_mode=ParseMode.HTML)
             return
         elif arg == "noformat":
             await update.message.reply_text(
-                f"<b>Welcome Settings:</b>\n"
+                f"{E.WAVE} <b>Welcome Settings:</b>\n"
                 f"  Welcome: {'ON' if settings.get('welcome_enabled') else 'OFF'}\n"
                 f"  Clean Welcome: {'ON' if settings.get('clean_welcome') else 'OFF'}\n\n"
                 f"<b>Welcome text (no formatting):</b>\n{msg.get('welcome_text', '')}",
@@ -205,7 +217,7 @@ async def welcome_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     await update.message.reply_text(
-        f"<b>Welcome Settings:</b>\n"
+        f"{E.WAVE} <b>Welcome Settings:</b>\n"
         f"  Welcome: {'ON' if settings.get('welcome_enabled') else 'OFF'}\n"
         f"  Goodbye: {'ON' if settings.get('goodbye_enabled') else 'OFF'}\n"
         f"  Clean Welcome: {'ON' if settings.get('clean_welcome') else 'OFF'}\n"
@@ -233,15 +245,17 @@ async def goodbye_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         arg = context.args[0].lower()
         if arg == "on":
             db.set_goodbye_enabled(chat_id, True)
-            await update.message.reply_text("Goodbye messages enabled!")
+            await update.message.reply_text(f"{E.CHECK} Goodbye messages enabled!",
+            parse_mode=ParseMode.HTML)
             return
         elif arg == "off":
             db.set_goodbye_enabled(chat_id, False)
-            await update.message.reply_text("Goodbye messages disabled!")
+            await update.message.reply_text(f"{E.CROSS} Goodbye messages disabled!",
+            parse_mode=ParseMode.HTML)
             return
         elif arg == "noformat":
             await update.message.reply_text(
-                f"<b>Goodbye Settings:</b>\n"
+                f"{E.GOODBYE} <b>Goodbye Settings:</b>\n"
                 f"  Goodbye: {'ON' if settings.get('goodbye_enabled') else 'OFF'}\n\n"
                 f"<b>Goodbye text (no formatting):</b>\n{msg.get('goodbye_text', '')}",
                 parse_mode=ParseMode.HTML,
@@ -249,7 +263,7 @@ async def goodbye_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     await update.message.reply_text(
-        f"<b>Goodbye Settings:</b>\n"
+        f"{E.GOODBYE} <b>Goodbye Settings:</b>\n"
         f"  Goodbye: {'ON' if settings.get('goodbye_enabled') else 'OFF'}\n"
         f"  Clean Goodbye: {'ON' if settings.get('clean_goodbye') else 'OFF'}\n\n"
         f"<b>Current Goodbye:</b>\n{msg.get('goodbye_text', '')}",
@@ -260,53 +274,65 @@ async def goodbye_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cleanwelcome_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /cleanwelcome — toggle clean welcome."""
     if update.effective_chat.type == "private":
-        await update.message.reply_text("This command only works in groups.")
+        await update.message.reply_text(f"{E.INFO} This command only works in groups.",
+            parse_mode=ParseMode.HTML)
         return
 
     if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can change this setting.")
+        await update.message.reply_text(f"{E.ERROR} Only admins can change this setting.",
+            parse_mode=ParseMode.HTML)
         return
 
     if not context.args:
         settings = db.get_welcome_settings(update.effective_chat.id)
-        await update.message.reply_text(f"Clean welcome: {'ON' if settings.get('clean_welcome') else 'OFF'}")
+        await update.message.reply_text(f"{E.SETTINGS} Clean welcome: {'ON' if settings.get('clean_welcome') else 'OFF'}",
+            parse_mode=ParseMode.HTML)
         return
 
     arg = context.args[0].lower()
     if arg == "on":
         db.set_clean_welcome(update.effective_chat.id, True)
-        await update.message.reply_text("Clean welcome enabled! Old welcome messages will be deleted.")
+        await update.message.reply_text(f"{E.CHECK} Clean welcome enabled! Old welcome messages will be deleted.",
+            parse_mode=ParseMode.HTML)
     elif arg == "off":
         db.set_clean_welcome(update.effective_chat.id, False)
-        await update.message.reply_text("Clean welcome disabled!")
+        await update.message.reply_text(f"{E.CROSS} Clean welcome disabled!",
+            parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text("Usage: /cleanwelcome on|off")
+        await update.message.reply_text(f"{E.INFO} Usage: /cleanwelcome on|off",
+            parse_mode=ParseMode.HTML)
 
 
 async def cleangoodbye_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /cleangoodbye — toggle clean goodbye."""
     if update.effective_chat.type == "private":
-        await update.message.reply_text("This command only works in groups.")
+        await update.message.reply_text(f"{E.INFO} This command only works in groups.",
+            parse_mode=ParseMode.HTML)
         return
 
     if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can change this setting.")
+        await update.message.reply_text(f"{E.ERROR} Only admins can change this setting.",
+            parse_mode=ParseMode.HTML)
         return
 
     if not context.args:
         settings = db.get_welcome_settings(update.effective_chat.id)
-        await update.message.reply_text(f"Clean goodbye: {'ON' if settings.get('clean_goodbye') else 'OFF'}")
+        await update.message.reply_text(f"{E.SETTINGS} Clean goodbye: {'ON' if settings.get('clean_goodbye') else 'OFF'}",
+            parse_mode=ParseMode.HTML)
         return
 
     arg = context.args[0].lower()
     if arg == "on":
         db.set_clean_goodbye(update.effective_chat.id, True)
-        await update.message.reply_text("Clean goodbye enabled! Old goodbye messages will be deleted.")
+        await update.message.reply_text(f"{E.CHECK} Clean goodbye enabled! Old goodbye messages will be deleted.",
+            parse_mode=ParseMode.HTML)
     elif arg == "off":
         db.set_clean_goodbye(update.effective_chat.id, False)
-        await update.message.reply_text("Clean goodbye disabled!")
+        await update.message.reply_text(f"{E.CROSS} Clean goodbye disabled!",
+            parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text("Usage: /cleangoodbye on|off")
+        await update.message.reply_text(f"{E.INFO} Usage: /cleangoodbye on|off",
+            parse_mode=ParseMode.HTML)
 
 
 # ── Welcome/Goodbye handlers ─────────────────────────────
@@ -322,7 +348,7 @@ async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     msg_data = db.get_welcome_message(chat_id)
-    welcome_text = msg_data.get("welcome_text", "Hey {first}, welcome to {chatname}! 👋")
+    welcome_text = msg_data.get("welcome_text", f"{E.WAVE} Hey {{first}}, welcome to {{chatname}}!")
 
     for user in update.message.new_chat_members:
         # Skip bots
@@ -352,7 +378,7 @@ async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             db.update_last_welcome_msg(chat_id, sent.message_id)
         except Exception as e:
-            logger.error(f"Welcome message error: {e}")
+            logger.warning(f"Welcome message error: {e}")
 
 
 async def left_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -371,7 +397,7 @@ async def left_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     msg_data = db.get_welcome_message(chat_id)
-    goodbye_text = msg_data.get("goodbye_text", "Sad to see you leaving {first}. Take Care! 👋")
+    goodbye_text = msg_data.get("goodbye_text", f"{E.GOODBYE} Sad to see you leaving {{first}}. Take Care!")
 
     # Clean old goodbye message
     if settings.get("clean_goodbye") and settings.get("last_goodbye_msg_id"):
@@ -391,7 +417,7 @@ async def left_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         db.update_last_goodbye_msg(chat_id, sent.message_id)
     except Exception as e:
-        logger.error(f"Goodbye message error: {e}")
+        logger.warning(f"Goodbye message error: {e}")
 
 
 # ── Module setup ─────────────────────────────────────────
