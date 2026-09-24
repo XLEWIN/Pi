@@ -276,8 +276,422 @@ class Database:
             )
         """)
 
+        # ── Analytics: per-chat daily counters ───────────
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chat_daily_stats (
+                chat_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                messages INTEGER DEFAULT 0,
+                new_members INTEGER DEFAULT 0,
+                left_members INTEGER DEFAULT 0,
+                spam_attempts INTEGER DEFAULT 0,
+                mod_actions INTEGER DEFAULT 0,
+                bind_fails INTEGER DEFAULT 0,
+                PRIMARY KEY (chat_id, date)
+            )
+        """)
+
+        # ── Analytics: peak activity hours ───────────────
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chat_hourly_stats (
+                chat_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                hour INTEGER NOT NULL,
+                messages INTEGER DEFAULT 0,
+                PRIMARY KEY (chat_id, date, hour)
+            )
+        """)
+
+        # ── User reputation (global) ─────────────────────
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_reputation (
+                user_id INTEGER PRIMARY KEY,
+                positive_actions INTEGER DEFAULT 0,
+                warnings_total INTEGER DEFAULT 0,
+                restrictions_total INTEGER DEFAULT 0,
+                first_seen TIMESTAMP,
+                updated_at TIMESTAMP
+            )
+        """)
+
+        # ── Anti-raid / Group Shield settings ────────────
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS shield_settings (
+                chat_id INTEGER PRIMARY KEY,
+                shield_enabled INTEGER DEFAULT 1,
+                join_limit INTEGER DEFAULT 8,
+                join_window INTEGER DEFAULT 15,
+                msg_limit INTEGER DEFAULT 10,
+                msg_window INTEGER DEFAULT 5,
+                action TEXT DEFAULT 'alert',
+                lockdown INTEGER DEFAULT 0,
+                updated_at TIMESTAMP
+            )
+        """)
+
+        # ── Raid event log ───────────────────────────────
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS raid_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                detail TEXT,
+                count INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         self.connection.commit()
         logger.info("Database tables created/verified")
+
+    # ── Analytics counters ───────────────────────────────
+    def _bump_daily(self, chat_id: int, **cols: int) -> None:
+        """Increment per-chat daily counters (thread-safe enough for our use)."""
+        from datetime import date
+        today = date.today().isoformat()
+        cursor = self.connection.cursor()
+        cursor.execute(
+            "INSERT OR IGNORE INTO chat_daily_stats (chat_id, date) VALUES (?, ?)",
+            (chat_id, today),
+        )
+        set_parts = ", ".join(f"{k} = {k} + ?" for k in cols)
+        if set_parts:
+            cursor.execute(
+                f"UPDATE chat_daily_stats SET {set_parts} WHERE chat_id = ? AND date = ?",
+                (*cols.values(), chat_id, today),
+            )
+        self.connection.commit()
+
+    def bump_messages(self, chat_id: int, n: int = 1) -> None:
+        try:
+            self._bump_daily(chat_id, messages=n)
+        except sqlite3.Error as e:
+            logger.error(f"bump_messages: {e}")
+
+    def bump_new_members(self, chat_id: int, n: int = 1) -> None:
+        try:
+            self._bump_daily(chat_id, new_members=n)
+        except sqlite3.Error as e:
+            logger.error(f"bump_new_members: {e}")
+
+    def bump_left_members(self, chat_id: int, n: int = 1) -> None:
+        try:
+            self._bump_daily(chat_id, left_members=n)
+        except sqlite3.Error as e:
+            logger.error(f"bump_left_members: {e}")
+
+    def bump_spam_attempts(self, chat_id: int, n: int = 1) -> None:
+        try:
+            self._bump_daily(chat_id, spam_attempts=n)
+        except sqlite3.Error as e:
+            logger.error(f"bump_spam_attempts: {e}")
+
+    def bump_mod_actions(self, chat_id: int, n: int = 1) -> None:
+        try:
+            self._bump_daily(chat_id, mod_actions=n)
+        except sqlite3.Error as e:
+            logger.error(f"bump_mod_actions: {e}")
+
+    def bump_bind_fails(self, chat_id: int, n: int = 1) -> None:
+        try:
+            self._bump_daily(chat_id, bind_fails=n)
+        except sqlite3.Error as e:
+            logger.error(f"bump_bind_fails: {e}")
+
+    def bump_hourly(self, chat_id: int, hour: int, n: int = 1) -> None:
+        from datetime import date
+        today = date.today().isoformat()
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                "INSERT OR IGNORE INTO chat_hourly_stats (chat_id, date, hour) VALUES (?, ?, ?)",
+                (chat_id, today, hour),
+            )
+            cursor.execute(
+                "UPDATE chat_hourly_stats SET messages = messages + ? "
+                "WHERE chat_id = ? AND date = ? AND hour = ?",
+                (n, chat_id, today, hour),
+            )
+            self.connection.commit()
+        except sqlite3.Error as e:
+            logger.error(f"bump_hourly: {e}")
+
+    def get_daily_stats(self, chat_id: int, days: int = 1) -> Dict[str, int]:
+        """Sum chat_daily_stats over the last N days (inclusive of today)."""
+        from datetime import date, timedelta
+        start = (date.today() - timedelta(days=max(days - 1, 0))).isoformat()
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                """
+                SELECT COALESCE(SUM(messages),0), COALESCE(SUM(new_members),0),
+                       COALESCE(SUM(left_members),0), COALESCE(SUM(spam_attempts),0),
+                       COALESCE(SUM(mod_actions),0), COALESCE(SUM(bind_fails),0)
+                FROM chat_daily_stats
+                WHERE chat_id = ? AND date >= ?
+                """,
+                (chat_id, start),
+            )
+            row = cursor.fetchone()
+            return {
+                "messages": row[0],
+                "new_members": row[1],
+                "left_members": row[2],
+                "spam_attempts": row[3],
+                "mod_actions": row[4],
+                "bind_fails": row[5],
+            }
+        except sqlite3.Error as e:
+            logger.error(f"get_daily_stats: {e}")
+            return {
+                "messages": 0, "new_members": 0, "left_members": 0,
+                "spam_attempts": 0, "mod_actions": 0, "bind_fails": 0,
+            }
+
+    def get_active_member_count(self, chat_id: int, days: int = 1) -> int:
+        from datetime import date, timedelta
+        start = (date.today() - timedelta(days=max(days - 1, 0))).isoformat()
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                "SELECT COUNT(DISTINCT user_id) FROM daily_messages "
+                "WHERE chat_id = ? AND date >= ?",
+                (chat_id, start),
+            )
+            return cursor.fetchone()[0] or 0
+        except sqlite3.Error:
+            return 0
+
+    def get_peak_hours(self, chat_id: int, days: int = 7, limit: int = 5) -> List[Dict[str, Any]]:
+        from datetime import date, timedelta
+        start = (date.today() - timedelta(days=max(days - 1, 0))).isoformat()
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                """
+                SELECT hour, SUM(messages) AS total
+                FROM chat_hourly_stats
+                WHERE chat_id = ? AND date >= ?
+                GROUP BY hour
+                ORDER BY total DESC
+                LIMIT ?
+                """,
+                (chat_id, start, limit),
+            )
+            return [{"hour": r[0], "messages": r[1]} for r in cursor.fetchall()]
+        except sqlite3.Error:
+            return []
+
+    # ── Reputation ───────────────────────────────────────
+    def _ensure_reputation(self, user_id: int) -> Dict[str, Any]:
+        cursor = self.connection.cursor()
+        cursor.execute("SELECT * FROM user_reputation WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        if row:
+            return dict(row)
+        now = datetime.now().isoformat()
+        cursor.execute(
+            "INSERT OR IGNORE INTO user_reputation "
+            "(user_id, positive_actions, warnings_total, restrictions_total, first_seen, updated_at) "
+            "VALUES (?, 0, 0, 0, ?, ?)",
+            (user_id, now, now),
+        )
+        self.connection.commit()
+        return {
+            "user_id": user_id,
+            "positive_actions": 0,
+            "warnings_total": 0,
+            "restrictions_total": 0,
+            "first_seen": now,
+            "updated_at": now,
+        }
+
+    def record_reputation_event(self, user_id: int, kind: str, delta: int = 1) -> None:
+        """kind: positive | warning | restriction"""
+        try:
+            self._ensure_reputation(user_id)
+            col = {
+                "positive": "positive_actions",
+                "warning": "warnings_total",
+                "restriction": "restrictions_total",
+            }.get(kind)
+            if not col:
+                return
+            now = datetime.now().isoformat()
+            cursor = self.connection.cursor()
+            cursor.execute(
+                f"UPDATE user_reputation SET {col} = MAX(0, {col} + ?), updated_at = ? "
+                "WHERE user_id = ?",
+                (delta, now, user_id),
+            )
+            self.connection.commit()
+        except sqlite3.Error as e:
+            logger.error(f"record_reputation_event: {e}")
+
+    def get_reputation(self, user_id: int) -> Dict[str, Any]:
+        """Computed reputation score + component counters."""
+        self._ensure_reputation(user_id)
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute("SELECT * FROM user_reputation WHERE user_id = ?", (user_id,))
+            row = dict(cursor.fetchone())
+            lvl = self.get_user_level(user_id)
+            messages = int(lvl.get("global_messages") or 0)
+            pos = int(row.get("positive_actions") or 0)
+            warns = int(row.get("warnings_total") or 0)
+            restr = int(row.get("restrictions_total") or 0)
+            # Activity-based base + boosts/penalties (never negative).
+            score = max(0, (messages // 5) + (pos * 10) - (warns * 20) - (restr * 40))
+            return {
+                "user_id": user_id,
+                "reputation": score,
+                "messages": messages,
+                "positive_actions": pos,
+                "warnings": warns,
+                "restrictions": restr,
+                "first_seen": row.get("first_seen"),
+            }
+        except sqlite3.Error as e:
+            logger.error(f"get_reputation: {e}")
+            return {
+                "user_id": user_id, "reputation": 0, "messages": 0,
+                "positive_actions": 0, "warnings": 0, "restrictions": 0,
+                "first_seen": None,
+            }
+
+    def get_reputation_rank(self, user_id: int) -> int:
+        """1-based global rank by computed reputation (messages//5 + boosts)."""
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                """
+                SELECT r.user_id,
+                       COALESCE(l.global_messages, 0) AS msgs,
+                       r.positive_actions, r.warnings_total, r.restrictions_total
+                FROM user_reputation r
+                LEFT JOIN user_level l ON l.user_id = r.user_id
+                """
+            )
+            scored = []
+            for row in cursor.fetchall():
+                score = max(
+                    0,
+                    (int(row[1]) // 5)
+                    + (int(row[2]) * 10)
+                    - (int(row[3]) * 20)
+                    - (int(row[4]) * 40),
+                )
+                scored.append((score, int(row[0])))
+            # Include users who have messages but no reputation row yet.
+            cursor.execute("SELECT user_id, global_messages FROM user_level")
+            known = {uid for _, uid in scored}
+            for row in cursor.fetchall():
+                uid, msgs = int(row[0]), int(row[1])
+                if uid not in known:
+                    scored.append((max(0, int(msgs) // 5), uid))
+            scored.sort(key=lambda x: (-x[0], x[1]))
+            for i, (_, uid) in enumerate(scored, start=1):
+                if uid == user_id:
+                    return i
+            return len(scored) + 1
+        except sqlite3.Error as e:
+            logger.error(f"get_reputation_rank: {e}")
+            return 1
+
+    def get_active_days(self, user_id: int) -> int:
+        """Days since first_seen (users table)."""
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute("SELECT first_seen FROM users WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
+            if not row or not row[0]:
+                return 0
+            first = datetime.fromisoformat(str(row[0]).replace("Z", ""))
+            return max(0, (datetime.now() - first).days)
+        except (sqlite3.Error, ValueError):
+            return 0
+
+    # ── Shield / anti-raid ───────────────────────────────
+    def get_shield_settings(self, chat_id: int) -> Dict[str, Any]:
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute("SELECT * FROM shield_settings WHERE chat_id = ?", (chat_id,))
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+            return {
+                "chat_id": chat_id,
+                "shield_enabled": 1,
+                "join_limit": 8,
+                "join_window": 15,
+                "msg_limit": 10,
+                "msg_window": 5,
+                "action": "alert",
+                "lockdown": 0,
+                "updated_at": None,
+            }
+        except sqlite3.Error as e:
+            logger.error(f"get_shield_settings: {e}")
+            return {}
+
+    def set_shield_settings(self, chat_id: int, **fields: Any) -> Dict[str, Any]:
+        current = self.get_shield_settings(chat_id)
+        current.update(fields)
+        current["chat_id"] = chat_id
+        current["updated_at"] = datetime.now().isoformat()
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                """
+                INSERT OR REPLACE INTO shield_settings
+                (chat_id, shield_enabled, join_limit, join_window, msg_limit,
+                 msg_window, action, lockdown, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    chat_id,
+                    int(current.get("shield_enabled") or 0),
+                    int(current.get("join_limit") or 8),
+                    int(current.get("join_window") or 15),
+                    int(current.get("msg_limit") or 10),
+                    int(current.get("msg_window") or 5),
+                    str(current.get("action") or "alert"),
+                    int(current.get("lockdown") or 0),
+                    current.get("updated_at"),
+                ),
+            )
+            self.connection.commit()
+            return current
+        except sqlite3.Error as e:
+            logger.error(f"set_shield_settings: {e}")
+            return current
+
+    def log_raid_event(self, chat_id: int, kind: str, detail: str, count: int = 1) -> None:
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                "INSERT INTO raid_events (chat_id, kind, detail, count) VALUES (?, ?, ?, ?)",
+                (chat_id, kind, detail, count),
+            )
+            # Keep log bounded.
+            cursor.execute(
+                "DELETE FROM raid_events WHERE id NOT IN "
+                "(SELECT id FROM raid_events ORDER BY id DESC LIMIT 500)"
+            )
+            self.connection.commit()
+        except sqlite3.Error as e:
+            logger.error(f"log_raid_event: {e}")
+
+    def get_raid_events(self, chat_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                "SELECT * FROM raid_events WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
+                (chat_id, limit),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+        except sqlite3.Error:
+            return []
 
     def add_user(self, user_id: int, username: str = None, first_name: str = None,
                  last_name: str = None, is_bot: bool = False) -> bool:

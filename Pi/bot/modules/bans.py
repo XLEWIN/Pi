@@ -1,9 +1,10 @@
 """Bans module - Global ban (gban), sudo users, and mass-ban features.
 
-Uses SQLite database for storage.
+Uses SQLite database for storage. Success replies use bot.responses cards.
 """
 
 import logging
+from html import escape
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -11,6 +12,16 @@ from telegram.constants import ParseMode
 
 from bot.database import db
 from bot.emojis import E
+from bot.responses import (
+    action_card,
+    field_by,
+    field_extra,
+    field_reason,
+    field_user,
+    plain_error,
+    plain_ok,
+    reply_card,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,9 +67,18 @@ async def addsudo_command(update, context):
             parse_mode=ParseMode.HTML)
         return
     db.add_sudo_user(target.id, update.effective_user.id)
-    await update.message.reply_text(
-        f"{E.CHECK} Added <a href='tg://user?id={target.id}'>{target.first_name}</a> as sudo user.",
-        parse_mode=ParseMode.HTML,
+    await reply_card(
+        update.message,
+        action_card(
+            "SUDO ADDED",
+            [
+                field_user(target),
+                field_by(update.effective_user, "ADDED BY"),
+                field_extra(E.SETTINGS, "ROLE", "SUDO"),
+            ],
+            icon=E.CHECK,
+        ),
+        user=target,
     )
 
 
@@ -73,12 +93,20 @@ async def rmsudo_command(update, context):
             parse_mode=ParseMode.HTML)
         return
     if db.remove_sudo_user(target.id):
-        await update.message.reply_text(
-            f"{E.CHECK} Removed <a href='tg://user?id={target.id}'>{target.first_name}</a> from sudo users.",
-            parse_mode=ParseMode.HTML,
+        await reply_card(
+            update.message,
+            action_card(
+                "SUDO REMOVED",
+                [
+                    field_user(target),
+                    field_by(update.effective_user, "REMOVED BY"),
+                ],
+                icon=E.CROSS,
+            ),
+            user=target,
         )
     else:
-        await update.message.reply_text(f"{E.WARNING} User is not a sudo user.",
+        await update.message.reply_text(plain_error("User is not a sudo user."),
             parse_mode=ParseMode.HTML)
 
 
@@ -124,10 +152,19 @@ async def gban_command(update, context):
     except Exception:
         pass
     total = len(db.get_gbanned_users())
-    await update.message.reply_text(
-        f"{E.BAN} <b>Globally Banned</b> <a href='tg://user?id={target.id}'>{target.first_name}</a>\n"
-        f"<b>Reason:</b> {reason}\n<b>Total Gbanned:</b> {total}",
-        parse_mode=ParseMode.HTML,
+    await reply_card(
+        update.message,
+        action_card(
+            "GLOBAL BAN SUCCESSFUL",
+            [
+                field_user(target),
+                field_by(update.effective_user, "BANNED BY"),
+                field_reason(reason),
+                field_extra(E.BAN, "TOTAL GBANNED", str(total)),
+            ],
+            icon=E.BAN,
+        ),
+        user=target,
     )
 
 
@@ -146,12 +183,20 @@ async def ungban_command(update, context):
             await context.bot.unban_chat_member(update.effective_chat.id, target.id)
         except Exception:
             pass
-        await update.message.reply_text(
-            f"{E.UNBAN} <b>Globally Unbanned</b> <a href='tg://user?id={target.id}'>{target.first_name}</a>.",
-            parse_mode=ParseMode.HTML,
+        await reply_card(
+            update.message,
+            action_card(
+                "GLOBAL UNBAN SUCCESSFUL",
+                [
+                    field_user(target),
+                    field_by(update.effective_user, "UNBANNED BY"),
+                ],
+                icon=E.UNBAN,
+            ),
+            user=target,
         )
     else:
-        await update.message.reply_text(f"{E.WARNING} User is not gbanned.",
+        await update.message.reply_text(plain_error("User is not gbanned."),
             parse_mode=ParseMode.HTML)
 
 
@@ -191,8 +236,18 @@ async def massban_command(update, context):
             banned += 1
         except (ValueError, Exception):
             failed += 1
-    await update.message.reply_text(f"{E.BAN} <b>Mass Ban:</b> Banned: {banned}, Failed: {failed}",
-            parse_mode=ParseMode.HTML)
+    await reply_card(
+        update.message,
+        action_card(
+            "MASS BAN COMPLETE",
+            [
+                field_by(update.effective_user, "BANNED BY"),
+                field_extra(E.BAN, "BANNED", str(banned)),
+                field_extra(E.ERROR, "FAILED", str(failed)),
+            ],
+            icon=E.BAN,
+        ),
+    )
 
 
 async def sudopromote_command(update, context):
@@ -213,12 +268,21 @@ async def sudopromote_command(update, context):
             can_pin_messages=True, can_promote_members=False,
             can_manage_video_chats=True,
         )
-        await update.message.reply_text(
-            f"{E.CHECK} Promoted <a href='tg://user?id={target.id}'>{target.first_name}</a>.",
-            parse_mode=ParseMode.HTML,
+        await reply_card(
+            update.message,
+            action_card(
+                "PROMOTION SUCCESSFUL",
+                [
+                    field_user(target),
+                    field_by(update.effective_user, "PROMOTED BY"),
+                    field_extra(E.SETTINGS, "TITLE", "ADMIN"),
+                ],
+                icon=E.CHECK,
+            ),
+            user=target,
         )
     except Exception as e:
-        await update.message.reply_text(f"{E.ERROR} Failed to promote: {e}",
+        await update.message.reply_text(plain_error(f"Failed to promote: {e}"),
             parse_mode=ParseMode.HTML)
 
 

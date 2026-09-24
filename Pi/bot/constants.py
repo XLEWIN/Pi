@@ -26,6 +26,21 @@ Here are all the available commands:
 /userinfo @user — See user info (admin)
 /userstats — Bot statistics (admin)
 /recentactivity — Recent activity (admin)
+/profile [@user] — Reputation profile card
+
+<b>{alert} Security &amp; Anti-Raid</b>
+/shield [on|off] — View / toggle Group Shield (admin)
+/shieldcfg joins &lt;N&gt; &lt;sec&gt; — Join-burst threshold (admin)
+/shieldcfg msgs &lt;N&gt; &lt;sec&gt; — Message-burst threshold (admin)
+/shieldcfg action &lt;alert|mute|kick|ban&gt; — Raid response (admin)
+/lockdown [on|off] — Freeze non-admin messaging (admin)
+/raidlog [n] — Recent raid events (admin)
+
+<b>{settings} Analytics</b>
+/stats [day|week|month] — Analytics dashboard (admin)
+/analytics — Alias of /stats (admin)
+/topactive [day|week|month] — Most active users (admin)
+/peakhours [days] — Busiest hours (admin)
 
 <b>{mute} Moderation</b>
 
