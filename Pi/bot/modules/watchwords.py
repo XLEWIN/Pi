@@ -19,6 +19,7 @@ from telegram.constants import ParseMode
 
 from bot.database import db
 from bot.keyboards.colored import btn_url, build_keyboard
+from bot.emojis import E, EID
 
 logger = logging.getLogger(__name__)
 
@@ -41,14 +42,16 @@ def _get_chat_link(chat):
 
 async def watch_command(update, context):
     if update.effective_chat.type == "private":
-        await update.message.reply_text("This command only works in groups.")
+        await update.message.reply_text(f"{E.INFO} This command only works in groups.",
+            parse_mode=ParseMode.HTML)
         return
     if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can manage watch words.")
+        await update.message.reply_text(f"{E.ERROR} Only admins can manage watch words.",
+            parse_mode=ParseMode.HTML)
         return
     if not context.args:
         await update.message.reply_text(
-            "<b>Watch Words</b>\n\n"
+            f"{E.EYES} <b>Watch Words</b>\n\n"
             "<b>Usage:</b>\n"
             "  /watch &lt;word or phrase&gt; - Add a watch word\n"
             "  /unwatch &lt;word or phrase&gt; - Remove a watch word\n"
@@ -65,25 +68,27 @@ async def watch_command(update, context):
 
     existing = db.get_watch_words(chat_id, admin_id)
     if word in existing:
-        await update.message.reply_text(f"<b>{word}</b> is already being watched.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"{E.WARNING} <b>{word}</b> is already being watched.", parse_mode=ParseMode.HTML)
         return
 
     db.add_watch_word(chat_id, admin_id, word)
     await update.message.reply_text(
-        f"Added <b>{word}</b> to your watch list.\nI'll notify you in DM when someone uses it.",
+        f"{E.CHECK} Added <b>{word}</b> to your watch list.\nI'll notify you in DM when someone uses it.",
         parse_mode=ParseMode.HTML,
     )
 
 
 async def unwatch_command(update, context):
     if update.effective_chat.type == "private":
-        await update.message.reply_text("This command only works in groups.")
+        await update.message.reply_text(f"{E.INFO} This command only works in groups.",
+            parse_mode=ParseMode.HTML)
         return
     if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can manage watch words.")
+        await update.message.reply_text(f"{E.ERROR} Only admins can manage watch words.",
+            parse_mode=ParseMode.HTML)
         return
     if not context.args:
-        await update.message.reply_text("Usage: /unwatch &lt;word or phrase&gt;", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"{E.INFO} Usage: /unwatch &lt;word or phrase&gt;", parse_mode=ParseMode.HTML)
         return
 
     chat_id = update.effective_chat.id
@@ -91,9 +96,10 @@ async def unwatch_command(update, context):
     word = " ".join(context.args).lower().strip()
 
     if db.remove_watch_word(chat_id, admin_id, word):
-        await update.message.reply_text(f"Removed <b>{word}</b> from your watch list.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"{E.CHECK} Removed <b>{word}</b> from your watch list.", parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text("Word not found in your watch list.")
+        await update.message.reply_text(f"{E.WARNING} Word not found in your watch list.",
+            parse_mode=ParseMode.HTML)
 
 
 async def watchlist_command(update, context):
@@ -107,28 +113,30 @@ async def watchlist_command(update, context):
 
     if not words:
         await update.message.reply_text(
-            "Your watch list is empty.\nUse /watch &lt;word&gt; to add words.",
+            f"{E.INFO} Your watch list is empty.\nUse /watch &lt;word&gt; to add words.",
             parse_mode=ParseMode.HTML,
         )
         return
 
     word_list = "\n".join([f"  - <code>{w}</code>" for w in sorted(words)])
     await update.message.reply_text(
-        f"<b>Your Watched Words ({len(words)}):</b>\n{word_list}",
+        f"{E.EYES} <b>Your Watched Words ({len(words)}):</b>\n{word_list}",
         parse_mode=ParseMode.HTML,
     )
 
 
 async def watchmode_command(update, context):
     if update.effective_chat.type == "private":
-        await update.message.reply_text("This command only works in groups.")
+        await update.message.reply_text(f"{E.INFO} This command only works in groups.",
+            parse_mode=ParseMode.HTML)
         return
     if not await _is_admin(update, context):
-        await update.message.reply_text("Only admins can change watch settings.")
+        await update.message.reply_text(f"{E.ERROR} Only admins can change watch settings.",
+            parse_mode=ParseMode.HTML)
         return
     if not context.args or context.args[0].lower() not in ["copy", "forward"]:
         await update.message.reply_text(
-            "Choose mode: <b>copy</b> or <b>forward</b>\n\n"
+            f"{E.SETTINGS} Choose mode: <b>copy</b> or <b>forward</b>\n\n"
             "<b>copy</b> - Formatted log with chat, sender, word, date, message.\n"
             "<b>forward</b> - Forwards the original message.",
             parse_mode=ParseMode.HTML,
@@ -139,7 +147,7 @@ async def watchmode_command(update, context):
     admin_id = update.effective_user.id
     mode = context.args[0].lower()
     db.set_watch_mode(chat_id, admin_id, mode)
-    await update.message.reply_text(f"Watch mode set to: <b>{mode}</b>", parse_mode=ParseMode.HTML)
+    await update.message.reply_text(f"{E.CHECK} Watch mode set to: <b>{mode}</b>", parse_mode=ParseMode.HTML)
 
 
 async def watch_check(update, context):
@@ -189,7 +197,7 @@ async def watch_check(update, context):
                         # Send via Bot API with colored buttons
                         tg_buttons = []
                         if msg_link:
-                            tg_buttons.append([btn_url("View Message", msg_link)])
+                            tg_buttons.append([btn_url("View Message", msg_link, icon_emoji_id=EID.WATCH)])
 
                         reply_markup = build_keyboard(tg_buttons) if tg_buttons else None
                         await context.bot.send_message(
@@ -204,12 +212,19 @@ async def watch_check(update, context):
                             f"Chat: {chat.title}\n"
                             f"Matched: <code>{word}</code>\n"
                         )
-                        await context.bot.send_message(chat_id=admin_id, text=header, parse_mode=ParseMode.HTML)
+                        # plain text fallback if HTML entities in title break parse
+                        try:
+                            await context.bot.send_message(chat_id=admin_id, text=header, parse_mode=ParseMode.HTML)
+                        except Exception:
+                            await context.bot.send_message(
+                                chat_id=admin_id,
+                                text=f"Watch Word Alert!\nChat: {chat.title}\nMatched: {word}",
+                            )
                         await message.forward(chat_id=admin_id)
 
                     break
                 except Exception as e:
-                    logger.error(f"Watch notification error: {e}")
+                    logger.warning(f"Watch notification error: {e}")
                 break
 
 
@@ -218,6 +233,6 @@ def setup(app: Application) -> list:
     app.add_handler(CommandHandler("unwatch", unwatch_command, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("watchlist", watchlist_command, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("watchmode", watchmode_command, filters=filters.ChatType.GROUPS))
-    app.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, watch_check), group=3)
+    app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, watch_check), group=3)
 
     return ["watch", "unwatch", "watchlist", "watchmode"]

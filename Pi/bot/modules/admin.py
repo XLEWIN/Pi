@@ -9,6 +9,8 @@ from telegram import Update, ChatMember, ChatPermissions
 from telegram.ext import Application, CommandHandler, ContextTypes, filters
 from telegram.constants import ParseMode
 
+from bot.emojis import E
+
 logger = logging.getLogger(__name__)
 
 # ── Helpers ──────────────────────────────────────────────
@@ -58,21 +60,24 @@ async def _get_target_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def promote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /promote — promote a user to admin."""
     if update.effective_chat.type == "private":
-        await update.message.reply_text("❌ This command only works in groups.")
+        await update.message.reply_text(f"{E.ERROR} This command only works in groups.",
+            parse_mode=ParseMode.HTML)
         return
 
     if not await _is_owner(update, context):
-        await update.message.reply_text("❌ Only the group creator can promote admins.")
+        await update.message.reply_text(f"{E.ERROR} Only the group creator can promote admins.",
+            parse_mode=ParseMode.HTML)
         return
 
     if not await _is_bot_admin(update, context):
-        await update.message.reply_text("❌ I need admin rights to promote users.")
+        await update.message.reply_text(f"{E.ERROR} I need admin rights to promote users.",
+            parse_mode=ParseMode.HTML)
         return
 
     target = await _get_target_user(update, context)
     if not target:
         await update.message.reply_text(
-            "❌ Reply to a user or provide their ID.\n\n<b>Usage:</b> /promote @user",
+            f"{E.ERROR} Reply to a user or provide their ID.\n\n<b>Usage:</b> /promote @user",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -90,27 +95,30 @@ async def promote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             can_manage_video_chats=True,
         )
         await update.message.reply_text(
-            f"✅ Promoted <a href='tg://user?id={target.id}'>{target.first_name}</a> to admin.",
+            f"{E.CHECK} Promoted <a href='tg://user?id={target.id}'>{target.first_name}</a> to admin.",
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed to promote: {e}")
+        await update.message.reply_text(f"{E.ERROR} Failed to promote: {e}",
+            parse_mode=ParseMode.HTML)
 
 
 async def demote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /demote — demote an admin."""
     if update.effective_chat.type == "private":
-        await update.message.reply_text("❌ This command only works in groups.")
+        await update.message.reply_text(f"{E.ERROR} This command only works in groups.",
+            parse_mode=ParseMode.HTML)
         return
 
     if not await _is_owner(update, context):
-        await update.message.reply_text("❌ Only the group creator can demote admins.")
+        await update.message.reply_text(f"{E.ERROR} Only the group creator can demote admins.",
+            parse_mode=ParseMode.HTML)
         return
 
     target = await _get_target_user(update, context)
     if not target:
         await update.message.reply_text(
-            "❌ Reply to a user or provide their ID.\n\n<b>Usage:</b> /demote @user",
+            f"{E.ERROR} Reply to a user or provide their ID.\n\n<b>Usage:</b> /demote @user",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -128,25 +136,29 @@ async def demote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             can_manage_video_chats=False,
         )
         await update.message.reply_text(
-            f"✅ Demoted <a href='tg://user?id={target.id}'>{target.first_name}</a>.",
+            f"{E.CHECK} Demoted <a href='tg://user?id={target.id}'>{target.first_name}</a>.",
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed to demote: {e}")
+        await update.message.reply_text(f"{E.ERROR} Failed to demote: {e}",
+            parse_mode=ParseMode.HTML)
 
 
 async def pin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /pin — pin a message."""
     if update.effective_chat.type == "private":
-        await update.message.reply_text("❌ This command only works in groups.")
+        await update.message.reply_text(f"{E.ERROR} This command only works in groups.",
+            parse_mode=ParseMode.HTML)
         return
 
     if not await _is_admin(update, context):
-        await update.message.reply_text("❌ You need admin rights to pin messages.")
+        await update.message.reply_text(f"{E.ERROR} You need admin rights to pin messages.",
+            parse_mode=ParseMode.HTML)
         return
 
     if not update.message.reply_to_message:
-        await update.message.reply_text("❌ Reply to a message to pin it.")
+        await update.message.reply_text(f"{E.ERROR} Reply to a message to pin it.",
+            parse_mode=ParseMode.HTML)
         return
 
     try:
@@ -157,21 +169,26 @@ async def pin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             disable_notification=silent,
         )
         if silent:
-            await update.message.reply_text("📌 Message pinned silently.")
+            await update.message.reply_text(f"{E.PIN} Message pinned silently.",
+            parse_mode=ParseMode.HTML)
         else:
-            await update.message.reply_text("📌 Message pinned.")
+            await update.message.reply_text(f"{E.PIN} Message pinned.",
+            parse_mode=ParseMode.HTML)
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed to pin: {e}")
+        await update.message.reply_text(f"{E.ERROR} Failed to pin: {e}",
+            parse_mode=ParseMode.HTML)
 
 
 async def unpin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /unpin — unpin a message."""
     if update.effective_chat.type == "private":
-        await update.message.reply_text("❌ This command only works in groups.")
+        await update.message.reply_text(f"{E.ERROR} This command only works in groups.",
+            parse_mode=ParseMode.HTML)
         return
 
     if not await _is_admin(update, context):
-        await update.message.reply_text("❌ You need admin rights to unpin messages.")
+        await update.message.reply_text(f"{E.ERROR} You need admin rights to unpin messages.",
+            parse_mode=ParseMode.HTML)
         return
 
     try:
@@ -182,15 +199,18 @@ async def unpin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await context.bot.unpin_all_chat_messages(update.effective_chat.id)
-        await update.message.reply_text("📌 Message unpinned.")
+        await update.message.reply_text(f"{E.PIN} Message unpinned.",
+            parse_mode=ParseMode.HTML)
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed to unpin: {e}")
+        await update.message.reply_text(f"{E.ERROR} Failed to unpin: {e}",
+            parse_mode=ParseMode.HTML)
 
 
 async def adminlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /adminlist — show all admins."""
     if update.effective_chat.type == "private":
-        await update.message.reply_text("❌ This command only works in groups.")
+        await update.message.reply_text(f"{E.ERROR} This command only works in groups.",
+            parse_mode=ParseMode.HTML)
         return
 
     try:
@@ -204,27 +224,29 @@ async def adminlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 admin_list.append(admin.user)
 
-        text = f"👑 <b>Admins in {update.effective_chat.title}:</b>\n\n"
+        text = f"{E.CROWN} <b>Admins in {update.effective_chat.title}:</b>\n\n"
 
         if owner:
             name = f"@{owner.username}" if owner.username else owner.first_name
-            text += f"👑 <b>Owner:</b> <a href='tg://user?id={owner.id}'>{name}</a>\n"
+            text += f"{E.CROWN} <b>Owner:</b> <a href='tg://user?id={owner.id}'>{name}</a>\n"
 
         if admin_list:
-            text += "\n🔧 <b>Administrators:</b>\n"
+            text += f"\n{E.ADMIN} <b>Administrators:</b>\n"
             for admin in admin_list:
                 name = f"@{admin.username}" if admin.username else admin.first_name
                 text += f"• <a href='tg://user?id={admin.id}'>{name}</a>\n"
 
         await update.message.reply_text(text, parse_mode=ParseMode.HTML)
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed to get admin list: {e}")
+        await update.message.reply_text(f"{E.ERROR} Failed to get admin list: {e}",
+            parse_mode=ParseMode.HTML)
 
 
 async def admin_count_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /admincount — count admins in chat."""
     if update.effective_chat.type == "private":
-        await update.message.reply_text("❌ This command only works in groups.")
+        await update.message.reply_text(f"{E.ERROR} This command only works in groups.",
+            parse_mode=ParseMode.HTML)
         return
 
     try:
@@ -233,80 +255,93 @@ async def admin_count_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         admin_count = len(admins) - owner_count
 
         await update.message.reply_text(
-            f"📊 <b>Admin Count for {update.effective_chat.title}:</b>\n\n"
-            f"👑 Owner: {owner_count}\n"
-            f"🔧 Admins: {admin_count}\n"
-            f"👤 Total: {len(admins)}",
+            f"{E.INFO} <b>Admin Count for {update.effective_chat.title}:</b>\n\n"
+            f"{E.CROWN} Owner: {owner_count}\n"
+            f"{E.ADMIN} Admins: {admin_count}\n"
+            f"{E.USER} Total: {len(admins)}",
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed to count admins: {e}")
+        await update.message.reply_text(f"{E.ERROR} Failed to count admins: {e}",
+            parse_mode=ParseMode.HTML)
 
 
 async def setchatphoto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /setchatphoto — set chat photo (reply to a photo)."""
     if update.effective_chat.type == "private":
-        await update.message.reply_text("❌ This command only works in groups.")
+        await update.message.reply_text(f"{E.ERROR} This command only works in groups.",
+            parse_mode=ParseMode.HTML)
         return
 
     if not await _is_admin(update, context):
-        await update.message.reply_text("❌ You need admin rights.")
+        await update.message.reply_text(f"{E.ERROR} You need admin rights.",
+            parse_mode=ParseMode.HTML)
         return
 
     if not update.message.reply_to_message or not update.message.reply_to_message.photo:
-        await update.message.reply_text("❌ Reply to a photo to set it as chat photo.")
+        await update.message.reply_text(f"{E.ERROR} Reply to a photo to set it as chat photo.",
+            parse_mode=ParseMode.HTML)
         return
 
     try:
         photo = update.message.reply_to_message.photo[-1]
         await context.bot.set_chat_photo(update.effective_chat.id, photo.file_id)
-        await update.message.reply_text("✅ Chat photo updated.")
+        await update.message.reply_text(f"{E.CHECK} Chat photo updated.",
+            parse_mode=ParseMode.HTML)
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed to set photo: {e}")
+        await update.message.reply_text(f"{E.ERROR} Failed to set photo: {e}",
+            parse_mode=ParseMode.HTML)
 
 
 async def setchatname_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /setchatname — set chat name."""
     if update.effective_chat.type == "private":
-        await update.message.reply_text("❌ This command only works in groups.")
+        await update.message.reply_text(f"{E.ERROR} This command only works in groups.",
+            parse_mode=ParseMode.HTML)
         return
 
     if not await _is_admin(update, context):
-        await update.message.reply_text("❌ You need admin rights.")
+        await update.message.reply_text(f"{E.ERROR} You need admin rights.",
+            parse_mode=ParseMode.HTML)
         return
 
     if not context.args:
-        await update.message.reply_text("ℹ️ Usage: /setchatname &lt;new name&gt;", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"{E.INFO} Usage: /setchatname &lt;new name&gt;", parse_mode=ParseMode.HTML)
         return
 
     name = " ".join(context.args)
     try:
         await context.bot.set_chat_title(update.effective_chat.id, name)
-        await update.message.reply_text(f"✅ Chat name set to: <b>{name}</b>", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"{E.CHECK} Chat name set to: <b>{name}</b>", parse_mode=ParseMode.HTML)
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed to set name: {e}")
+        await update.message.reply_text(f"{E.ERROR} Failed to set name: {e}",
+            parse_mode=ParseMode.HTML)
 
 
 async def setchatdescription_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /setchatdescription — set chat description."""
     if update.effective_chat.type == "private":
-        await update.message.reply_text("❌ This command only works in groups.")
+        await update.message.reply_text(f"{E.ERROR} This command only works in groups.",
+            parse_mode=ParseMode.HTML)
         return
 
     if not await _is_admin(update, context):
-        await update.message.reply_text("❌ You need admin rights.")
+        await update.message.reply_text(f"{E.ERROR} You need admin rights.",
+            parse_mode=ParseMode.HTML)
         return
 
     if not context.args:
-        await update.message.reply_text("ℹ️ Usage: /setchatdescription &lt;description&gt;", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"{E.INFO} Usage: /setchatdescription &lt;description&gt;", parse_mode=ParseMode.HTML)
         return
 
     desc = " ".join(context.args)
     try:
         await context.bot.set_chat_description(update.effective_chat.id, desc)
-        await update.message.reply_text("✅ Chat description updated.")
+        await update.message.reply_text(f"{E.CHECK} Chat description updated.",
+            parse_mode=ParseMode.HTML)
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed to set description: {e}")
+        await update.message.reply_text(f"{E.ERROR} Failed to set description: {e}",
+            parse_mode=ParseMode.HTML)
 
 
 # ── Module setup ─────────────────────────────────────────

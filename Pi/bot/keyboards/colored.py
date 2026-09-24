@@ -4,36 +4,53 @@ Uses Telegram's native button styling:
 - primary  → Blue
 - success  → Green
 - danger   → Red
+
+Also supports icon_custom_emoji_id for custom emoji icons on buttons.
 """
 
-from typing import List
+from typing import List, Optional
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 
 # ── Button builders ──────────────────────────────────────
-def btn_primary(text: str, data: str) -> InlineKeyboardButton:
+def btn_primary(text: str, data: str, icon_emoji_id: Optional[str] = None) -> InlineKeyboardButton:
     """Blue/primary colored button."""
-    return InlineKeyboardButton(text, callback_data=data, api_kwargs={"style": "primary"})
+    kwargs = {"style": "primary"}
+    if icon_emoji_id:
+        kwargs["icon_custom_emoji_id"] = icon_emoji_id
+    return InlineKeyboardButton(text, callback_data=data, api_kwargs=kwargs)
 
 
-def btn_success(text: str, data: str) -> InlineKeyboardButton:
+def btn_success(text: str, data: str, icon_emoji_id: Optional[str] = None) -> InlineKeyboardButton:
     """Green/success colored button."""
-    return InlineKeyboardButton(text, callback_data=data, api_kwargs={"style": "success"})
+    kwargs = {"style": "success"}
+    if icon_emoji_id:
+        kwargs["icon_custom_emoji_id"] = icon_emoji_id
+    return InlineKeyboardButton(text, callback_data=data, api_kwargs=kwargs)
 
 
-def btn_danger(text: str, data: str) -> InlineKeyboardButton:
+def btn_danger(text: str, data: str, icon_emoji_id: Optional[str] = None) -> InlineKeyboardButton:
     """Red/danger colored button."""
-    return InlineKeyboardButton(text, callback_data=data, api_kwargs={"style": "danger"})
+    kwargs = {"style": "danger"}
+    if icon_emoji_id:
+        kwargs["icon_custom_emoji_id"] = icon_emoji_id
+    return InlineKeyboardButton(text, callback_data=data, api_kwargs=kwargs)
 
 
-def btn_default(text: str, data: str) -> InlineKeyboardButton:
+def btn_default(text: str, data: str, icon_emoji_id: Optional[str] = None) -> InlineKeyboardButton:
     """Default/white colored button."""
-    return InlineKeyboardButton(text, callback_data=data)
+    kwargs = {}
+    if icon_emoji_id:
+        kwargs["icon_custom_emoji_id"] = icon_emoji_id
+    return InlineKeyboardButton(text, callback_data=data, api_kwargs=kwargs if kwargs else None)
 
 
-def btn_url(text: str, url: str) -> InlineKeyboardButton:
+def btn_url(text: str, url: str, icon_emoji_id: Optional[str] = None) -> InlineKeyboardButton:
     """URL button."""
-    return InlineKeyboardButton(text, url=url)
+    kwargs = {}
+    if icon_emoji_id:
+        kwargs["icon_custom_emoji_id"] = icon_emoji_id
+    return InlineKeyboardButton(text, url=url, api_kwargs=kwargs if kwargs else None)
 
 
 # ── Keyboard builder ─────────────────────────────────────

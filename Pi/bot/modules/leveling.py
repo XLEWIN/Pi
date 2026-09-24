@@ -18,6 +18,7 @@ from telegram.constants import ParseMode
 from bot.database import db
 from bot.profile_templates import get_theme_list, THEMES
 from bot.rank_image import create_rank_card
+from bot.emojis import E
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +42,7 @@ def _format_number(n: int) -> str:
 
 # ── Message tracker for XP ──────────────────────────────
 async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Track messages for XP gain."""
+    """Track messages for XP gain (DB work runs off the event loop)."""
     if not update.message or update.effective_chat.type == "private":
         return
 
@@ -60,17 +61,25 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     _cooldowns[cooldown_key] = now
 
-    # Add XP
-    level_ups, new_level, leveled_up = db.add_message_xp(user_id, chat_id)
+    def _db_work():
+        try:
+            return db.add_message_xp(user_id, chat_id)
+        except Exception as e:
+            logger.warning(f"XP track failed: {e}")
+            return (0, 1, False)
+
+    # SQLite is synchronous — run it off the event loop so commands stay fast.
+    import asyncio
+    loop = asyncio.get_running_loop()
+    _level_ups, new_level, leveled_up = await loop.run_in_executor(None, _db_work)
 
     # Announce level up (only every 5 levels to avoid spam)
     if leveled_up and new_level % 5 == 0:
-        user_data = db.get_user_level(user_id)
         name = user.first_name or "User"
         try:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"🎉 <b>{name}</b> leveled up to <b>Level {new_level}</b>!",
+                text=f"{E.FIRE} <b>{name}</b> leveled up to <b>Level {new_level}</b>!",
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
@@ -81,7 +90,8 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /rank — show user rank card using smash-style renderer."""
     if update.effective_chat.type == "private":
-        await update.message.reply_text("This command only works in groups.")
+        await update.message.reply_text(f"{E.INFO} This command only works in groups.",
+            parse_mode=ParseMode.HTML)
         return
 
     chat_id = update.effective_chat.id
@@ -147,7 +157,7 @@ async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if result and os.path.exists(output_path):
             with open(output_path, "rb") as f:
-                await update.message.reply_photo(photo=f, caption=f"📊 Rank card for {name}")
+                await update.message.reply_photo(photo=f, caption=f"{E.CHART} Rank card for {name}", parse_mode=ParseMode.HTML)
         else:
             await update.message.reply_text("Error generating rank card.")
     except Exception as e:
@@ -165,12 +175,13 @@ async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ranktemplate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /ranktemplate — pick rank card template (DM only)."""
     if update.effective_chat.type != "private":
-        await update.message.reply_text("Use this command in my DM for privacy.")
+        await update.message.reply_text(f"{E.INFO} Use this command in my DM for privacy.",
+            parse_mode=ParseMode.HTML)
         return
 
     if not context.args:
         await update.message.reply_text(
-            f"<b>Rank Templates</b>\n\n"
+            f"{E.SETTINGS} <b>Rank Templates</b>\n\n"
             f"{get_theme_list()}\n\n"
             f"<b>Usage:</b> /ranktemplate &lt;number&gt;\n"
             f"<b>Example:</b> /ranktemplate 3",
@@ -181,15 +192,18 @@ async def ranktemplate_command(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         template = int(context.args[0])
         if template not in THEMES:
-            await update.message.reply_text("Invalid template. Choose 1-6.")
+            await update.message.reply_text(f"{E.ERROR} Invalid template. Choose 1-6.",
+            parse_mode=ParseMode.HTML)
             return
     except ValueError:
-        await update.message.reply_text("Please provide a number (1-6).")
+        await update.message.reply_text(f"{E.ERROR} Please provide a number (1-6).",
+            parse_mode=ParseMode.HTML)
         return
 
     db.set_template(update.effective_user.id, template)
     theme_name = THEMES[template]["name"]
-    await update.message.reply_text(f"Template set to {theme_name}!")
+    await update.message.reply_text(f"{E.CHECK} Template set to {theme_name}!",
+            parse_mode=ParseMode.HTML)
 
 
 async def nextlevel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -202,7 +216,7 @@ async def nextlevel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_xp = xp % needed
 
     await update.message.reply_text(
-        f"📊 <b>Level Progress</b>\n\n"
+        f"{E.CHART} <b>Level Progress</b>\n\n"
         f"  Level: <b>{level}</b>\n"
         f"  XP: <b>{current_xp}</b> / {needed}\n"
         f"  Total XP: <b>{xp}</b>\n"
@@ -219,7 +233,7 @@ async def streak_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     best = user_data.get("streak_best", 0)
 
     await update.message.reply_text(
-        f"🔥 <b>Message Streak</b>\n\n"
+        f"{E.FIRE} <b>Message Streak</b>\n\n"
         f"  Current: <b>{current}</b> days\n"
         f"  Best: <b>{best}</b> days",
         parse_mode=ParseMode.HTML,
@@ -236,11 +250,12 @@ async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     lb = db.get_leaderboard(chat_id, limit=10)
 
     if not lb:
-        await update.message.reply_text("No leaderboard data yet. Start chatting!")
+        await update.message.reply_text(f"{E.INFO} No leaderboard data yet. Start chatting!",
+            parse_mode=ParseMode.HTML)
         return
 
-    medals = ["🥇", "🥈", "🥉"]
-    lines = [f"<b>📊 Leaderboard — {update.effective_chat.title}</b>\n"]
+    medals = [E.MEDAL_1, E.MEDAL_2, E.MEDAL_3]
+    lines = [f"{E.CHART} <b>Leaderboard — {update.effective_chat.title}</b>\n"]
 
     for i, entry in enumerate(lb):
         name = entry.get("first_name") or entry.get("username") or str(entry["user_id"])
@@ -260,11 +275,12 @@ async def daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     top = db.get_daily_top(chat_id, limit=10)
 
     if not top:
-        await update.message.reply_text("No messages today yet. Be the first!")
+        await update.message.reply_text(f"{E.INFO} No messages today yet. Be the first!",
+            parse_mode=ParseMode.HTML)
         return
 
-    medals = ["🥇", "🥈", "🥉"]
-    lines = [f"<b>📅 Today's Top Chatters</b>\n"]
+    medals = [E.MEDAL_1, E.MEDAL_2, E.MEDAL_3]
+    lines = [f"{E.TIME} <b>Today's Top Chatters</b>\n"]
 
     for i, entry in enumerate(top):
         name = entry.get("first_name") or entry.get("username") or str(entry["user_id"])
@@ -284,11 +300,12 @@ async def weekly_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     top = db.get_period_top(chat_id, days=7, limit=10)
 
     if not top:
-        await update.message.reply_text("No messages this week yet!")
+        await update.message.reply_text(f"{E.INFO} No messages this week yet!",
+            parse_mode=ParseMode.HTML)
         return
 
-    medals = ["🥇", "🥈", "🥉"]
-    lines = [f"<b>📆 Weekly Top Chatters</b>\n"]
+    medals = [E.MEDAL_1, E.MEDAL_2, E.MEDAL_3]
+    lines = [f"{E.TIME} <b>Weekly Top Chatters</b>\n"]
 
     for i, entry in enumerate(top):
         name = entry.get("first_name") or entry.get("username") or str(entry["user_id"])
@@ -308,11 +325,12 @@ async def monthly_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     top = db.get_period_top(chat_id, days=30, limit=10)
 
     if not top:
-        await update.message.reply_text("No messages this month yet!")
+        await update.message.reply_text(f"{E.INFO} No messages this month yet!",
+            parse_mode=ParseMode.HTML)
         return
 
-    medals = ["🥇", "🥈", "🥉"]
-    lines = [f"<b>📆 Monthly Top Chatters</b>\n"]
+    medals = [E.MEDAL_1, E.MEDAL_2, E.MEDAL_3]
+    lines = [f"{E.TIME} <b>Monthly Top Chatters</b>\n"]
 
     for i, entry in enumerate(top):
         name = entry.get("first_name") or entry.get("username") or str(entry["user_id"])

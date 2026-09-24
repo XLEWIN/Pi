@@ -3,6 +3,7 @@
 Tracks all users in groups and DMs, logs activity to SQLite.
 """
 
+import asyncio
 import logging
 from datetime import datetime
 from typing import Optional
@@ -20,6 +21,7 @@ from telegram.constants import ParseMode
 
 from bot.database import db
 from bot.modules.start import send_log, format_user_log
+from bot.emojis import E
 
 logger = logging.getLogger(__name__)
 
@@ -34,36 +36,37 @@ def get_user_display(user: User) -> str:
 async def register_user(user: User, context: ContextTypes.DEFAULT_TYPE,
                         chat_id: int = None, chat_title: str = None,
                         action: str = "joined"):
-    """Register a user and log the activity."""
+    """Register a user and log the activity (never blocks the caller for long)."""
     if user.is_bot:
         return
 
-    # Add user to database
-    db.add_user(
-        user_id=user.id,
-        username=user.username,
-        first_name=user.first_name,
-        last_name=user.last_name,
-        is_bot=user.is_bot
-    )
-
-    # Add to group if provided
-    if chat_id and chat_title:
-        db.add_group(chat_id, chat_title)
-        db.add_group_member(chat_id, user.id, "member")
-
-    # Log activity
-    db.update_user_activity(
-        user_id=user.id,
-        action=action,
-        chat_id=chat_id,
-        chat_title=chat_title
-    )
-
-    # Send log to channel
     log_message = format_user_log(user, action, chat_title)
-    await send_log(context, log_message)
 
+    def _db_work() -> None:
+        try:
+            db.add_user(
+                user_id=user.id,
+                username=user.username,
+                first_name=user.first_name,
+                last_name=user.last_name,
+                is_bot=user.is_bot,
+            )
+            if chat_id and chat_title:
+                db.add_group(chat_id, chat_title)
+                db.add_group_member(chat_id, user.id, "member")
+            db.update_user_activity(
+                user_id=user.id,
+                action=action,
+                chat_id=chat_id,
+                chat_title=chat_title,
+            )
+        except Exception as e:
+            logger.warning(f"register_user DB failed: {e}")
+
+    # Off the event loop so join events cannot stall command replies.
+    asyncio.get_running_loop().run_in_executor(None, _db_work)
+    # Soft log — timeout + HTML-safe payload already inside send_log/format_user_log.
+    asyncio.create_task(send_log(context, log_message))
     logger.info(f"User {user.id} ({get_user_display(user)}) {action}")
 
 
@@ -74,51 +77,80 @@ async def register_group_members(update: Update, context: ContextTypes.DEFAULT_T
 
     chat = update.effective_chat
     chat_id = chat.id
-    chat_title = chat.title or chat.first_name
+    chat_title = chat.title or chat.first_name or "Unknown"
 
     # Check if bot was added
     bot_added = any(member.id == context.bot.id for member in update.message.new_chat_members)
 
     if bot_added:
-        # Bot was added to a group, register it
-        bot_user = await context.bot.get_me()
-        db.add_user(
-            user_id=bot_user.id,
-            username=bot_user.username,
-            first_name=bot_user.first_name,
-            is_bot=True
+        from html import escape
+        safe_title = escape(str(chat_title))
+
+        def _db_work() -> None:
+            try:
+                bot_user = context.bot_data.get("_me")
+                # Fallback identity is filled below if missing; group rows only need chat.
+                db.add_group(chat_id, str(chat_title))
+                if bot_user:
+                    db.add_user(
+                        user_id=bot_user["id"],
+                        username=bot_user.get("username"),
+                        first_name=bot_user.get("first_name"),
+                        is_bot=True,
+                    )
+                    db.add_group_member(chat_id, bot_user["id"], "bot")
+            except Exception as e:
+                logger.warning(f"bot-added DB failed: {e}")
+
+        me = context.bot_data.get("username")
+        # Keep identity in bot_data for background DB work.
+        try:
+            bot_user = await context.bot.get_me()
+            context.bot_data["_me"] = {
+                "id": bot_user.id,
+                "username": bot_user.username,
+                "first_name": bot_user.first_name,
+            }
+        except Exception:
+            bot_user = None
+
+        asyncio.get_running_loop().run_in_executor(None, _db_work)
+
+        log_message = (
+            f"🤖 <b>Bot added to chat</b>\n"
+            f"💬 Chat: <b>{safe_title}</b>\n"
+            f"🆔 Chat ID: <code>{chat_id}</code>"
         )
-        db.add_group(chat_id, chat_title)
-        db.add_group_member(chat_id, bot_user.id, "bot")
-
-        # Log bot addition
-        log_message = f"🤖 <b>Bot added to chat</b>\n"
-        log_message += f"💬 Chat: <b>{chat_title}</b>\n"
-        log_message += f"🆔 Chat ID: <code>{chat_id}</code>"
-        await send_log(context, log_message)
-
+        asyncio.create_task(send_log(context, log_message))
         logger.info(f"Bot added to group {chat_title} ({chat_id})")
 
-        # Try to get group members
-        try:
-            member_count = await context.bot.get_chat_member_count(chat_id)
+        # Group stats are informational — fire and forget.
+        async def _stats() -> None:
+            try:
+                member_count = await asyncio.wait_for(
+                    context.bot.get_chat_member_count(chat_id), timeout=5
+                )
+                await send_log(
+                    context,
+                    f"📊 <b>Group stats</b>\n"
+                    f"💬 Chat: <b>{safe_title}</b>\n"
+                    f"👥 Members: {member_count}",
+                )
+            except Exception as e:
+                logger.warning(f"Group stats log failed: {e}")
 
-            log_message = f"📊 <b>Group stats</b>\n"
-            log_message += f"💬 Chat: <b>{chat_title}</b>\n"
-            log_message += f"👥 Members: {member_count}"
-            await send_log(context, log_message)
+        asyncio.create_task(_stats())
 
-        except Exception as e:
-            logger.error(f"Error getting group info: {e}")
-
-    # Register other new members
+    # Register other new members without blocking this handler.
     for member in update.message.new_chat_members:
         if not member.is_bot:
-            await register_user(
-                member, context,
-                chat_id=chat_id,
-                chat_title=chat_title,
-                action=f"joined {chat_title}"
+            asyncio.create_task(
+                register_user(
+                    member, context,
+                    chat_id=chat_id,
+                    chat_title=chat_title,
+                    action=f"joined {chat_title}",
+                )
             )
 
 
@@ -149,48 +181,51 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Track messages to register active users."""
+    """Track messages to register active users (DB work runs in the background)."""
     if not update.message or not update.effective_user:
         return
 
     user = update.effective_user
     chat = update.effective_chat
 
-    # Skip if it's a bot
     if user.is_bot:
         return
 
-    # Register/update user
-    db.add_user(
-        user_id=user.id,
-        username=user.username,
-        first_name=user.first_name,
-        last_name=user.last_name,
-        is_bot=user.is_bot
-    )
+    def _db_work() -> None:
+        try:
+            db.add_user(
+                user_id=user.id,
+                username=user.username,
+                first_name=user.first_name,
+                last_name=user.last_name,
+                is_bot=user.is_bot,
+            )
+            db.update_user_activity(
+                user_id=user.id,
+                action="sent message",
+                chat_id=chat.id,
+                chat_title=chat.title or chat.first_name,
+            )
+        except Exception as e:
+            logger.warning(f"track_message DB failed: {e}")
 
-    # Update activity (don't log every message to avoid spam)
-    # Only update in database, don't send to log channel
-    db.update_user_activity(
-        user_id=user.id,
-        action="sent message",
-        chat_id=chat.id,
-        chat_title=chat.title or chat.first_name
-    )
+    # Don't block the event loop — SQLite commits can stall command replies.
+    asyncio.get_running_loop().run_in_executor(None, _db_work)
 
 
 async def userstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /userstats — show bot statistics."""
     if update.effective_chat.type == "private":
-        await update.message.reply_text("❌ This command can only be used in groups.")
+        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.",
+            parse_mode=ParseMode.HTML)
         return
 
     user_count = db.get_user_count()
     group_count = db.get_group_count()
 
-    stats_text = f"""📊 Bot Statistics
+    stats_text = f"""{E.CHART} Bot Statistics
 
-👥 Total Users: {user_count}
+{E.USER} Total Users: {user_count}
 💬 Total Groups: {group_count}
 
 Use /myinfo to see your info.
@@ -205,13 +240,14 @@ async def myinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data = db.get_user(user.id)
 
     if not user_data:
-        await update.message.reply_text("❌ You are not registered yet.")
+        await update.message.reply_text(f"{E.ERROR} You are not registered yet.",
+            parse_mode=ParseMode.HTML)
         return
 
     username = f"@{user_data['username']}" if user_data['username'] else "No username"
     name = user_data['first_name'] or "Unknown"
 
-    info_text = f"""👤 Your Information
+    info_text = f"""{E.USER} Your Information
 
 🆔 User ID: <code>{user_data['user_id']}</code>
 📛 Username: {username}
@@ -219,9 +255,9 @@ async def myinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📅 First Seen: {user_data['first_seen']}
 📅 Last Seen: {user_data['last_seen']}
 
-📊 Status: {"🔴 Banned" if user_data['is_banned'] else "🟢 Active"}
-🔇 Muted: {"Yes" if user_data['is_muted'] else "No"}
-⚠️ Warnings: {user_data['warnings']}"""
+{E.CHECK} Status: {"🔴 Banned" if user_data['is_banned'] else "🟢 Active"}
+{E.MUTE} Muted: {"Yes" if user_data['is_muted'] else "No"}
+{E.WARN} Warnings: {user_data['warnings']}"""
 
     await update.message.reply_text(info_text, parse_mode=ParseMode.HTML)
 
@@ -229,7 +265,8 @@ async def myinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def userinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /userinfo @user — show user info (admin only)."""
     if update.effective_chat.type == "private":
-        await update.message.reply_text("❌ This command can only be used in groups.")
+        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.",
+            parse_mode=ParseMode.HTML)
         return
 
     # Check if user is admin
@@ -239,10 +276,12 @@ async def userinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         member = await context.bot.get_chat_member(chat_id, user_id)
         if member.status not in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]:
-            await update.message.reply_text("❌ You need admin permissions to use this command.")
+            await update.message.reply_text(f"{E.ERROR} You need admin permissions to use this command.",
+            parse_mode=ParseMode.HTML)
             return
     except Exception:
-        await update.message.reply_text("❌ Error checking permissions.")
+        await update.message.reply_text(f"{E.ERROR} Error checking permissions.",
+            parse_mode=ParseMode.HTML)
         return
 
     # Get target user
@@ -264,7 +303,7 @@ async def userinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not target_user:
         await update.message.reply_text(
-            "❌ Please specify a user.\n\n"
+            f"{E.ERROR} Please specify a user.\n\n"
             "<b>Usage:</b>\n"
             "• /userinfo @user\n"
             "• Reply to a message with /userinfo",
@@ -275,13 +314,14 @@ async def userinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data = db.get_user(target_user.id)
 
     if not user_data:
-        await update.message.reply_text("❌ User not found in database.")
+        await update.message.reply_text(f"{E.ERROR} User not found in database.",
+            parse_mode=ParseMode.HTML)
         return
 
     username = f"@{user_data['username']}" if user_data['username'] else "No username"
     name = user_data['first_name'] or "Unknown"
 
-    info_text = f"""👤 User Information
+    info_text = f"""{E.USER} User Information
 
 🆔 User ID: <code>{user_data['user_id']}</code>
 📛 Username: {username}
@@ -289,9 +329,9 @@ async def userinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📅 First Seen: {user_data['first_seen']}
 📅 Last Seen: {user_data['last_seen']}
 
-📊 Status: {"🔴 Banned" if user_data['is_banned'] else "🟢 Active"}
-🔇 Muted: {"Yes" if user_data['is_muted'] else "No"}
-⚠️ Warnings: {user_data['warnings']}"""
+{E.CHECK} Status: {"🔴 Banned" if user_data['is_banned'] else "🟢 Active"}
+{E.MUTE} Muted: {"Yes" if user_data['is_muted'] else "No"}
+{E.WARN} Warnings: {user_data['warnings']}"""
 
     await update.message.reply_text(info_text, parse_mode=ParseMode.HTML)
 
@@ -299,7 +339,8 @@ async def userinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def recentactivity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /recentactivity — show recent activity."""
     if update.effective_chat.type == "private":
-        await update.message.reply_text("❌ This command can only be used in groups.")
+        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.",
+            parse_mode=ParseMode.HTML)
         return
 
     # Check if user is admin
@@ -309,19 +350,22 @@ async def recentactivity_command(update: Update, context: ContextTypes.DEFAULT_T
     try:
         member = await context.bot.get_chat_member(chat_id, user_id)
         if member.status not in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]:
-            await update.message.reply_text("❌ You need admin permissions to use this command.")
+            await update.message.reply_text(f"{E.ERROR} You need admin permissions to use this command.",
+            parse_mode=ParseMode.HTML)
             return
     except Exception:
-        await update.message.reply_text("❌ Error checking permissions.")
+        await update.message.reply_text(f"{E.ERROR} Error checking permissions.",
+            parse_mode=ParseMode.HTML)
         return
 
     activity = db.get_recent_activity(limit=5)
 
     if not activity:
-        await update.message.reply_text("📭 No recent activity.")
+        await update.message.reply_text(f"{E.INFO} No recent activity.",
+            parse_mode=ParseMode.HTML)
         return
 
-    activity_text = "📜 Recent Activity\n\n"
+    activity_text = f"{E.SETTINGS} Recent Activity\n\n"
 
     for act in activity:
         username = f"@{act['username']}" if act.get('username') else "Unknown"

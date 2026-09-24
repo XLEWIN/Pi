@@ -1,5 +1,7 @@
 """Bot-wide constants: texts, URLs and callback data."""
 
+from bot.emojis import E
+
 BOT_NAME = "Phi π"
 
 BOT_DESCRIPTION = (
@@ -8,16 +10,16 @@ BOT_DESCRIPTION = (
 )
 
 START_TEXT = (
-    "🔥 {username}\n"
+    "{fire} {username}\n"
     "{description}\n\n"
-    "➡️ /help for the full command list."
+    "{arrow} /help for the full command list."
 )
 
-HELP_TEXT = """📖 Help Menu
+HELP_TEXT = """{info} Help Menu
 
 Here are all the available commands:
 
-<b>🏠 General</b>
+<b>{wave} General</b>
 /start — Open the main menu
 /help — Show this help menu
 /myinfo — See your info
@@ -25,7 +27,7 @@ Here are all the available commands:
 /userstats — Bot statistics (admin)
 /recentactivity — Recent activity (admin)
 
-<b>🔇 Moderation</b>
+<b>{mute} Moderation</b>
 
 <b>Mute Commands</b>
 /mute @user [period] [reason] — Mute a user
@@ -69,12 +71,12 @@ Here are all the available commands:
 <b>Duration Formats:</b>
 30s • 5m • 1h • 2d • 1w
 
-<b>🎯 Filters</b>
+<b>{settings} Filters</b>
 /filter &lt;trigger&gt; — Add a filter (reply to message)
 /stop &lt;trigger&gt; — Remove a filter
 /filters — List all filters in chat
 
-<b>🚫 Blocklist</b>
+<b>{cross} Blocklist</b>
 /blocklist &lt;word1&gt; &lt;word2&gt; — Add blocked words
 /unblocklist &lt;word1&gt; — Remove blocked words
 /blocklistview — View blocked words
@@ -82,7 +84,7 @@ Here are all the available commands:
 /setblocklistaction &lt;delete|warn|mute|kick|ban&gt; — Set action
 /blocklistreason &lt;reason&gt; — Set reason
 
-<b>🎉 Fun</b>
+<b>{sparkle} Fun</b>
 /hug [user] — Hug someone
 /kiss [user] — Kiss someone
 /slap [user] — Slap someone
@@ -95,7 +97,7 @@ Here are all the available commands:
 /kill [user] — Playfully eliminate
 /yeet [user] — YEET!
 
-<b>👑 Admin</b>
+<b>{crown} Admin</b>
 /promote @user — Promote to admin
 /demote @user — Demote an admin
 /pin — Pin a message
@@ -104,7 +106,7 @@ Here are all the available commands:
 /admincount — Count admins
 /fullpromote — Self-promote to full admin (owner only)
 
-<b>🔨 Gban & Sudo</b>
+<b>{alert} Gban &amp; Sudo</b>
 /gban @user [reason] — Globally ban (sudo)
 /ungban @user — Globally unban (sudo)
 /gbanlist — List gbanned users (sudo)
@@ -113,13 +115,13 @@ Here are all the available commands:
 /rmsudo @user — Remove sudo user (owner)
 /sudolist — List sudo users (owner)
 
-<b>👀 Watch Words</b>
+<b>{eyes} Watch Words</b>
 /watch &lt;word&gt; — Add a watched word (admin)
 /unwatch &lt;word&gt; — Remove a watched word (admin)
 /watchlist — List your watched words (admin)
 /watchmode &lt;copy|forward&gt; — Set delivery mode (admin)
 
-<b>👋 Welcome/Goodbye</b>
+<b>{wave} Welcome/Goodbye</b>
 /welcome [on|off] — Toggle/view welcome messages
 /goodbye [on|off] — Toggle/view goodbye messages
 /setwelcome &lt;text&gt; — Set custom welcome message
@@ -129,9 +131,9 @@ Here are all the available commands:
 /cleanwelcome [on|off] — Delete old welcome messages
 /cleangoodbye [on|off] — Delete old goodbye messages
 
-<b>Variables:</b> {'first'} {'last'} {'fullname'} {'username'} {'mention'} {'chatname'} {'id'}
+<b>Variables:</b> {{first}} {{last}} {{fullname}} {{username}} {{mention}} {{chatname}} {{id}}
 
-<b>🏆 Leveling &amp; Leaderboard</b>
+<b>{fire} Leveling &amp; Leaderboard</b>
 /rank [@user] — View rank card
 /template — Pick rank card template with preview (DM only)
 /ranktemplate — Pick rank card template (DM only)
@@ -147,8 +149,8 @@ Here are all the available commands:
 """
 
 # ── URLs ────────────────────────────────────────────────
-URL_ADD_TO_GROUP = "http://t.me/Phi_RoBot?startgroup=botstart"
-URL_OFFICIAL_CHANNEL = "https://t.me/Phi_Chart"
+URL_ADD_TO_GROUP = "http://t.me/PiModulerBot?startgroup=botstart"
+URL_OFFICIAL_CHANNEL = "https://t.me/ThePiUpdates"
 URL_NETWORK = "https://t.me/ShadowBotsHQ"
 
 # ── Callback data ───────────────────────────────────────

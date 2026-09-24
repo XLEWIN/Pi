@@ -1,5 +1,7 @@
 """Database module — SQLite operations for user storage and logging."""
 
+import os
+import shutil
 import sqlite3
 import logging
 from datetime import datetime
@@ -8,9 +10,33 @@ from typing import Optional, List, Dict, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Database file path
-DB_DIR = Path(__file__).resolve().parent.parent
+# Prefer a local (non-OneDrive) path so sync/locking cannot stall handlers.
+# Falls back to the project folder if LOCALAPPDATA is unavailable.
+_LEGACY_DB_DIR = Path(__file__).resolve().parent.parent
+_LOCAL_DB_DIR = Path(os.environ.get("LOCALAPPDATA", _LEGACY_DB_DIR)) / "PiBot"
+try:
+    _LOCAL_DB_DIR.mkdir(parents=True, exist_ok=True)
+    DB_DIR = _LOCAL_DB_DIR
+except OSError:
+    DB_DIR = _LEGACY_DB_DIR
 DB_PATH = DB_DIR / "bot_database.db"
+
+# One-time migrate from the old project-folder DB (e.g. after moving off OneDrive).
+_LEGACY_DB = _LEGACY_DB_DIR / "bot_database.db"
+if (
+    DB_DIR != _LEGACY_DB_DIR
+    and _LEGACY_DB.exists()
+    and not DB_PATH.exists()
+):
+    try:
+        shutil.copy2(_LEGACY_DB, DB_PATH)
+        for suffix in ("-wal", "-shm"):
+            src = Path(str(_LEGACY_DB) + suffix)
+            if src.exists():
+                shutil.copy2(src, Path(str(DB_PATH) + suffix))
+        logger.info(f"Migrated database to {DB_PATH}")
+    except OSError as e:
+        logger.warning(f"Could not migrate legacy database: {e}")
 
 
 class Database:
@@ -25,9 +51,15 @@ class Database:
     def connect(self):
         """Connect to the SQLite database."""
         try:
-            self.connection = sqlite3.connect(self.db_path, check_same_thread=False)
+            self.connection = sqlite3.connect(
+                self.db_path,
+                check_same_thread=False,
+                timeout=5.0,
+            )
             self.connection.row_factory = sqlite3.Row
             self.connection.execute("PRAGMA journal_mode=WAL")
+            self.connection.execute("PRAGMA busy_timeout=5000")
+            self.connection.execute("PRAGMA synchronous=NORMAL")
             logger.info(f"Connected to database: {self.db_path}")
         except sqlite3.Error as e:
             logger.error(f"Database connection error: {e}")

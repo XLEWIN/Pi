@@ -18,6 +18,7 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 
 from bot.database import db
+from bot.emojis import E
 
 logger = logging.getLogger(__name__)
 
@@ -59,16 +60,18 @@ def _get_reply_buttons(buttons_json: str) -> Optional[InlineKeyboardMarkup]:
 async def add_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /filter — add a new filter."""
     if update.effective_chat.type == "private":
-        await update.message.reply_text("❌ This command only works in groups.")
+        await update.message.reply_text(f"{E.ERROR} This command only works in groups.",
+            parse_mode=ParseMode.HTML)
         return
 
     if not await _is_admin(update, context):
-        await update.message.reply_text("❌ You need admin rights to manage filters.")
+        await update.message.reply_text(f"{E.ERROR} You need admin rights to manage filters.",
+            parse_mode=ParseMode.HTML)
         return
 
     if not context.args or len(context.args) < 1:
         await update.message.reply_text(
-            "ℹ️ <b>Usage:</b>\n"
+            f"{E.INFO} <b>Usage:</b>\n"
             "• /filter &lt;trigger&gt; — Add filter with text reply\n"
             "• /filter &lt;trigger&gt; — Reply to a message to set as response\n"
             "• /stop &lt;trigger&gt; — Remove a filter",
@@ -119,7 +122,7 @@ async def add_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_text = " ".join(context.args[1:])
     else:
         await update.message.reply_text(
-            "❌ Provide a trigger word and reply to a message, or add text after the trigger."
+            f"{E.ERROR} Provide a trigger word and reply to a message, or add text after the trigger."
         )
         return
 
@@ -127,7 +130,7 @@ async def add_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.add_filter(chat_id, trigger, reply_text, buttons_json, media_type, media_id)
 
     await update.message.reply_text(
-        f"✅ Filter set for <b>{trigger}</b>.",
+        f"{E.CHECK} Filter set for <b>{trigger}</b>.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -135,42 +138,46 @@ async def add_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stop_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /stop — remove a filter."""
     if update.effective_chat.type == "private":
-        await update.message.reply_text("❌ This command only works in groups.")
+        await update.message.reply_text(f"{E.ERROR} This command only works in groups.",
+            parse_mode=ParseMode.HTML)
         return
 
     if not await _is_admin(update, context):
-        await update.message.reply_text("❌ You need admin rights to manage filters.")
+        await update.message.reply_text(f"{E.ERROR} You need admin rights to manage filters.",
+            parse_mode=ParseMode.HTML)
         return
 
     if not context.args:
-        await update.message.reply_text("ℹ️ Usage: /stop &lt;trigger&gt;", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"{E.INFO} Usage: /stop &lt;trigger&gt;", parse_mode=ParseMode.HTML)
         return
 
     trigger = context.args[0].lower()
     chat_id = update.effective_chat.id
 
     if db.remove_filter(chat_id, trigger):
-        await update.message.reply_text(f"✅ Filter <b>{trigger}</b> removed.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"{E.CHECK} Filter <b>{trigger}</b> removed.", parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text("❌ Filter not found.")
+        await update.message.reply_text(f"{E.ERROR} Filter not found.",
+            parse_mode=ParseMode.HTML)
 
 
 async def filters_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /filters — list all filters in chat."""
     if update.effective_chat.type == "private":
-        await update.message.reply_text("❌ This command only works in groups.")
+        await update.message.reply_text(f"{E.ERROR} This command only works in groups.")
         return
 
     chat_id = update.effective_chat.id
     filters_data = db.get_filters(chat_id)
 
     if not filters_data:
-        await update.message.reply_text("ℹ️ No filters set in this chat.")
+        await update.message.reply_text(f"{E.INFO} No filters set in this chat.",
+            parse_mode=ParseMode.HTML)
         return
 
     trigger_list = "\n".join([f"• <code>{f['trigger_word']}</code>" for f in filters_data])
     await update.message.reply_text(
-        f"📋 <b>Active Filters ({len(filters_data)}):</b>\n{trigger_list}",
+        f"{E.SETTINGS} <b>Active Filters ({len(filters_data)}):</b>\n{trigger_list}",
         parse_mode=ParseMode.HTML,
     )
 
@@ -215,7 +222,7 @@ async def check_filters(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 elif reply_text:
                     await update.message.reply_text(reply_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
             except Exception as e:
-                logger.error(f"Filter reply error: {e}")
+                logger.warning(f"Filter reply error: {e}")
             break
 
 
@@ -225,6 +232,6 @@ def setup(app: Application) -> list:
     app.add_handler(CommandHandler("filter", add_filter, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("stop", stop_filter, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("filters", filters_list, filters=filters.ChatType.GROUPS))
-    app.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, check_filters), group=1)
+    app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, check_filters), group=1)
 
     return ["filter", "stop", "filters"]
