@@ -341,8 +341,178 @@ class Database:
             )
         """)
 
+        # ── Instagram media file_id cache (L3) ──────────
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ig_file_cache (
+                cache_key TEXT PRIMARY KEY,
+                file_id TEXT NOT NULL,
+                media_kind TEXT NOT NULL,
+                source_url TEXT,
+                hits INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # ── Instagram per-chat settings ─────────────────
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ig_settings (
+                chat_id INTEGER PRIMARY KEY,
+                auto_download INTEGER DEFAULT 1,
+                max_items INTEGER DEFAULT 10,
+                send_spoiler INTEGER DEFAULT 0,
+                updated_at TIMESTAMP
+            )
+        """)
+
+        # ── Instagram download log ──────────────────────
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ig_download_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER,
+                user_id INTEGER,
+                status TEXT,
+                media_kind TEXT,
+                items INTEGER DEFAULT 0,
+                duration_ms INTEGER DEFAULT 0,
+                error TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         self.connection.commit()
         logger.info("Database tables created/verified")
+
+    # ── Instagram cache / settings / log ─────────────────
+    def ig_get_file_ids(self, keys: List[str]) -> Dict[str, Tuple[str, str]]:
+        """Return {key: (file_id, media_kind)} for the requested keys."""
+        if not keys:
+            return {}
+        try:
+            cursor = self.connection.cursor()
+            placeholders = ",".join("?" for _ in keys)
+            cursor.execute(
+                f"SELECT cache_key, file_id, media_kind FROM ig_file_cache "
+                f"WHERE cache_key IN ({placeholders})",
+                tuple(keys),
+            )
+            return {r[0]: (r[1], r[2]) for r in cursor.fetchall()}
+        except sqlite3.Error as e:
+            logger.error(f"ig_get_file_ids: {e}")
+            return {}
+
+    def ig_put_file_id(
+        self, cache_key: str, file_id: str, media_kind: str, source_url: str = ""
+    ) -> None:
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                """
+                INSERT INTO ig_file_cache (cache_key, file_id, media_kind, source_url, hits, last_used)
+                VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    file_id = excluded.file_id,
+                    media_kind = excluded.media_kind,
+                    source_url = excluded.source_url,
+                    hits = hits + 1,
+                    last_used = CURRENT_TIMESTAMP
+                """,
+                (cache_key, file_id, media_kind, source_url),
+            )
+            self.connection.commit()
+        except sqlite3.Error as e:
+            logger.error(f"ig_put_file_id: {e}")
+
+    def ig_touch_file_id(self, cache_key: str) -> None:
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                "UPDATE ig_file_cache SET hits = hits + 1, last_used = CURRENT_TIMESTAMP "
+                "WHERE cache_key = ?",
+                (cache_key,),
+            )
+            self.connection.commit()
+        except sqlite3.Error as e:
+            logger.error(f"ig_touch_file_id: {e}")
+
+    def ig_clear_file_cache(self) -> int:
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute("SELECT COUNT(*) FROM ig_file_cache")
+            n = cursor.fetchone()[0] or 0
+            cursor.execute("DELETE FROM ig_file_cache")
+            self.connection.commit()
+            return int(n)
+        except sqlite3.Error as e:
+            logger.error(f"ig_clear_file_cache: {e}")
+            return 0
+
+    def ig_cache_stats(self) -> Dict[str, int]:
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                "SELECT COUNT(*), COALESCE(SUM(hits), 0) FROM ig_file_cache"
+            )
+            row = cursor.fetchone()
+            return {"rows": int(row[0] or 0), "hits": int(row[1] or 0)}
+        except sqlite3.Error as e:
+            logger.error(f"ig_cache_stats: {e}")
+            return {"rows": 0, "hits": 0}
+
+    def ig_get_settings(self, chat_id: int) -> Optional[Dict[str, Any]]:
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute("SELECT * FROM ig_settings WHERE chat_id = ?", (chat_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        except sqlite3.Error as e:
+            logger.error(f"ig_get_settings: {e}")
+            return None
+
+    def ig_set_settings(self, chat_id: int, **fields: int) -> None:
+        allowed = {"auto_download", "max_items", "send_spoiler"}
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                "INSERT OR IGNORE INTO ig_settings (chat_id) VALUES (?)",
+                (chat_id,),
+            )
+            set_parts = ", ".join(f"{k} = ?" for k in updates)
+            cursor.execute(
+                f"UPDATE ig_settings SET {set_parts}, updated_at = CURRENT_TIMESTAMP "
+                f"WHERE chat_id = ?",
+                (*updates.values(), chat_id),
+            )
+            self.connection.commit()
+        except sqlite3.Error as e:
+            logger.error(f"ig_set_settings: {e}")
+
+    def ig_log_download(
+        self,
+        chat_id: int,
+        user_id: int,
+        status: str,
+        media_kind: str,
+        items: int,
+        duration_ms: int,
+        error: Optional[str],
+    ) -> None:
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                """
+                INSERT INTO ig_download_log
+                    (chat_id, user_id, status, media_kind, items, duration_ms, error)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (chat_id, user_id, status, media_kind, int(items), int(duration_ms), error),
+            )
+            self.connection.commit()
+        except sqlite3.Error as e:
+            logger.error(f"ig_log_download: {e}")
 
     # ── Analytics counters ───────────────────────────────
     def _bump_daily(self, chat_id: int, **cols: int) -> None:

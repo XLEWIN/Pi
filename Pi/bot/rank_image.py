@@ -382,9 +382,9 @@ def create_rank_card(
 
         # ---- statistics ----
         stats = [
-            ("RANK", str(rank_text), "bar"),
-            ("MESSAGES", messages, "chat"),
-            ("GLOBAL MESSAGES", global_messages, "globe"),
+            ("Rank", str(rank_text), "bar"),
+            ("Messages", messages, "chat"),
+            ("Global Messages", global_messages, "globe"),
         ]
         hf = _font(HEADING_SIZE * SCALE)
         vf = _font(VALUE_SIZE * SCALE)

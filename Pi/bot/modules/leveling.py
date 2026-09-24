@@ -216,11 +216,11 @@ async def nextlevel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_xp = xp % needed
 
     await update.message.reply_text(
-        f"{E.CHART} <b>Level Progress</b>\n\n"
-        f"  Level: <b>{level}</b>\n"
-        f"  XP: <b>{current_xp}</b> / {needed}\n"
-        f"  Total XP: <b>{xp}</b>\n"
-        f"  Messages: <b>{user_data.get('global_messages', 0)}</b>",
+        f"{E.CHART} Level: <b>{level}</b>\n"
+        f"├ Next: Level {level + 1}\n"
+        f"├ Progress: {_format_number(current_xp)} / {_format_number(needed)} XP\n"
+        f"├ Total XP: <b>{_format_number(xp)}</b>\n"
+        f"└ Messages: <b>{_format_number(user_data.get('global_messages', 0))}</b>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -233,9 +233,9 @@ async def streak_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     best = user_data.get("streak_best", 0)
 
     await update.message.reply_text(
-        f"{E.FIRE} <b>Message Streak</b>\n\n"
-        f"  Current: <b>{current}</b> days\n"
-        f"  Best: <b>{best}</b> days",
+        f"{E.FIRE} Message Streak\n"
+        f"├ Current: <b>{current}</b> days\n"
+        f"└ Best: <b>{best}</b> days",
         parse_mode=ParseMode.HTML,
     )
 

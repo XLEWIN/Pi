@@ -31,6 +31,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         crown=E.CROWN,
         alert=E.ALERT,
         eyes=E.EYES,
+        web=E.WEB,
+        announce=E.ANNOUNCE,
     )
     try:
         await update.message.reply_text(text, parse_mode=ParseMode.HTML)

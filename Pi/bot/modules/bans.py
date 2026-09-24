@@ -70,11 +70,11 @@ async def addsudo_command(update, context):
     await reply_card(
         update.message,
         action_card(
-            "SUDO ADDED",
+            "Sudo Added",
             [
                 field_user(target),
                 field_by(update.effective_user, "ADDED BY"),
-                field_extra(E.SETTINGS, "ROLE", "SUDO"),
+                field_extra(E.SETTINGS, "Role", "SUDO"),
             ],
             icon=E.CHECK,
         ),
@@ -96,7 +96,7 @@ async def rmsudo_command(update, context):
         await reply_card(
             update.message,
             action_card(
-                "SUDO REMOVED",
+                "Sudo Removed",
                 [
                     field_user(target),
                     field_by(update.effective_user, "REMOVED BY"),
@@ -155,12 +155,12 @@ async def gban_command(update, context):
     await reply_card(
         update.message,
         action_card(
-            "GLOBAL BAN SUCCESSFUL",
+            "Global Ban Successful",
             [
                 field_user(target),
                 field_by(update.effective_user, "BANNED BY"),
                 field_reason(reason),
-                field_extra(E.BAN, "TOTAL GBANNED", str(total)),
+                field_extra(E.BAN, "Total Gbanned", str(total)),
             ],
             icon=E.BAN,
         ),
@@ -186,7 +186,7 @@ async def ungban_command(update, context):
         await reply_card(
             update.message,
             action_card(
-                "GLOBAL UNBAN SUCCESSFUL",
+                "Global Unban Successful",
                 [
                     field_user(target),
                     field_by(update.effective_user, "UNBANNED BY"),
@@ -239,11 +239,11 @@ async def massban_command(update, context):
     await reply_card(
         update.message,
         action_card(
-            "MASS BAN COMPLETE",
+            "Mass Ban Complete",
             [
                 field_by(update.effective_user, "BANNED BY"),
-                field_extra(E.BAN, "BANNED", str(banned)),
-                field_extra(E.ERROR, "FAILED", str(failed)),
+                field_extra(E.BAN, "Banned", str(banned)),
+                field_extra(E.ERROR, "Failed", str(failed)),
             ],
             icon=E.BAN,
         ),
@@ -271,11 +271,11 @@ async def sudopromote_command(update, context):
         await reply_card(
             update.message,
             action_card(
-                "PROMOTION SUCCESSFUL",
+                "Promotion Successful",
                 [
                     field_user(target),
                     field_by(update.effective_user, "PROMOTED BY"),
-                    field_extra(E.SETTINGS, "TITLE", "ADMIN"),
+                    field_extra(E.SETTINGS, "Title", "ADMIN"),
                 ],
                 icon=E.CHECK,
             ),

@@ -190,11 +190,11 @@ async def detect_join_burst(
     )
     action = str(settings.get("action") or "alert").lower()
     text = action_card(
-        "JOIN BURST DETECTED",
+        "Join Burst Detected",
         [
-            field_extra(E.ALERT, "DETAIL", escape(detail)),
-            field_extra(E.USER, "SAMPLE", escape(names[:120])),
-            field_extra(E.SETTINGS, "ACTION", escape(action.upper())),
+            field_extra(E.ALERT, "Detail", escape(detail)),
+            field_extra(E.USER, "Sample", escape(names[:120])),
+            field_extra(E.SETTINGS, "Action", escape(action.capitalize())),
         ],
         icon=E.ALERT,
     )
@@ -263,11 +263,11 @@ async def detect_message_burst(
     action = str(settings.get("action") or "alert").lower()
 
     text = action_card(
-        "MESSAGE BURST DETECTED",
+        "Message Burst Detected",
         [
             field_user(user),
-            field_extra(E.ALERT, "DETAIL", escape(detail)),
-            field_extra(E.SETTINGS, "ACTION", escape(action.upper())),
+            field_extra(E.ALERT, "Detail", escape(detail)),
+            field_extra(E.SETTINGS, "Action", escape(action.capitalize())),
         ],
         icon=E.ALERT,
     )
@@ -315,13 +315,13 @@ async def shield_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     on = "ON" if settings.get("shield_enabled") else "OFF"
     lock = "ON" if settings.get("lockdown") else "OFF"
     text = action_card(
-        "GROUP SHIELD",
+        "Group Shield",
         [
-            field_extra(E.CHECK, "STATUS", on),
-            field_extra(E.ALERT, "JOIN BURST", f"{settings.get('join_limit')} / {settings.get('join_window')}s"),
-            field_extra(E.FIRE, "MSG BURST", f"{settings.get('msg_limit')} / {settings.get('msg_window')}s"),
-            field_extra(E.SETTINGS, "ACTION", str(settings.get("action") or "alert").upper()),
-            field_extra(E.BAN, "LOCKDOWN", lock),
+            field_extra(E.CHECK, "Status", on),
+            field_extra(E.ALERT, "Join Burst", f"{settings.get('join_limit')} / {settings.get('join_window')}s"),
+            field_extra(E.FIRE, "Msg Burst", f"{settings.get('msg_limit')} / {settings.get('msg_window')}s"),
+            field_extra(E.SETTINGS, "Action", str(settings.get("action") or "alert").capitalize()),
+            field_extra(E.BAN, "Lockdown", lock),
         ],
         icon=E.ALERT,
     )
@@ -399,7 +399,7 @@ async def shieldcfg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         db.set_shield_settings(chat_id, action=action)
         await update.message.reply_text(
-            f"{E.CHECK} Shield action: <b>{action.upper()}</b>.",
+            f"{E.CHECK} Shield action: <b>{action.capitalize()}</b>.",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -476,7 +476,7 @@ async def raidlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    lines = [f"{E.ALERT} <b>RAID LOG~</b>", ""]
+    lines = [f"{E.ALERT} <b>Raid Log</b>", ""]
     for e in events:
         kind = str(e.get("kind") or "?").upper()
         detail = escape(str(e.get("detail") or ""))

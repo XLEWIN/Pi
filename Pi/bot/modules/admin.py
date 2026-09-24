@@ -111,7 +111,7 @@ async def promote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply_card(
             update.message,
             action_card(
-                "PROMOTION SUCCESSFUL",
+                "Promotion Successful",
                 [
                     field_user(target),
                     field_by(update.effective_user, "PROMOTED BY"),
@@ -161,7 +161,7 @@ async def demote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply_card(
             update.message,
             action_card(
-                "DEMOTION SUCCESSFUL",
+                "Demotion Successful",
                 [
                     field_user(target),
                     field_by(update.effective_user, "DEMOTED BY"),
@@ -204,10 +204,10 @@ async def pin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reply_card(
                 update.message,
                 action_card(
-                    "MESSAGE PINNED",
+                    "Message Pinned",
                     [
                         field_by(update.effective_user, "PINNED BY"),
-                        field_extra(E.INFO, "MODE", "SILENT"),
+                        field_extra(E.INFO, "Mode", "SILENT"),
                     ],
                     icon=E.PIN,
                 ),
@@ -216,10 +216,10 @@ async def pin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reply_card(
                 update.message,
                 action_card(
-                    "MESSAGE PINNED",
+                    "Message Pinned",
                     [
                         field_by(update.effective_user, "PINNED BY"),
-                        field_extra(E.INFO, "MODE", "NOTIFICATION ON"),
+                        field_extra(E.INFO, "Mode", "NOTIFICATION ON"),
                     ],
                     icon=E.PIN,
                 ),
@@ -252,12 +252,12 @@ async def unpin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply_card(
             update.message,
             action_card(
-                "MESSAGE UNPINNED",
+                "Message Unpinned",
                 [
                     field_by(update.effective_user, "UNPINNED BY"),
                     field_extra(
                         E.INFO,
-                        "SCOPE",
+                        "Scope",
                         "Single message" if update.message.reply_to_message else "All pins",
                     ),
                 ],
@@ -288,9 +288,9 @@ async def adminlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 admin_list.append(admin.user)
 
         text = action_card(
-            "ADMIN LIST",
+            "Admin List",
             [
-                field_extra(E.INFO, "GROUP", escape(update.effective_chat.title or "")),
+                field_extra(E.INFO, "Group", escape(update.effective_chat.title or "")),
             ],
             icon=E.CROWN,
         ) + "\n\n"
@@ -326,12 +326,12 @@ async def admin_count_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await reply_card(
             update.message,
             action_card(
-                "ADMIN COUNT",
+                "Admin Count",
                 [
-                    field_extra(E.INFO, "GROUP", escape(update.effective_chat.title or "")),
-                    field_extra(E.CROWN, "OWNER", str(owner_count)),
-                    field_extra(E.ADMIN, "ADMINS", str(admin_count)),
-                    field_extra(E.USER, "TOTAL", str(len(admins))),
+                    field_extra(E.INFO, "Group", escape(update.effective_chat.title or "")),
+                    field_extra(E.CROWN, "Owner", str(owner_count)),
+                    field_extra(E.ADMIN, "Admins", str(admin_count)),
+                    field_extra(E.USER, "Total", str(len(admins))),
                 ],
                 icon=E.ADMIN,
             ),
@@ -364,10 +364,10 @@ async def setchatphoto_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await reply_card(
             update.message,
             action_card(
-                "CHAT PHOTO UPDATED",
+                "Chat Photo Updated",
                 [
                     field_by(update.effective_user, "UPDATED BY"),
-                    field_extra(E.INFO, "CHAT", escape(update.effective_chat.title or "")),
+                    field_extra(E.INFO, "Chat", escape(update.effective_chat.title or "")),
                 ],
                 icon=E.CHECK,
             ),
@@ -399,10 +399,10 @@ async def setchatname_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await reply_card(
             update.message,
             action_card(
-                "CHAT NAME UPDATED",
+                "Chat Name Updated",
                 [
                     field_by(update.effective_user, "UPDATED BY"),
-                    field_extra(E.INFO, "NEW NAME", escape(name)),
+                    field_extra(E.INFO, "New Name", escape(name)),
                 ],
                 icon=E.CHECK,
             ),
@@ -434,10 +434,10 @@ async def setchatdescription_command(update: Update, context: ContextTypes.DEFAU
         await reply_card(
             update.message,
             action_card(
-                "CHAT DESCRIPTION UPDATED",
+                "Chat Description Updated",
                 [
                     field_by(update.effective_user, "UPDATED BY"),
-                    field_extra(E.INFO, "DESCRIPTION", escape(desc[:200])),
+                    field_extra(E.INFO, "Description", escape(desc[:200])),
                 ],
                 icon=E.CHECK,
             ),

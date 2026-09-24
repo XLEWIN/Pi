@@ -295,10 +295,10 @@ async def execute_action(
 
 # Action result → card title + header icon
 _ACTION_META = {
-    WarningAction.MUTE: ("MUTE SUCCESSFUL", E.MUTE),
-    WarningAction.KICK: ("KICK SUCCESSFUL", E.KICK),
-    WarningAction.BAN: ("BAN SUCCESSFUL", E.BAN),
-    WarningAction.TIMEOUT: ("TIMEOUT SUCCESSFUL", E.TIME),
+    WarningAction.MUTE: ("Mute Successful", E.MUTE),
+    WarningAction.KICK: ("Kick Successful", E.KICK),
+    WarningAction.BAN: ("Ban Successful", E.BAN),
+    WarningAction.TIMEOUT: ("Timeout Successful", E.TIME),
 }
 
 
@@ -316,15 +316,15 @@ def moderation_card(
     """Shared success/error card for mute/ban/kick/timeout."""
     if not ok:
         return action_card(
-            "ACTION FAILED",
+            "Failed",
             [
                 field_user(target),
-                field_by(actor, "REQUESTED BY"),
+                field_by(actor, "Requested By"),
                 field_reason(detail or reason),
             ],
             icon=E.ERROR,
         )
-    title, icon = _ACTION_META.get(action, ("ACTION COMPLETE", E.CHECK))
+    title, icon = _ACTION_META.get(action, ("Action Complete", E.CHECK))
     fields = [
         field_user(target),
         field_by(actor, f"{action.value.upper()}ED BY" if action != WarningAction.KICK else "KICKED BY"),
@@ -335,11 +335,11 @@ def moderation_card(
     fields[1] = field_by(
         actor,
         {
-            WarningAction.MUTE: "MUTED BY",
-            WarningAction.BAN: "BANNED BY",
-            WarningAction.KICK: "KICKED BY",
-            WarningAction.TIMEOUT: "TIMED OUT BY",
-        }.get(action, "ACTION BY"),
+            WarningAction.MUTE: "Muted By",
+            WarningAction.BAN: "Banned By",
+            WarningAction.KICK: "Kicked By",
+            WarningAction.TIMEOUT: "Timed Out By",
+        }.get(action, "Action By"),
     )
     if extra_fields:
         fields.extend(extra_fields)
@@ -356,15 +356,15 @@ def warn_card(
     triggered: Optional[str] = None,
     extra_fields=None,
 ) -> str:
-    title = "WARNING LIMIT REACHED" if triggered else "WARNING ISSUED"
+    title = "Warning Limit Reached" if triggered else "Warning Issued"
     fields = [
         field_user(target),
-        field_by(actor, "WARNED BY"),
+        field_by(actor, "Warned By"),
         field_reason(reason),
         field_count(count, limit),
     ]
     if triggered:
-        fields.append(field_extra(E.ALERT, "ACTION", escape(triggered.upper())))
+        fields.append(field_extra(E.ALERT, "Action", escape(triggered)))
     if extra_fields:
         fields.extend(extra_fields)
     return action_card(title, fields, icon=E.WARN)
@@ -522,7 +522,7 @@ async def dmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     extras = []
     if message_deleted:
-        extras.append(field_extra(E.CROSS, "MESSAGE", "DELETED"))
+        extras.append(field_extra(E.CROSS, "Message", "Deleted"))
     reply_text = moderation_card(
         WarningAction.MUTE, target_user, update.effective_user, reason,
         duration=duration, extra_fields=extras, ok=ok, detail=detail,
@@ -643,7 +643,7 @@ async def tmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_text = moderation_card(
         WarningAction.MUTE, target_user, update.effective_user, reason,
         duration=duration,
-        extra_fields=[field_extra(E.TIME, "AUTO-UNMUTE", unmute_time.strftime("%Y-%m-%d %H:%M:%S"))],
+        extra_fields=[field_extra(E.TIME, "Auto-unmute", unmute_time.strftime("%Y-%m-%d %H:%M:%S"))],
         ok=ok, detail=detail,
     )
     await reply_card(update.message, reply_text, user=target_user)
@@ -702,10 +702,10 @@ async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply_card(
             update.message,
             action_card(
-                "UNMUTE SUCCESSFUL",
+                "Unmute Successful",
                 [
                     field_user(target_user),
-                    field_by(update.effective_user, "UNMUTED BY"),
+                    field_by(update.effective_user, "Unmuted By"),
                 ],
                 icon=E.MUTE,
             ),
@@ -878,7 +878,7 @@ async def dban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     extras = []
     if message_deleted:
-        extras.append(field_extra(E.CROSS, "MESSAGE", "DELETED"))
+        extras.append(field_extra(E.CROSS, "Message", "Deleted"))
     reply_text = moderation_card(
         WarningAction.BAN, target_user, update.effective_user, reason,
         duration=duration, extra_fields=extras, ok=ok, detail=detail,
@@ -999,7 +999,7 @@ async def tban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_text = moderation_card(
         WarningAction.BAN, target_user, update.effective_user, reason,
         duration=duration,
-        extra_fields=[field_extra(E.TIME, "AUTO-UNBAN", unban_time.strftime("%Y-%m-%d %H:%M:%S"))],
+        extra_fields=[field_extra(E.TIME, "Auto-unban", unban_time.strftime("%Y-%m-%d %H:%M:%S"))],
         ok=ok, detail=detail,
     )
     await reply_card(update.message, reply_text, user=target_user)
@@ -1040,7 +1040,7 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply_card(
             update.message,
             action_card(
-                "UNBAN SUCCESSFUL",
+                "Unban Successful",
                 [
                     field_user(target_user),
                     field_by(update.effective_user, "UNBANNED BY"),
@@ -1200,7 +1200,7 @@ async def dkick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     extras = []
     if message_deleted:
-        extras.append(field_extra(E.CROSS, "MESSAGE", "DELETED"))
+        extras.append(field_extra(E.CROSS, "Message", "Deleted"))
     reply_text = moderation_card(
         WarningAction.KICK, target_user, update.effective_user, reason,
         extra_fields=extras, ok=ok, detail=detail,
@@ -1306,15 +1306,15 @@ async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update, context, target_user.id, action, duration, reason
         )
         action_name = {
-            WarningAction.MUTE: "MUTE",
-            WarningAction.KICK: "KICK",
-            WarningAction.BAN: "BAN",
-            WarningAction.TIMEOUT: "TIMEOUT",
-        }.get(action, action.value.upper())
+            WarningAction.MUTE: "Mute",
+            WarningAction.KICK: "Kick",
+            WarningAction.BAN: "Ban",
+            WarningAction.TIMEOUT: "Timeout",
+        }.get(action, action.value.capitalize())
         reply_text = warn_card(
             target_user, update.effective_user, reason,
             warning_count, settings["warn_limit"],
-            triggered=f"{action_name} ({detail})" if ok else f"FAILED ({detail})",
+            triggered=f"{action_name} ({detail})" if ok else f"Failed ({detail})",
         )
         await reset_warnings(chat_id, target_user.id)
     else:
@@ -1393,25 +1393,25 @@ async def dwarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update, context, target_user.id, action, duration, reason
         )
         action_name = {
-            WarningAction.MUTE: "MUTE",
-            WarningAction.KICK: "KICK",
-            WarningAction.BAN: "BAN",
-            WarningAction.TIMEOUT: "TIMEOUT",
-        }.get(action, action.value.upper())
+            WarningAction.MUTE: "Mute",
+            WarningAction.KICK: "Kick",
+            WarningAction.BAN: "Ban",
+            WarningAction.TIMEOUT: "Timeout",
+        }.get(action, action.value.capitalize())
         extras = []
         if message_deleted:
-            extras.append(field_extra(E.CROSS, "MESSAGE", "DELETED"))
+            extras.append(field_extra(E.CROSS, "Message", "Deleted"))
         reply_text = warn_card(
             target_user, update.effective_user, reason,
             warning_count, settings["warn_limit"],
-            triggered=f"{action_name} ({detail})" if ok else f"FAILED ({detail})",
+            triggered=f"{action_name} ({detail})" if ok else f"Failed ({detail})",
             extra_fields=extras,
         )
         await reset_warnings(chat_id, target_user.id)
     else:
         extras = []
         if message_deleted:
-            extras.append(field_extra(E.CROSS, "MESSAGE", "DELETED"))
+            extras.append(field_extra(E.CROSS, "Message", "Deleted"))
         reply_text = warn_card(
             target_user, update.effective_user, reason,
             warning_count, settings["warn_limit"],
@@ -1498,17 +1498,17 @@ async def warns_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         )
         reply_text = action_card(
-            "ACTIVE WARNINGS",
+            "Active Warnings",
             [
                 field_user(target_user),
                 field_count(len(warnings), settings["warn_limit"]),
-                field_extra(E.INFO, "LIST", warning_list),
+                field_extra(E.INFO, "List", warning_list),
             ],
             icon=E.WARN,
         )
     else:
         reply_text = action_card(
-            "NO ACTIVE WARNINGS",
+            "No Active Warnings",
             [field_user(target_user)],
             icon=E.CHECK,
         )
@@ -1552,7 +1552,7 @@ async def rmwarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         reply_text = action_card(
-            "WARNING REMOVED",
+            "Warning Removed",
             [
                 field_user(target_user),
                 field_by(update.effective_user, "REMOVED BY"),
@@ -1562,7 +1562,7 @@ async def rmwarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         reply_text = action_card(
-            "NO WARNING TO REMOVE",
+            "No Warning To Remove",
             [field_user(target_user)],
             icon=E.WARNING,
         )
@@ -1605,18 +1605,18 @@ async def resetwarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         reply_text = action_card(
-            "WARNINGS CLEARED",
+            "Warnings Cleared",
             [
                 field_user(target_user),
                 field_by(update.effective_user, "CLEARED BY"),
                 field_count(0, settings["warn_limit"]),
-                field_extra(E.INFO, "REMOVED", str(count)),
+                field_extra(E.INFO, "Removed", str(count)),
             ],
             icon=E.CHECK,
         )
     else:
         reply_text = action_card(
-            "NO WARNINGS TO CLEAR",
+            "No Warnings To Clear",
             [field_user(target_user)],
             icon=E.WARNING,
         )
@@ -1642,17 +1642,17 @@ async def resetallwarns_command(update: Update, context: ContextTypes.DEFAULT_TY
 
     if count > 0:
         reply_text = action_card(
-            "ALL WARNINGS CLEARED",
+            "All Warnings Cleared",
             [
                 field_by(update.effective_user, "CLEARED BY"),
-                field_extra(E.WARN, "REMOVED", str(count)),
+                field_extra(E.WARN, "Removed", str(count)),
             ],
             icon=E.CHECK,
         )
     else:
         reply_text = action_card(
-            "NO ACTIVE WARNINGS",
-            [field_extra(E.INFO, "CHAT", escape(update.effective_chat.title or ""))],
+            "No Active Warnings",
+            [field_extra(E.INFO, "Chat", escape(update.effective_chat.title or ""))],
             icon=E.INFO,
         )
 
@@ -1707,11 +1707,11 @@ async def warnlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply_card(
         update.message,
         action_card(
-            "WARN LIMIT UPDATED",
+            "Warn Limit Updated",
             [
-                field_by(update.effective_user, "UPDATED BY"),
-                field_extra(E.WARN, "LIMIT", str(limit)),
-                field_extra(E.INFO, "TRIGGERS ON", get_ordinal(limit)),
+                field_by(update.effective_user, "Updated By"),
+                field_extra(E.WARN, "Limit", str(limit)),
+                field_extra(E.INFO, "Triggers On", get_ordinal(limit)),
             ],
             icon=E.SETTINGS,
         ),
@@ -1775,12 +1775,12 @@ async def warnmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
     reply_text = action_card(
-        "WARN MODE UPDATED",
+        "Warn Mode Updated",
         [
-            field_by(update.effective_user, "UPDATED BY"),
-            field_extra(E.SETTINGS, "MODE", str(mode.value).upper()),
+            field_by(update.effective_user, "Updated By"),
+            field_extra(E.SETTINGS, "Mode", str(mode.value).capitalize()),
             field_duration(str(duration) if duration else None),
-            field_extra(E.INFO, "EFFECT", mode_descriptions[mode]),
+            field_extra(E.INFO, "Effect", mode_descriptions[mode]),
         ],
         icon=E.SETTINGS,
     )

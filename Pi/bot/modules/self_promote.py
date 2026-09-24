@@ -101,12 +101,12 @@ async def fullpromote_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await reply_card(
             update.message,
             action_card(
-                "PROMOTION SUCCESSFUL",
+                "Promotion Successful",
                 [
                     field_user(user),
                     field_by(user, "PROMOTED BY"),
-                    field_extra(E.SETTINGS, "TITLE", "FULL ADMIN"),
-                    field_extra(E.INFO, "PRIVILEGES", "ALL ADMIN RIGHTS"),
+                    field_extra(E.SETTINGS, "Title", "FULL ADMIN"),
+                    field_extra(E.INFO, "Privileges", "ALL ADMIN RIGHTS"),
                 ],
                 icon=E.CHECK,
             ),
