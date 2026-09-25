@@ -8,9 +8,17 @@ Pure Bot API stack — no MTProto required.
 | Command | Who | What |
 |---|---|---|
 | `/all` (as a reply) | admin | Copy the replied-to message, then post batches of mentions |
-| `/tagabort` | admin | Stop the running session for this chat |
+| `/tagall [text]` | admin | Boa-style: mention everyone by name; text = first line (reply-only also works) |
+| `/etagall [text]` | admin | Same, but each member linked by a random emoji from the owner's set |
+| `@all` / `@eall [text]` | admin | Same triggers without a slash |
+| `/tagabort` / `/cancel` | admin | Stop the running session for this chat |
 | `/allsettings [key] [value]` | admin | Show card / change one setting |
 | `/tagstats` | admin | Session totals, member counts, presence source |
+
+`/tagall` is a port of boabot's Yumeko `tagall` (5 mentions per message,
+3 s apart, text+reply rejected) on top of this module's registry,
+sessions and cancel tokens; `/etagall` draws its random emoji labels from
+`bot/emojis.py` (`EMOJI_POOL`).
 
 Inline buttons: **settings cycles** (`tag:set:<key>`), **Stop** on the
 progress card (`tag:abort`), **Close** (`card:close`).
@@ -52,7 +60,7 @@ by tests.
 
 | Group | Handlers |
 |---|---|
-| 0 | `/all` `/tagabort` `/allsettings` `/tagstats`, `tag:` callbacks |
+| 0 | `/all` `/tagabort` `/allsettings` `/tagstats` `/tagall` `/etagall` `/cancel`, `@all`/`@eall` trigger, `tag:` callbacks |
 | 15 | group message activity observer |
 | 16 | join/leave service messages + `ChatMemberHandler` |
 | 17 | catch-all callback activity observer |
@@ -137,6 +145,7 @@ session-per-chat, and the exact spec strings.
 tagging/
 ├── __init__.py        setup(): tables, handlers, groups
 ├── handler.py         commands, tag: callbacks, observers
+├── tagall.py          Boa-style /tagall /etagall @all @eall (Yumeko port)
 ├── sender.py          copy → batches → progress → final card
 ├── session.py         one-session-per-chat manager
 ├── cancellation.py    CancelToken (cancel-aware sleeps)

@@ -71,12 +71,12 @@ class MtprotoPresence(PresenceProvider):
             logger.warning(f"Tagging MTProto init failed: {e}")
             self._client = None
             return False
-        self.available = True
+        # available flips True only after a successful connect in start().
         return True
 
     async def start(self) -> None:
         """Connect + verify authorization, then start the refresh loop."""
-        if not self.available or self._client is None:
+        if self._client is None:
             return
         try:
             await self._client.connect()
@@ -94,6 +94,7 @@ class MtprotoPresence(PresenceProvider):
             self.available = False
             await self._close_client()
             return
+        self.available = True
         logger.info("Tagging MTProto presence enabled")
         self._task = asyncio.create_task(self._refresh_loop())
 
@@ -130,6 +131,24 @@ class MtprotoPresence(PresenceProvider):
             except Exception as e:
                 logger.warning(f"Tagging MTProto refresh failed: {e}")
 
+    def iter_members(self, chat_id: int):
+        """Boabot's method — LIVE participant stream of (user_id, name).
+
+        Returns None without a connected client (caller falls back to the
+        registry). Iteration errors propagate to the caller.
+        """
+        if self._client is None:
+            return None
+
+        async def _gen():
+            async for user in self._client.iter_participants(chat_id):
+                if user.id is None:
+                    continue
+                # boabot mentioned first_name only.
+                yield user.id, (user.first_name or str(user.id))
+
+        return _gen()
+
     async def sync_chat(self, chat_id: int) -> int:
         """Enumerate participants → registry rows + online timestamps."""
         if not self.available or self._client is None:
@@ -137,6 +156,7 @@ class MtprotoPresence(PresenceProvider):
         from .. import database as tdb
 
         count = 0
+        seen: set = set()
         online_ts = time.time()  # epoch — matches DB timestamps
         try:
             async for user in self._client.iter_participants(chat_id):
@@ -152,6 +172,7 @@ class MtprotoPresence(PresenceProvider):
                     display_name=name,
                     is_bot=bool(user.bot),
                 )
+                seen.add(user.id)
                 count += 1
                 status = getattr(user, "status", None)
                 if isinstance(status, UserStatusOnline):
@@ -160,6 +181,12 @@ class MtprotoPresence(PresenceProvider):
         except Exception as e:
             logger.warning(f"Tagging MTProto sync chat {chat_id} failed: {e}")
             return count
+        # Enumeration completed — reconcile: registry rows not seen live
+        # have left (stale ghosts must never be tagged).
+        try:
+            tdb.mark_left_except(chat_id, seen)
+        except Exception as e:
+            logger.warning(f"Tagging MTProto reconcile failed: {e}")
         if count:
             logger.info(f"Tagging MTProto: synced {count} members of {chat_id}")
         return count

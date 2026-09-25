@@ -52,12 +52,21 @@ def _prepare_console() -> None:
 
 
 class BotFormatter(logging.Formatter):
-    """Compact one-line formatter: [time] [TAG] message."""
+    """Compact one-line formatter: [time] [TAG] message.
+
+    Appends the exception traceback when the record carries exc_info —
+    otherwise handler errors would log without any stack trace.
+    """
 
     def format(self, record: logging.LogRecord) -> str:
         color, tag = LEVEL_STYLES.get(record.levelno, (RESET, "???"))
         ts = datetime.now().strftime("%H:%M:%S")
-        return f"{DIM}{ts}{RESET} {color}{tag}{RESET} {record.getMessage()}"
+        line = f"{DIM}{ts}{RESET} {color}{tag}{RESET} {record.getMessage()}"
+        if record.exc_info:
+            exc = self.formatException(record.exc_info)
+            if exc:
+                line = f"{line}\n{exc}"
+        return line
 
 
 def log_load(logger: logging.Logger, message: str) -> None:

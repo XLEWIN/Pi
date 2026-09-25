@@ -48,6 +48,10 @@ ENV_API_ID = "TELEGRAM_API_ID"
 ENV_API_HASH = "TELEGRAM_API_HASH"
 ENV_MTPROTO_ENABLED = "TAG_MTPROTO"  # "1" to enable when creds present
 
+# ── Boa-style tagall (ported from Yumeko/modules/tagall.py) ───────
+TAGALL_BATCH_SIZE = 5        # mentions per message (boabot: 5)
+TAGALL_BATCH_DELAY = 3.0     # seconds between messages (boabot: 3)
+
 # ── Settings cycles (`/allsettings` + inline buttons) ─────────────
 MODES = ("online_first", "recent", "random", "all")
 WINDOWS_H = (1, 6, 12, 24, 72, 168, 0)        # 0 = off / no window
@@ -89,3 +93,6 @@ MSG_STOPPED_FMT = "Tagging stopped. Tagged: {tagged} / {total} users"
 MSG_NOBODY = "No users matched the current tagging filters."
 MSG_ADMIN_FETCH_FAIL = "Could not fetch the admin list — try again."
 MSG_SETTINGS_VALUE_BAD = "Unknown value for {key}: {value}"
+# Boa-style tagall input rules (Yumeko wording, plain-ASCII Pi style).
+MSG_TAGALL_ONE_ARG = "Provide only one argument!"
+MSG_TAGALL_NO_INPUT = "Reply to a message or provide text to mention others!"

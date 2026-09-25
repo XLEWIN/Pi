@@ -26,6 +26,11 @@ class PresenceManager:
         self._activity = ActivityPresence()
         self._mtproto: PresenceProvider = _mtproto_provider()
         self._kicked = False
+        # start() must run exactly once: configure() would otherwise build a
+        # second TelegramClient on the same session file (kick task racing
+        # an explicit await start()).
+        self._start_lock = asyncio.Lock()
+        self._started = False
 
     @property
     def mtproto(self) -> MtprotoPresence:
@@ -63,13 +68,33 @@ class PresenceManager:
             return 0
         return await self._mtproto.sync_chat(chat_id)
 
+    def live_member_stream(self, chat_id: int):
+        """Boabot's /tagall source — LIVE iter_participants stream.
+
+        None when MTProto is unavailable → caller falls back to the
+        observed-registry pipeline.
+        """
+        if not self._mtproto.available:
+            return None
+        fn = getattr(self._mtproto, "iter_members", None)
+        return fn(chat_id) if fn else None
+
     async def start(self) -> None:
-        """Configure + connect MTProto if enabled (never raises)."""
-        try:
-            if self._mtproto.configure():
-                await self._mtproto.start()
-        except Exception as e:
-            logger.warning(f"Tagging MTProto startup failed: {e}")
+        """Configure + connect MTProto if enabled (never raises; idempotent).
+
+        Concurrent callers await the same run — the second returns only
+        after connect() finished (or failed), so `available` is settled
+        by the time any caller proceeds.
+        """
+        async with self._start_lock:
+            if self._started:
+                return
+            try:
+                if self._mtproto.configure():
+                    await self._mtproto.start()
+            except Exception as e:
+                logger.warning(f"Tagging MTProto startup failed: {e}")
+            self._started = True
 
     def kick(self) -> None:
         """Idempotent: schedule start() on the *running* loop.

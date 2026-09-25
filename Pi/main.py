@@ -8,27 +8,57 @@ import asyncio
 import logging
 import signal
 import sys
+import traceback
 from datetime import datetime
 
 from telegram import Update
+from telegram.error import NetworkError
 from telegram.ext import Application, ContextTypes
 
 from bot.config import settings
 from bot.constants import BOT_NAME
 from bot.loader import load_modules
 from bot.logger import logger
-from bot.database import db
+from bot.database import DB_DIR, db
 
 
 # ── Startup log ──────────────────────────────────────────
 LOG_CHANNEL_ID = -1003845687680  # Pi_Logs
+HANDLER_ERRORS_FILE = DB_DIR / "handler_errors.log"
+
+
+def _persist_handler_error(update: object, err: Exception) -> None:
+    """Append full traceback to a log file (diagnosable without a paste)."""
+    try:
+        uid = getattr(update, "update_id", "?")
+        chat = "?"
+        user = "?"
+        if isinstance(update, Update) and update.effective_chat:
+            chat = update.effective_chat.id
+            user = getattr(update.effective_user, "id", "?")
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        tb = "".join(
+            traceback.format_exception(type(err), err, err.__traceback__)
+        )
+        with open(HANDLER_ERRORS_FILE, "a", encoding="utf-8") as f:
+            f.write(
+                f"=== {ts} update={uid} chat={chat} user={user} "
+                f"{type(err).__name__}: {err}\n{tb}\n"
+            )
+    except Exception:
+        pass  # diagnosis must never raise
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Log handler exceptions so failures never disappear silently."""
     err = context.error
-    # Expected/soft failures — one line, no traceback noise.
-    if isinstance(err, Exception) and type(err).__name__ in {"TimedOut", "NetworkError", "BadRequest"}:
+    # Expected/soft failures — one line, no traceback noise. isinstance
+    # (not just the type name) so every NetworkError subclass — TimedOut,
+    # InternalServerError, httpx wrapping — is treated as network.
+    if isinstance(err, Exception) and (
+        isinstance(err, (NetworkError, TimeoutError))
+        or type(err).__name__ in {"TimedOut", "BadRequest"}
+    ):
         logger.warning(f"Handler network/API issue: {err}")
         return
     logger.error("Handler error", exc_info=err)
@@ -39,6 +69,8 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
             getattr(update.effective_chat, "id", "?"),
             getattr(update.effective_user, "id", "?"),
         )
+    if isinstance(err, Exception):
+        _persist_handler_error(update, err)
 
 
 async def post_init(app: Application) -> None:

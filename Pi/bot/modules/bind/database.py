@@ -5,12 +5,14 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from bot.database import db as _db
+from bot.database import db as _db, ThreadLocalConn
 
 logger = logging.getLogger(__name__)
 
-# Shared connection from bot.database (WAL, busy_timeout already set).
-_conn = _db.connection
+# Thread-safe view of the shared connection (never bind `_db.connection`
+# directly — that pins one thread's connection and corrupts under
+# executor use).
+_conn = ThreadLocalConn(_db)
 
 
 def ensure_tables() -> None:

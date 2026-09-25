@@ -76,8 +76,15 @@ async def assemble_candidates(
     *,
     now: Optional[float] = None,
     presence=None,
+    exclude_bots: bool = True,
+    exclude_admins: bool = True,
 ) -> List[Candidate]:
-    """Full /all pipeline. Never raises on presence failures."""
+    """Full /all pipeline. Never raises on presence failures.
+
+    /all keeps Pi's invariant (exclude bots+admins); /tagall passes
+    exclude_bots=False, exclude_admins=False for boabot parity — it
+    tags EVERY member.
+    """
     now = now if now is not None else time.time()
     presence = presence or get_manager()
 
@@ -91,10 +98,10 @@ async def assemble_candidates(
     candidates: List[Candidate] = []
     for row in rows:
         c = _row_to_candidate(row)
-        if c.is_bot:
+        if exclude_bots and c.is_bot:
             continue
-        if c.user_id in admin_ids:
-            continue  # admins are never tagged
+        if exclude_admins and c.user_id in admin_ids:
+            continue  # /all: admins are never tagged
         if not window_allows(c, settings, now):
             continue
         candidates.append(c)

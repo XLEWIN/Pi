@@ -271,7 +271,7 @@ async def unpin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def adminlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /adminlist — show all admins."""
+    """Handle /adminlist — show owner, human admins and bots, each counted."""
     if update.effective_chat.type == "private":
         await update.message.reply_text(f"{E.ERROR} This command only works in groups.",
             parse_mode=ParseMode.HTML)
@@ -280,18 +280,24 @@ async def adminlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         admins = await context.bot.get_chat_administrators(update.effective_chat.id)
         owner = None
-        admin_list = []
+        human_admins = []
+        bot_admins = []
 
         for admin in admins:
             if admin.status == "creator":
                 owner = admin.user
+            elif admin.user.is_bot:
+                bot_admins.append(admin.user)
             else:
-                admin_list.append(admin.user)
+                human_admins.append(admin.user)
 
         text = action_card(
             "Admin List",
             [
                 field_extra(E.INFO, "Group", escape(update.effective_chat.title or "")),
+                field_extra(E.ADMIN, "Admins", str(len(human_admins))),
+                field_extra("🤖", "Bots", str(len(bot_admins))),
+                field_extra(E.USER, "Total", str(len(admins))),
             ],
             icon=E.CROWN,
         ) + "\n\n"
@@ -300,11 +306,17 @@ async def adminlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             name = f"@{escape(owner.username)}" if owner.username else escape(owner.first_name)
             text += f"{E.CROWN} <b>Owner:</b> <a href='tg://user?id={owner.id}'>{name}</a>\n"
 
-        if admin_list:
+        if human_admins:
             text += f"\n{E.ADMIN} <b>Administrators:</b>\n"
-            for admin in admin_list:
+            for admin in human_admins:
                 name = f"@{escape(admin.username)}" if admin.username else escape(admin.first_name)
                 text += f"• <a href='tg://user?id={admin.id}'>{name}</a>\n"
+
+        if bot_admins:
+            text += f"\n🤖 <b>Bots:</b>\n"
+            for bot_user in bot_admins:
+                name = f"@{escape(bot_user.username)}" if bot_user.username else escape(bot_user.first_name or str(bot_user.id))
+                text += f"• <a href='tg://user?id={bot_user.id}'>{name}</a>\n"
 
         await reply_card(update.message, text)
     except Exception as e:
@@ -313,7 +325,7 @@ async def adminlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def admin_count_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /admincount — count admins in chat."""
+    """Handle /admincount — count owners, admins and bot admins separately."""
     if update.effective_chat.type == "private":
         await update.message.reply_text(f"{E.ERROR} This command only works in groups.",
             parse_mode=ParseMode.HTML)
@@ -322,7 +334,10 @@ async def admin_count_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         admins = await context.bot.get_chat_administrators(update.effective_chat.id)
         owner_count = sum(1 for a in admins if a.status == "creator")
-        admin_count = len(admins) - owner_count
+        bot_count = sum(1 for a in admins if a.user.is_bot)
+        human_admin_count = sum(
+            1 for a in admins if a.status != "creator" and not a.user.is_bot
+        )
 
         await reply_card(
             update.message,
@@ -331,7 +346,8 @@ async def admin_count_command(update: Update, context: ContextTypes.DEFAULT_TYPE
                 [
                     field_extra(E.INFO, "Group", escape(update.effective_chat.title or "")),
                     field_extra(E.CROWN, "Owner", str(owner_count)),
-                    field_extra(E.ADMIN, "Admins", str(admin_count)),
+                    field_extra(E.ADMIN, "Admins", str(human_admin_count)),
+                    field_extra("🤖", "Bots", str(bot_count)),
                     field_extra(E.USER, "Total", str(len(admins))),
                 ],
                 icon=E.ADMIN,
