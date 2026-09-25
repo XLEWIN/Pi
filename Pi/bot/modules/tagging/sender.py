@@ -1,10 +1,11 @@
 """Send loop — copy source, batch mentions, progress, flood, cancel.
 
 Flow:
-    1. flush activity → assemble candidates (registry/admin/presence)
+    1. flush activity → seed registry from shared history → assemble
+       candidates (registry/admin/presence)
     2. copy_message of the replied-to source (no re-upload)
     3. send mention batches (thread-aware) with cancel-aware pacing
-    4. final card: completion / stop / failure
+    4. final card: completion / stop / failure (edit, reply fallback)
 
 Cancellation: checked between every step and raced against FloodWait
 sleeps via CancelToken.sleep(), so /tagabort always lands promptly.
@@ -13,7 +14,6 @@ sleeps via CancelToken.sleep(), so /tagabort always lands promptly.
 from __future__ import annotations
 
 import asyncio
-import logging
 from typing import List, Optional
 
 from telegram import Message
@@ -27,6 +27,7 @@ except ImportError:  # pragma: no cover
     _FloodExc = RetryAfter
 
 from bot.emojis import E
+from bot.logger import logger
 from bot.responses import action_card
 
 from . import batcher, config, database as tdb, member_registry, session as sess_mod
@@ -37,11 +38,9 @@ from .exceptions import (
     TaggingError,
 )
 from .keyboards import progress_keyboard
-from .models import Candidate
+from .models import Candidate, TagSettings
 from .session import TagSession
 from .utils import fmt_duration, fmt_n, pct, progress_bar
-
-logger = logging.getLogger(__name__)
 
 # Errors that are expected/soft in a mass-send loop.
 _SOFT_NET = (TimedOut, NetworkError)
@@ -120,6 +119,29 @@ def failed_card(detail: str) -> str:
     )
 
 
+def nobody_card(known: int, st: TagSettings) -> str:
+    """Enriched 'nobody matched' card — says why and how to fix it.
+
+    `known` = members currently in the registry (post-seed). The plain
+    failed_card left users stuck on a dead end with zero explanation.
+    """
+    fields = [
+        (E.INFO, "Detail", config.MSG_NOBODY),
+        (E.USER, "Registry", f"{fmt_n(known)} members known"),
+    ]
+    if known <= 0:
+        fields.append((E.INFO, "Hint", "Members are learned as they chat."))
+    elif st.mode == "all":
+        fields.append(
+            (E.SETTINGS, "Hint", "Known members are admins, bots or left.")
+        )
+    else:
+        fields.append(
+            (E.SETTINGS, "Hint", "/allsettings mode all — ignore the window")
+        )
+    return action_card("No One to Tag", fields, icon=E.ERROR)
+
+
 # ── Progress editing (rate-limited) ───────────────────────────────
 
 async def _edit_status(
@@ -128,14 +150,20 @@ async def _edit_status(
     *,
     keyboard=None,
     force: bool = False,
-) -> None:
-    """Edit the live card; swallow 'not modified' + edit races."""
+) -> bool:
+    """Edit the live card; swallow 'not modified' + edit races.
+
+    Returns True when the card shows `text` (now or already), False when
+    the edit was rate-limited or genuinely failed. Terminal paths pass
+    force=True and route a False through _finalize_status() so a broken
+    edit can never leave the chat stuck on the opening card.
+    """
     import time as _time
 
     if not force:
         gap = _time.monotonic() - (s._last_edit or 0)  # type: ignore[attr-defined]
         if gap < config.PROGRESS_EDIT_MIN:
-            return
+            return False
     try:
         await s.status_message.edit_message_text(
             text,
@@ -144,11 +172,40 @@ async def _edit_status(
         )
         s._last_edit = _time.monotonic()  # type: ignore[attr-defined]
         s.metrics.edits += 1
+        return True
     except BadRequest as e:
-        if "not modified" not in str(e).lower():
-            logger.debug(f"Tagging status edit failed: {e}")
+        if "not modified" in str(e).lower():
+            return True  # the card already shows this text
+        # Terminal (force) failures must be visible; progress-only
+        # failures stay quiet to avoid spamming a long run.
+        (logger.warning if force else logger.debug)(
+            f"Tagging status edit failed: {e}"
+        )
+        return False
     except Exception as e:
-        logger.debug(f"Tagging status edit error: {e}")
+        (logger.warning if force else logger.debug)(
+            f"Tagging status edit error: {e}"
+        )
+        return False
+
+
+async def _finalize_status(s: TagSession, text: str) -> None:
+    """Land the terminal card no matter what.
+
+    Tries the status-message edit first; if that fails (deleted card,
+    stale message, edit race), falls back to a fresh reply in the chat
+    so the user always sees the outcome instead of a frozen card.
+    """
+    if await _edit_status(s, text, keyboard=None, force=True):
+        return
+    try:
+        await s.status_message.reply_text(text, parse_mode="HTML")
+        logger.warning(
+            f"Tagging final-card edit failed — sent fallback reply "
+            f"chat={s.chat_id}"
+        )
+    except Exception as e:
+        logger.error(f"Tagging final-card fallback failed chat={s.chat_id}: {e}")
 
 
 # ── Sending ───────────────────────────────────────────────────────
@@ -220,6 +277,18 @@ async def run(session: TagSession, context) -> None:
         except Exception as e:
             logger.warning(f"Tagging pre-run flush failed: {e}")
 
+        # Registry backfill from shared history — the observer only
+        # knows members who chatted since this process started.
+        try:
+            seeded = tdb.seed_from_history(s.chat_id)
+            if seeded:
+                logger.info(
+                    f"Tagging seeded {seeded} member(s) from history "
+                    f"chat={s.chat_id}"
+                )
+        except Exception as e:
+            logger.warning(f"Tagging history seed failed: {e}")
+
         candidates: List[Candidate] = await member_registry.assemble_candidates(
             s.chat_id, s.settings, s.admin_ids
         )
@@ -258,7 +327,7 @@ async def run(session: TagSession, context) -> None:
             tagged=s.tagged,
             messages_sent=s.metrics.messages_sent,
         )
-        await _edit_status(s, done_card(s), keyboard=None, force=True)
+        await _finalize_status(s, done_card(s))
         logger.info(
             f"Tagging completed chat={s.chat_id} tagged={s.tagged}/{s.total} "
             f"in {fmt_duration(s.metrics.elapsed)}"
@@ -273,15 +342,20 @@ async def run(session: TagSession, context) -> None:
             tagged=s.tagged,
             messages_sent=s.metrics.messages_sent,
         )
-        await _edit_status(s, stopped_card(s), keyboard=None, force=True)
+        await _finalize_status(s, stopped_card(s))
         logger.info(f"Tagging stopped chat={s.chat_id} tagged={s.tagged}")
 
     except NobodyToTagError as e:
         sess_mod.finish(s, "failed")
+        known = tdb.count_members(s.chat_id)
         tdb.finish_session(
-            s.session_id, "failed", total=0, error=str(e)
+            s.session_id, "failed", total=0, error=str(e) or "nobody",
         )
-        await _edit_status(s, failed_card(config.MSG_NOBODY), force=True)
+        logger.info(
+            f"Tagging nobody matched chat={s.chat_id} known={known} "
+            f"mode={s.settings.mode}"
+        )
+        await _finalize_status(s, nobody_card(known, s.settings))
 
     except FloodTooLongError as e:
         sess_mod.finish(s, "failed")
@@ -293,13 +367,12 @@ async def run(session: TagSession, context) -> None:
             messages_sent=s.metrics.messages_sent,
             error=f"flood {e.seconds}s",
         )
-        await _edit_status(
+        await _finalize_status(
             s,
             failed_card(
                 f"Rate limited — wait about {fmt_duration(e.seconds)} "
                 f"then try again."
             ),
-            force=True,
         )
 
     except TaggingError as e:
@@ -308,7 +381,7 @@ async def run(session: TagSession, context) -> None:
             s.session_id, "failed", total=s.total, tagged=s.tagged,
             messages_sent=s.metrics.messages_sent, error=str(e),
         )
-        await _edit_status(s, failed_card(str(e)), force=True)
+        await _finalize_status(s, failed_card(str(e)))
 
     except asyncio.CancelledError:
         sess_mod.finish(s, "failed")
@@ -325,7 +398,7 @@ async def run(session: TagSession, context) -> None:
             s.session_id, "failed", total=s.total, tagged=s.tagged,
             messages_sent=s.metrics.messages_sent, error=type(e).__name__,
         )
-        await _edit_status(s, failed_card("Unexpected error — see logs."), force=True)
+        await _finalize_status(s, failed_card("Unexpected error — see logs."))
 
     finally:
         s.done.set()

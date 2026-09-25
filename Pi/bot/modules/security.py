@@ -20,12 +20,12 @@ from telegram import ChatMember, ChatPermissions, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
-    CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
 )
 
+from bot.command_handler import COMMAND, CommandHandler
 from bot.database import db
 from bot.emojis import E
 from bot.responses import action_card, field_extra, field_user, reply_card
@@ -508,7 +508,7 @@ def setup(app: Application) -> list:
     # Message flood: after leveling XP (5) → group 6.
     app.add_handler(
         MessageHandler(
-            group_filter & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
+            group_filter & ~COMMAND & ~filters.StatusUpdate.ALL,
             detect_message_burst,
         ),
         group=6,

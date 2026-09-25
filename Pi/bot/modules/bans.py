@@ -7,9 +7,10 @@ import logging
 from html import escape
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, ContextTypes
 from telegram.constants import ParseMode
 
+from bot.command_handler import CommandHandler
 from bot.database import db
 from bot.emojis import E
 from bot.responses import (

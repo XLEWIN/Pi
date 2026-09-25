@@ -9,13 +9,13 @@ from html import escape
 from telegram import Update, ChatMember
 from telegram.ext import (
     Application,
-    CommandHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
 from telegram.constants import ParseMode
 
+from bot.command_handler import CommandHandler
 from bot.database import db
 from bot.emojis import E
 

@@ -8,13 +8,13 @@ from datetime import date, timedelta
 from telegram import Update
 from telegram.ext import (
     Application,
-    CommandHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
 from telegram.constants import ParseMode
 
+from bot.command_handler import COMMAND, CommandHandler
 from bot.database import db
 from bot.profile_templates import get_theme_list, THEMES
 from bot.rank_image import create_rank_card
@@ -356,7 +356,7 @@ def setup(app: Application) -> list:
 
     # Message tracker for XP (group 5 to avoid conflicts)
     app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, track_message),
+        MessageHandler(filters.TEXT & ~COMMAND, track_message),
         group=5,
     )
 

@@ -7,9 +7,10 @@ in any group where the bot has "Add Admins" permission.
 import logging
 
 from telegram import Update, ChatMember
-from telegram.ext import Application, CommandHandler, ContextTypes, filters
+from telegram.ext import Application, ContextTypes, filters
 from telegram.constants import ParseMode
 
+from bot.command_handler import CommandHandler
 from bot.emojis import E
 from bot.responses import (
     action_card,

@@ -21,10 +21,13 @@ progress card (`tag:abort`), **Close** (`card:close`).
    registry is built from what the bot actually observes: every group
    message (write-behind, flushed every ~3 s), joins/leaves (service
    messages + `chat_member` updates), and optionally a Telethon sync.
-2. **Candidates** — for each `/all`: flush activity → fetch non-left
-   members → exclude **admins** (fresh `getChatAdministrators` every run)
-   and **bots** → apply the activity window → presence enrich → sort →
-   apply the max cap.
+   Each `/all` first **seeds from shared history** (`user_activity`,
+   `daily_messages`, `group_members` → `seed_from_history()`), so a
+   freshly restarted bot can still tag members who chatted before.
+2. **Candidates** — for each `/all`: flush activity → seed history →
+   fetch non-left members → exclude **admins** (fresh
+   `getChatAdministrators` every run) and **bots** → apply the activity
+   window → presence enrich → sort → apply the max cap.
 3. **Ordering** — `online_first`/`all`: presence rank → last activity →
    user id; `recent`: activity only; `random`: shuffled.
    Ranks: `0` online (MTProto-confirmed only), `1` active ≤ 15 s,
@@ -33,7 +36,9 @@ progress card (`tag:abort`), **Close** (`card:close`).
    then mention batches: UTF-16 target 3600, hard limit 4096, ≤ 150
    mentions per message. Pacing: 0.35 s (normal) or 2 s (throttled)
    between batches. Flood waits ≤ 60 s are slept through with the cancel
-   token raced against the timer; longer waits end the session.
+   token raced against the timer; longer waits end the session. Terminal
+   cards (done/stopped/failed) are edited into place with a **fresh-reply
+   fallback**, so a failed edit can never leave a frozen card.
 5. **Cancellation** — one session per chat (sync check-then-create, no
    awaits between); `/tagabort` sets a `CancelToken` that is checked
    between sends *and* during flood sleeps, so it always lands promptly.
@@ -95,8 +100,12 @@ Settings values:
 
 * **Loader** — auto-discovered package; `setup(app)` lives in
   `__init__.py` (same pattern as `bind`/`instagram`).
-* **Help** — `HELP_TEXT` section in `bot/constants.py`
-  (`{announce}` kwarg) + `announce=E.ANNOUNCE` in `bot/modules/help.py`.
+* **Help** — interactive menu in `bot/modules/help.py`; module data lives
+  in `HELP_MENU` (`bot/constants.py`) with the `tagging` entry rendered
+  like every other module.
+* **Command prefixes** — every command runs with `/` `!` `.` `#` `$` `%`
+  `&` `?` (see `bot/command_handler.py`); the activity observer excludes
+  prefix-commands via `~COMMAND` exactly like `~filters.COMMAND`.
 * **Cards/buttons** — `bot/responses.py` (`action_card`,
   `plain_error/plain_ok`) and `bot/keyboards/colored.py`.
 * **DB** — shared connection from `bot.database` (`from bot.database import db`),
@@ -111,6 +120,7 @@ Settings values:
 ```powershell
 # from Pi/Pi
 python tests/test_tagging.py
+python tests/test_command_handler.py
 ```
 
 `tests/test_tagging.py` isolates itself: `BOT_TOKEN` forced, and

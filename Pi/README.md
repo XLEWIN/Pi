@@ -2,6 +2,8 @@
 
 A comprehensive Telegram moderation bot with mute, ban, kick, warnings, and rules management.
 
+> **Command prefixes:** every command below also works with `!` `.` `#` `$` `%` `&` `?` — e.g. `!mute @user`, `.warn @user`, `#rules`.
+
 ## Features
 
 ### 🔇 Mute Commands

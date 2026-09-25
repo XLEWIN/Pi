@@ -8,13 +8,13 @@ import logging
 from telegram import Update, ChatPermissions
 from telegram.ext import (
     Application,
-    CommandHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
 from telegram.constants import ParseMode
 
+from bot.command_handler import COMMAND, CommandHandler
 from bot.database import db
 from bot.emojis import E
 
@@ -304,6 +304,6 @@ def setup(app: Application) -> list:
     app.add_handler(CommandHandler("unblocklistall", clear_blocklist, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("setblocklistaction", set_blocklist_action, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("blocklistreason", set_blocklist_reason, filters=filters.ChatType.GROUPS))
-    app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, blocklist_check), group=2)
+    app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~COMMAND, blocklist_check), group=2)
 
     return ["blocklist", "unblocklist", "blocklistview", "unblocklistall", "setblocklistaction", "blocklistreason"]

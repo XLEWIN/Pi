@@ -17,11 +17,11 @@ from telegram.ext import (
     Application,
     CallbackQueryHandler,
     ChatMemberHandler,
-    CommandHandler,
     MessageHandler,
     filters,
 )
 
+from bot.command_handler import COMMAND, CommandHandler
 from bot.logger import logger
 
 from . import database as tdb
@@ -63,7 +63,7 @@ def setup(app: Application) -> list[str]:
     app.add_handler(
         MessageHandler(
             filters.ChatType.GROUPS
-            & ~filters.COMMAND
+            & ~COMMAND
             & ~filters.StatusUpdate.ALL,
             activity_observer,
         ),

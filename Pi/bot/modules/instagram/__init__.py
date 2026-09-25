@@ -10,8 +10,9 @@ Auto-detect: group 14 (text messages containing instagram.com URLs).
 
 from __future__ import annotations
 
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
 
+from bot.command_handler import COMMAND, CommandHandler
 from bot.logger import logger
 
 from .config import HANDLER_GROUP, ig_config
@@ -54,7 +55,7 @@ def setup(app: Application) -> list[str]:
     # Narrow filter: only non-command text that contains an Instagram host.
     ig_filter = (
         filters.TEXT
-        & ~filters.COMMAND
+        & ~COMMAND
         & filters.Regex(r"(?i)(instagram\.com|instagr\.am)/")
     )
     app.add_handler(

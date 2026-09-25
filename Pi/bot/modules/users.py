@@ -11,7 +11,6 @@ from typing import Optional
 from telegram import Update, ChatMember, User
 from telegram.ext import (
     Application,
-    CommandHandler,
     MessageHandler,
     ContextTypes,
     ChatMemberHandler,
@@ -19,6 +18,7 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
+from bot.command_handler import COMMAND, CommandHandler
 from bot.database import db
 from bot.modules.start import send_log, format_user_log
 from bot.emojis import E
@@ -391,7 +391,7 @@ def setup(app: Application) -> list[str]:
     app.add_handler(ChatMemberHandler(handle_new_member, ChatMemberHandler.CHAT_MEMBER))
 
     # Track all messages to register active users
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, track_message))
+    app.add_handler(MessageHandler(filters.ALL & ~COMMAND, track_message))
 
     # Commands
     app.add_handler(CommandHandler("userstats", userstats_command))

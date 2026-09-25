@@ -17,12 +17,12 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
-    CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
 )
 
+from bot.command_handler import COMMAND, CommandHandler
 from bot.database import db
 from bot.emojis import E
 from bot.responses import action_card, field_extra
@@ -285,7 +285,7 @@ def setup(app: Application) -> list:
     # Message hour counter — after leveling(5)/security(6) → group 7.
     app.add_handler(
         MessageHandler(
-            group_filter & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
+            group_filter & ~COMMAND & ~filters.StatusUpdate.ALL,
             track_message_analytics,
         ),
         group=7,

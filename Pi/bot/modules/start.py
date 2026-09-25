@@ -7,9 +7,10 @@ import asyncio
 from html import escape
 
 from telegram import Update
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 from telegram.constants import ParseMode
 
+from bot.command_handler import CommandHandler
 from bot.constants import BOT_DESCRIPTION, START_TEXT, URL_ADD_TO_GROUP, URL_OFFICIAL_CHANNEL, URL_NETWORK
 from bot.database import db
 from bot.emojis import E
@@ -75,21 +76,26 @@ def format_user_log(user, action: str, chat_title: str = None) -> str:
     return log_text
 
 
-def build_start_keyboard():
-    """Build the start menu keyboard with colored buttons and custom emoji icons."""
+def build_start_keyboard(icons: bool = True):
+    """Start menu keyboard with colored buttons; icons=False = plain retry."""
     from bot.emojis import EID
 
     buttons = [
         [
-            btn_url("Bot To Chat", URL_ADD_TO_GROUP, icon_emoji_id=EID.ADD),
-            btn_primary("Help Menu", "start:help", icon_emoji_id=EID.INFO),
+            btn_url("Bot To Chat", URL_ADD_TO_GROUP,
+                    icon_emoji_id=EID.ADD if icons else None),
+            btn_primary("Help Menu", "start:help",
+                        icon_emoji_id=EID.INFO if icons else None),
         ],
         [
-            btn_success("Dashboard", "start:dashboard", icon_emoji_id=EID.WEB),
+            btn_success("Dashboard", "start:dashboard",
+                        icon_emoji_id=EID.WEB if icons else None),
         ],
         [
-            btn_url("Channel", URL_OFFICIAL_CHANNEL, icon_emoji_id=EID.ANNOUNCE),
-            btn_url("Network", URL_NETWORK, icon_emoji_id=EID.TRAVEL),
+            btn_url("Channel", URL_OFFICIAL_CHANNEL,
+                    icon_emoji_id=EID.ANNOUNCE if icons else None),
+            btn_url("Network", URL_NETWORK,
+                    icon_emoji_id=EID.TRAVEL if icons else None),
         ],
     ]
     return build_keyboard(buttons)
@@ -147,19 +153,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"✈️ /help for the full command list."
     )
     keyboard = build_start_keyboard()
-    plain_keyboard = build_keyboard(
-        [
-            [
-                btn_url("Bot To Chat", URL_ADD_TO_GROUP),
-                btn_primary("Help Menu", "start:help"),
-            ],
-            [btn_success("Dashboard", "start:dashboard")],
-            [
-                btn_url("Channel", URL_OFFICIAL_CHANNEL),
-                btn_url("Network", URL_NETWORK),
-            ],
-        ]
-    )
+    plain_keyboard = build_start_keyboard(icons=False)
 
     # Exactly one attempt for the brand payload. Timeouts must not stack
     # (that was the multi-second stall). Only a fast BadRequest gets a
@@ -198,6 +192,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle the start callback buttons."""
     query = update.callback_query
+    data = query.data or ""
+    if data == "start:help":
+        # Open the interactive help menu (help.py owns the edit).
+        from bot.modules.help import show_main_menu
+
+        await show_main_menu(update, context)
+        return
     await query.answer("Coming soon!", show_alert=False)
 
 

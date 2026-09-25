@@ -10,13 +10,13 @@ from datetime import datetime
 from telegram import Update
 from telegram.ext import (
     Application,
-    CommandHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
 from telegram.constants import ParseMode
 
+from bot.command_handler import COMMAND, CommandHandler
 from bot.database import db
 from bot.keyboards.colored import btn_url, build_keyboard
 from bot.emojis import E, EID
@@ -233,6 +233,6 @@ def setup(app: Application) -> list:
     app.add_handler(CommandHandler("unwatch", unwatch_command, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("watchlist", watchlist_command, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("watchmode", watchmode_command, filters=filters.ChatType.GROUPS))
-    app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, watch_check), group=3)
+    app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~COMMAND, watch_check), group=3)
 
     return ["watch", "unwatch", "watchlist", "watchmode"]

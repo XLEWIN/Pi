@@ -10,14 +10,13 @@ Schema (see README.md):
 
 from __future__ import annotations
 
-import logging
 import sqlite3
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from bot.database import db as _db
-
-logger = logging.getLogger(__name__)
+from bot.logger import logger
 
 # Shared connection from bot.database (WAL, busy_timeout already set).
 _conn = _db.connection
@@ -284,6 +283,116 @@ def count_active(chat_id: int, since: float) -> int:
         (chat_id, since),
     ).fetchone()
     return int(row["n"]) if row else 0
+
+
+# ── History seeding (fresh bots / quiet chats) ────────────────────
+
+def _parse_ts(value: Any) -> float:
+    """Shared-table timestamp → epoch seconds (0.0 when unparseable).
+
+    Handles the three formats found in the shared tables:
+      * 'YYYY-MM-DD HH:MM:SS'  — SQLite CURRENT_TIMESTAMP, **UTC**
+      * isoformat with 'T'     — written by Python, local wall-clock
+      * 'YYYY-MM-DD'           — daily_messages.date, local midnight
+    """
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    if len(text) == 10:  # bare date → local midnight
+        try:
+            return datetime.strptime(text, "%Y-%m-%d").timestamp()
+        except ValueError:
+            return 0.0
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    if dt.tzinfo is None:
+        if "T" in text:
+            dt = dt.astimezone()          # naive local (Python isoformat)
+        else:
+            dt = dt.replace(tzinfo=timezone.utc)  # CURRENT_TIMESTAMP = UTC
+    return dt.timestamp()
+
+
+def seed_from_history(chat_id: int) -> int:
+    """Backfill tag_members from the shared history tables.
+
+    The activity observer only learns members from messages seen since
+    the bot started — a /all right after a restart would otherwise find
+    nobody. Merges user_activity (UTC), daily_messages (local date) and
+    group_members (joined_at) into one best-known timestamp per user,
+    enriches identity from `users`, then reuses bulk_observe() whose MAX
+    semantics never regress fresher live rows or re-open a leave.
+
+    Returns the number of members upserted (0 when there is no history).
+    """
+    # 1. Best-known activity timestamp per user, across every source.
+    best: Dict[int, float] = {}
+    bot_ids: set = set()
+    sources = (
+        "SELECT user_id, MAX(timestamp) AS ts FROM user_activity "
+        "WHERE chat_id=? GROUP BY user_id",
+        "SELECT user_id, MAX(date) AS ts FROM daily_messages "
+        "WHERE chat_id=? GROUP BY user_id",
+        "SELECT user_id, MAX(joined_at) AS ts, "
+        "MAX(CASE WHEN role='bot' THEN 1 ELSE 0 END) AS isbot "
+        "FROM group_members WHERE chat_id=? GROUP BY user_id",
+    )
+    try:
+        for sql in sources:
+            for row in _conn.execute(sql, (chat_id,)).fetchall():
+                uid = int(row["user_id"])
+                ts = _parse_ts(row["ts"])
+                if ts > best.get(uid, 0.0):
+                    best[uid] = ts
+                keys = row.keys()
+                if "isbot" in keys and row["isbot"]:
+                    bot_ids.add(uid)
+    except sqlite3.Error as e:
+        logger.warning(f"Tagging history seed query failed: {e}")
+        return 0
+    if not best:
+        return 0
+
+    # 2. Identity from the shared users table (chunked IN lists).
+    ids = sorted(best)
+    identity: Dict[int, Tuple[Optional[str], str]] = {}
+    try:
+        for i in range(0, len(ids), 400):
+            chunk = ids[i:i + 400]
+            marks = ",".join("?" for _ in chunk)
+            for row in _conn.execute(
+                "SELECT user_id, username, first_name, last_name, is_bot "
+                f"FROM users WHERE user_id IN ({marks})",
+                chunk,
+            ).fetchall():
+                uid = int(row["user_id"])
+                name = " ".join(
+                    p for p in (row["first_name"] or "",
+                                row["last_name"] or "") if p
+                ) or str(uid)
+                identity[uid] = (row["username"], name)
+                if row["is_bot"]:
+                    bot_ids.add(uid)
+    except sqlite3.Error as e:
+        logger.warning(f"Tagging history identity lookup failed: {e}")
+
+    # 3. One upsert pass — same code path as the live write-behind.
+    items = [
+        (
+            chat_id,
+            uid,
+            *identity.get(uid, (None, str(uid))),
+            1 if uid in bot_ids else 0,
+            best[uid],
+        )
+        for uid in ids
+    ]
+    bulk_observe(items)
+    return len(items)
 
 
 # ── Activity write-behind ─────────────────────────────────────────
