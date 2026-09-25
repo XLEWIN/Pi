@@ -1,10 +1,11 @@
-"""Mass Tagging module — /all, /tagabort, /allsettings, /tagstats.
+"""Mass Tagging module — /all, /tagabort, /allsettings, /tagstats,
+plus Boa-style /tagall, /etagall, @all, @eall (Yumeko port).
 
 Auto-discovered by bot.loader as package `bot.modules.tagging`.
 setup(app) must live here so the top-level module exposes setup().
 
 Handler groups (see config.py for the full rationale):
-    0   commands + tag:* callbacks
+    0   commands + tag:* callbacks + @all/@eall trigger
     15  message activity observer (write-behind, no DB in hot path)
     16  joins/leaves (service messages) + chat_member updates
     17  catch-all callback activity observer
@@ -41,6 +42,7 @@ from .handler import (
     tagabort_command,
     tagstats_command,
 )
+from .tagall import at_trigger, etagall_command, tagall_command
 
 
 def setup(app: Application) -> list[str]:
@@ -56,7 +58,21 @@ def setup(app: Application) -> list[str]:
     app.add_handler(CommandHandler("tagabort", tagabort_command))
     app.add_handler(CommandHandler("allsettings", allsettings_command))
     app.add_handler(CommandHandler("tagstats", tagstats_command))
+    # Boa-style tagall (Yumeko port): /cancel is boabot's stop command
+    # and shares Pi's session — same handler as /tagabort.
+    app.add_handler(CommandHandler("tagall", tagall_command))
+    app.add_handler(CommandHandler("etagall", etagall_command))
+    app.add_handler(CommandHandler("cancel", tagabort_command))
     app.add_handler(CallbackQueryHandler(tag_callback, pattern=r"^tag:"))
+    # @all / @eall without a slash (boabot's second pattern). Regex is
+    # narrow, so plain messages fall through to the other group-0
+    # handlers exactly as before.
+    app.add_handler(
+        MessageHandler(
+            filters.Regex(r"^@(all|eall)(?:\s|$)") & filters.ChatType.GROUPS,
+            at_trigger,
+        )
+    )
 
     # Message activity — own group so filters(1)/blocklist(2)/watch(3)
     # and analytics(7/13) keep their own matches (one handler per group).
@@ -96,4 +112,8 @@ def setup(app: Application) -> list[str]:
     # presence_manager.kick() on the first update instead.
 
     logger.info("Tagging module registered")
-    return ["/all", "/tagabort", "/allsettings", "/tagstats", "tag:* callbacks"]
+    return [
+        "/all", "/tagabort", "/allsettings", "/tagstats",
+        "/tagall", "/etagall", "/cancel", "@all", "@eall",
+        "tag:* callbacks",
+    ]

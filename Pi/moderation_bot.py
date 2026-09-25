@@ -45,7 +45,6 @@ DEFAULT_SETTINGS = {
     "private_rules": False,
 }
 
-
 def parse_duration(duration_str: str) -> Optional[timedelta]:
     """Parse duration string like '30s', '5m', '1h', '2d', '1w'."""
     if not duration_str:

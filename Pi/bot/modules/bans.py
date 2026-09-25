@@ -121,9 +121,29 @@ async def sudolist_command(update, context):
         await update.message.reply_text(f"{E.INFO} No sudo users configured.",
             parse_mode=ParseMode.HTML)
         return
-    sudo_list = "\n".join([f"  - <code>{uid}</code>" for uid in sorted(sudo_ids)])
+
+    async def _user_label(uid: int) -> str:
+        """Clickable @username/name for uid; plain code id if lookup fails."""
+        try:
+            chat = await context.bot.get_chat(uid)
+            name = getattr(chat, "first_name", None) or getattr(chat, "title", None)
+            uname = getattr(chat, "username", None)
+            if name:
+                label = f"@{escape(uname)}" if uname else escape(name)
+                return f'<a href="tg://user?id={uid}">{label}</a>'
+        except Exception:
+            pass
+        return f"<code>{uid}</code>"
+
+    # List comp (eager, awaited here) — a genexp with `await` silently
+    # becomes an async_generator, which str.join cannot iterate.
+    sudo_list = "\n".join(
+        [f"  - {await _user_label(uid)}" for uid in sorted(sudo_ids)]
+    )
+    owner_label = await _user_label(OWNER_ID)
     await update.message.reply_text(
-        f"{E.ADMIN} <b>Sudo Users:</b>\n{sudo_list}\n\n{E.CROWN} <b>Owner:</b> <code>{OWNER_ID}</code>",
+        f"{E.ADMIN} <b>Sudo Users:</b>\n{sudo_list}\n\n"
+        f"{E.CROWN} <b>Owner:</b> {owner_label}",
         parse_mode=ParseMode.HTML,
     )
 
@@ -146,7 +166,14 @@ async def gban_command(update, context):
         await update.message.reply_text(f"{E.ERROR} I cannot gban myself.",
             parse_mode=ParseMode.HTML)
         return
-    reason = " ".join(context.args[1:]) if len(context.args) > 1 else "No reason provided"
+    # Reply target: every arg is a reason word. Otherwise args[0] was
+    # the target (@username / numeric ID) — drop it so it never shows
+    # up as the reason.
+    if update.message.reply_to_message and update.message.reply_to_message.from_user:
+        reason_args = list(context.args or [])
+    else:
+        reason_args = list(context.args or [])[1:]
+    reason = " ".join(reason_args).strip() or "No reason provided"
     db.add_gban(target.id, reason, update.effective_user.id)
     try:
         await context.bot.ban_chat_member(update.effective_chat.id, target.id)

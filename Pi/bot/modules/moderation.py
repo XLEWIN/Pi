@@ -156,6 +156,66 @@ async def get_target_user(
     return None
 
 
+#: Fallback reason shown on action cards when none was given.
+DEFAULT_REASON = "No reason provided"
+
+
+def action_args(update: Update, context: ContextTypes.DEFAULT_TYPE) -> list[str]:
+    """Command args remaining after the target — the (duration/)reason tokens.
+
+    Mirrors :func:`get_target_user`'s resolution order so the target
+    token is never mistaken for a reason (a numeric user ID must not
+    leak into the "Reason" field of the action card):
+
+    1. Reply target → every arg belongs to (duration/)reason.
+    2. Text-mention entity target → whatever follows the mentioned
+       text (entity offsets are UTF-16 code units).
+    3. @username / numeric-ID target at ``args[0]`` → drop it.
+    """
+    args = list(context.args or [])
+    if not args:
+        return []
+    message = update.message
+    if (
+        message is not None
+        and message.reply_to_message
+        and message.reply_to_message.from_user
+    ):
+        return args
+    if message is not None and message.entities:
+        for entity in message.entities:
+            if (
+                getattr(entity, "type", None) == "text_mention"
+                and getattr(entity, "user", None)
+            ):
+                text = message.text or message.caption or ""
+                try:
+                    encoded = text.encode("utf-16-le")
+                    rest = encoded[
+                        (entity.offset + entity.length) * 2 :
+                    ].decode("utf-16-le", errors="ignore")
+                except Exception:
+                    rest = ""
+                return rest.split()
+    return args[1:]
+
+
+def parse_duration_reason(
+    args: Optional[list[str]],
+) -> tuple[Optional[timedelta], str]:
+    """Split remaining args into ``(duration, reason)`` with safe defaults.
+
+    A missing/empty reason becomes :data:`DEFAULT_REASON`; a first token
+    that is not a duration (``30s/5m/1h/2d/1w``) is part of the reason.
+    """
+    if not args:
+        return None, DEFAULT_REASON
+    duration = parse_duration(args[0])
+    if duration:
+        return duration, " ".join(args[1:]).strip() or DEFAULT_REASON
+    return None, " ".join(args).strip() or DEFAULT_REASON
+
+
 async def is_admin(
     update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int = None
 ) -> bool:
@@ -421,20 +481,7 @@ async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML)
         return
 
-    duration = None
-    reason = "No reason provided"
-
-    if context.args:
-        args_start = 1 if context.args[0].startswith("@") else 0
-        remaining_args = context.args[args_start:]
-
-        if remaining_args:
-            parsed_duration = parse_duration(remaining_args[0])
-            if parsed_duration:
-                duration = parsed_duration
-                reason = " ".join(remaining_args[1:]) or reason
-            else:
-                reason = " ".join(remaining_args) or reason
+    duration, reason = parse_duration_reason(action_args(update, context))
 
     ok, detail = await execute_action(
         update, context, target_user.id, WarningAction.MUTE, duration, reason
@@ -505,18 +552,7 @@ async def dmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"{E.ERROR} I cannot mute myself.")
         return
 
-    duration = None
-    reason = "No reason provided"
-
-    if context.args:
-        args_start = 0
-        if context.args and not context.args[0].startswith("@"):
-            parsed_duration = parse_duration(context.args[0])
-            if parsed_duration:
-                duration = parsed_duration
-                reason = " ".join(context.args[1:]) or reason
-            else:
-                reason = " ".join(context.args) or reason
+    duration, reason = parse_duration_reason(action_args(update, context))
 
     ok, detail = await execute_action(
         update, context, target_user.id, WarningAction.MUTE, duration, reason
@@ -550,18 +586,7 @@ async def smute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target_user.id == context.bot.id:
         return
 
-    duration = None
-    reason = "No reason provided"
-
-    if context.args:
-        args_start = 1 if context.args[0].startswith("@") else 0
-        if len(context.args) > args_start:
-            parsed_duration = parse_duration(context.args[args_start])
-            if parsed_duration:
-                duration = parsed_duration
-                reason = " ".join(context.args[args_start + 1 :]) or reason
-            else:
-                reason = " ".join(context.args[args_start:]) or reason
+    duration, reason = parse_duration_reason(action_args(update, context))
 
     await execute_action(
         update, context, target_user.id, WarningAction.MUTE, duration, reason
@@ -612,21 +637,14 @@ async def tmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"{E.ERROR} I cannot mute myself.")
         return
 
-    duration = None
-    reason = "No reason provided"
+    remaining = action_args(update, context)
+    duration, reason = parse_duration_reason(remaining)
 
-    if context.args:
-        args_start = 1 if context.args[0].startswith("@") else 0
-        if len(context.args) > args_start:
-            parsed_duration = parse_duration(context.args[args_start])
-            if parsed_duration:
-                duration = parsed_duration
-                reason = " ".join(context.args[args_start + 1 :]) or reason
-            else:
-                await update.message.reply_text(
-                    f"{E.ERROR} Invalid duration format. Use: 30s, 5m, 1h, 2d, or 1w"
-                )
-                return
+    if not duration and remaining:
+        await update.message.reply_text(
+            f"{E.ERROR} Invalid duration format. Use: 30s, 5m, 1h, 2d, or 1w"
+        )
+        return
 
     if not duration:
         await update.message.reply_text(
@@ -779,18 +797,7 @@ async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    duration = None
-    reason = "No reason provided"
-
-    if context.args:
-        args_start = 1 if context.args[0].startswith("@") else 0
-        if len(context.args) > args_start:
-            parsed_duration = parse_duration(context.args[args_start])
-            if parsed_duration:
-                duration = parsed_duration
-                reason = " ".join(context.args[args_start + 1 :]) or reason
-            else:
-                reason = " ".join(context.args[args_start:]) or reason
+    duration, reason = parse_duration_reason(action_args(update, context))
 
     ok, detail = await execute_action(
         update, context, target_user.id, WarningAction.BAN, duration, reason
@@ -861,18 +868,7 @@ async def dban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"{E.ERROR} I cannot ban myself.")
         return
 
-    duration = None
-    reason = "No reason provided"
-
-    if context.args:
-        args_start = 0
-        if context.args and not context.args[0].startswith("@"):
-            parsed_duration = parse_duration(context.args[0])
-            if parsed_duration:
-                duration = parsed_duration
-                reason = " ".join(context.args[1:]) or reason
-            else:
-                reason = " ".join(context.args) or reason
+    duration, reason = parse_duration_reason(action_args(update, context))
 
     ok, detail = await execute_action(
         update, context, target_user.id, WarningAction.BAN, duration, reason
@@ -906,18 +902,7 @@ async def sban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target_user.id == context.bot.id:
         return
 
-    duration = None
-    reason = "No reason provided"
-
-    if context.args:
-        args_start = 1 if context.args[0].startswith("@") else 0
-        if len(context.args) > args_start:
-            parsed_duration = parse_duration(context.args[args_start])
-            if parsed_duration:
-                duration = parsed_duration
-                reason = " ".join(context.args[args_start + 1 :]) or reason
-            else:
-                reason = " ".join(context.args[args_start:]) or reason
+    duration, reason = parse_duration_reason(action_args(update, context))
 
     await execute_action(
         update, context, target_user.id, WarningAction.BAN, duration, reason
@@ -968,21 +953,14 @@ async def tban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"{E.ERROR} I cannot ban myself.")
         return
 
-    duration = None
-    reason = "No reason provided"
+    remaining = action_args(update, context)
+    duration, reason = parse_duration_reason(remaining)
 
-    if context.args:
-        args_start = 1 if context.args[0].startswith("@") else 0
-        if len(context.args) > args_start:
-            parsed_duration = parse_duration(context.args[args_start])
-            if parsed_duration:
-                duration = parsed_duration
-                reason = " ".join(context.args[args_start + 1 :]) or reason
-            else:
-                await update.message.reply_text(
-                    f"{E.ERROR} Invalid duration format. Use: 30s, 5m, 1h, 2d, or 1w"
-                )
-                return
+    if not duration and remaining:
+        await update.message.reply_text(
+            f"{E.ERROR} Invalid duration format. Use: 30s, 5m, 1h, 2d, or 1w"
+        )
+        return
 
     if not duration:
         await update.message.reply_text(
@@ -1117,11 +1095,7 @@ async def kick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    reason = "No reason provided"
-    if context.args:
-        args_start = 1 if context.args[0].startswith("@") else 0
-        if len(context.args) > args_start:
-            reason = " ".join(context.args[args_start:]) or reason
+    reason = " ".join(action_args(update, context)) or DEFAULT_REASON
 
     ok, detail = await execute_action(
         update, context, target_user.id, WarningAction.KICK, reason=reason
@@ -1192,9 +1166,7 @@ async def dkick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"{E.ERROR} I cannot kick myself.")
         return
 
-    reason = "No reason provided"
-    if context.args:
-        reason = " ".join(context.args) or reason
+    reason = " ".join(action_args(update, context)) or DEFAULT_REASON
 
     ok, detail = await execute_action(
         update, context, target_user.id, WarningAction.KICK, reason=reason
@@ -1228,11 +1200,7 @@ async def skick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target_user.id == context.bot.id:
         return
 
-    reason = "No reason provided"
-    if context.args:
-        args_start = 1 if context.args[0].startswith("@") else 0
-        if len(context.args) > args_start:
-            reason = " ".join(context.args[args_start:]) or reason
+    reason = " ".join(action_args(update, context)) or DEFAULT_REASON
 
     await execute_action(
         update, context, target_user.id, WarningAction.KICK, reason=reason
@@ -1282,11 +1250,7 @@ async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"{E.ERROR} I cannot warn myself.")
         return
 
-    reason = "No reason provided"
-    if context.args:
-        args_start = 1 if context.args[0].startswith("@") else 0
-        if len(context.args) > args_start:
-            reason = " ".join(context.args[args_start:]) or reason
+    reason = " ".join(action_args(update, context)) or DEFAULT_REASON
 
     chat_id = update.effective_chat.id
     settings = await get_chat_settings(chat_id)
@@ -1371,9 +1335,7 @@ async def dwarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"{E.ERROR} I cannot warn myself.")
         return
 
-    reason = "No reason provided"
-    if context.args:
-        reason = " ".join(context.args) or reason
+    reason = " ".join(action_args(update, context)) or DEFAULT_REASON
 
     chat_id = update.effective_chat.id
     settings = await get_chat_settings(chat_id)
@@ -1441,11 +1403,7 @@ async def swarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target_user.id == context.bot.id:
         return
 
-    reason = "No reason provided"
-    if context.args:
-        args_start = 1 if context.args[0].startswith("@") else 0
-        if len(context.args) > args_start:
-            reason = " ".join(context.args[args_start:]) or reason
+    reason = " ".join(action_args(update, context)) or DEFAULT_REASON
 
     chat_id = update.effective_chat.id
     settings = await get_chat_settings(chat_id)

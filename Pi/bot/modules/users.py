@@ -6,6 +6,7 @@ Tracks all users in groups and DMs, logs activity to SQLite.
 import asyncio
 import logging
 from datetime import datetime
+from html import escape
 from typing import Optional
 
 from telegram import Update, ChatMember, User
@@ -14,6 +15,7 @@ from telegram.ext import (
     MessageHandler,
     ContextTypes,
     ChatMemberHandler,
+    CallbackQueryHandler,
     filters,
 )
 from telegram.constants import ParseMode
@@ -21,7 +23,9 @@ from telegram.constants import ParseMode
 from bot.command_handler import COMMAND, CommandHandler
 from bot.database import db
 from bot.modules.start import send_log, format_user_log
-from bot.emojis import E
+from bot.emojis import E, EID, custom_emoji
+from bot.keyboards.colored import btn_danger, btn_primary, build_keyboard
+from bot.responses import action_card, field_extra
 
 logger = logging.getLogger(__name__)
 
@@ -234,106 +238,228 @@ Use /recentactivity to see recent activity."""
     await update.message.reply_text(stats_text, parse_mode=ParseMode.HTML)
 
 
-async def myinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /myinfo — show user's own info."""
-    user = update.effective_user
-    user_data = db.get_user(user.id)
+async def _build_info_text(bot, target) -> str:
+    """Full user-info card (bot tree style) with real data sources.
 
-    if not user_data:
-        await update.message.reply_text(f"{E.ERROR} You are not registered yet.",
-            parse_mode=ParseMode.HTML)
+    Fields without a Bot API source show n/a:
+    * DC ID — Bot API does not expose the data center.
+    * Custom Bio / Custom Tag — Pi has no such profile fields.
+    * AFK Status — Pi has no AFK system.
+    Health is derived from real moderation data:
+    ``100 − 25 × warnings`` (each warning costs 25%).
+    """
+    uid = target.id
+    first = getattr(target, "first_name", None) or "n/a"
+    last = getattr(target, "last_name", None) or "n/a"
+    name = " ".join(
+        p
+        for p in (getattr(target, "first_name", None), getattr(target, "last_name", None))
+        if p
+    ) or str(uid)
+    mention = f'<a href="tg://user?id={uid}">{escape(name)}</a>'
+    username_raw = getattr(target, "username", None)
+    username = f"@{escape(username_raw)}" if username_raw else "n/a"
+
+    # Bio: available on ChatFullInfo for private chats.
+    bio = "n/a"
+    try:
+        chat = await bot.get_chat(uid)
+        raw_bio = getattr(chat, "bio", None)
+        if raw_bio:
+            bio = escape(raw_bio)
+    except Exception:
+        pass
+
+    photos = "n/a"
+    try:
+        profile = await bot.get_user_profile_photos(uid, limit=1)
+        photos = str(profile.total_count)
+    except Exception:
+        pass
+    photos_display = (
+        photos if photos == "n/a"
+        else f"{photos} photo{'s' if photos != '1' else ''}"
+    )
+
+    user_row = db.get_user(uid) or {}
+    warnings = int(user_row.get("warnings") or 0)
+    health = max(0, 100 - 25 * min(warnings, 4))
+    filled = health // 10
+    bar = "▰" * filled + "▱" * (10 - filled)
+
+    return action_card(
+        "User Information",
+        [
+            field_extra(custom_emoji("💭", EID.INFO), "ID", f"<code>{uid}</code>"),
+            field_extra(E.USER, "First Name", escape(first)),
+            field_extra(E.USER, "Last Name", escape(last)),
+            field_extra(E.ANNOUNCE, "Username", username),
+            field_extra(E.WAVE, "Mention", mention),
+            field_extra(E.WEB, "DC ID", "n/a"),
+            field_extra(E.BOOKMARK, "Bio", bio),
+            field_extra(E.SPARKLE, "Custom Bio", "n/a"),
+            field_extra(E.LOCATION, "Custom Tag", "n/a"),
+            field_extra(E.WATCH, "Profile Photos", photos_display),
+            field_extra(E.HEART, "Health", f"{health}% {bar}"),
+            field_extra(E.TIME, "AFK Status", "No"),
+            field_extra(E.FOLDER, "Common Groups", str(db.count_user_groups(uid))),
+            field_extra(E.CROSS, "Globally Banned", "Yes" if db.is_gbanned(uid) else "No"),
+            field_extra(E.MUTE, "Globally Muted", "Yes" if user_row.get("is_muted") else "No"),
+        ],
+        icon=E.USER,
+    )
+
+
+def info_keyboard():
+    """Colored My Info / Close row under the info card."""
+    return build_keyboard(
+        [
+            [
+                btn_primary("My Info", "info:me", icon_emoji_id=EID.USER),
+                btn_danger("Close", "info:close", icon_emoji_id=EID.CROSS),
+            ]
+        ]
+    )
+
+
+async def _send_info(update: Update, context: ContextTypes.DEFAULT_TYPE, target) -> None:
+    text = await _build_info_text(context.bot, target)
+    await update.message.reply_text(
+        text, parse_mode=ParseMode.HTML, reply_markup=info_keyboard()
+    )
+
+
+async def _resolve_info_target(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, default_self: bool
+):
+    """Reply → @mention → numeric ID → (default_self ? self : None)."""
+    message = update.message
+    if (
+        message is not None
+        and message.reply_to_message
+        and message.reply_to_message.from_user
+    ):
+        return message.reply_to_message.from_user
+
+    if context.args:
+        arg = context.args[0]
+        if arg.startswith("@"):
+            try:
+                member = await context.bot.get_chat_member(
+                    update.effective_chat.id, arg
+                )
+                if member and member.user:
+                    return member.user
+            except Exception:
+                pass
+            return None
+        try:
+            uid = int(arg)
+        except ValueError:
+            return None
+        if uid == update.effective_user.id:
+            return update.effective_user
+        try:
+            chat = await context.bot.get_chat(uid)
+            if getattr(chat, "type", None) != "private":
+                return None
+            return chat
+        except Exception:
+            return None
+
+    return update.effective_user if default_self else None
+
+
+async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /info — full user-info card (self when no target given)."""
+    target = await _resolve_info_target(update, context, default_self=True)
+    if target is None:
+        await update.message.reply_text(
+            f"{E.ERROR} Could not find that user.\n\n"
+            "<b>Usage:</b>\n"
+            "• /info — your own info\n"
+            "• /info @user or /info USER_ID\n"
+            "• Reply to a message with /info",
+            parse_mode=ParseMode.HTML,
+        )
         return
+    await _send_info(update, context, target)
 
-    username = f"@{user_data['username']}" if user_data['username'] else "No username"
-    name = user_data['first_name'] or "Unknown"
 
-    info_text = f"""{E.USER} Your Information
-
-🆔 User ID: <code>{user_data['user_id']}</code>
-📛 Username: {username}
-📛 Name: {name}
-📅 First Seen: {user_data['first_seen']}
-📅 Last Seen: {user_data['last_seen']}
-
-{E.CHECK} Status: {"🔴 Banned" if user_data['is_banned'] else "🟢 Active"}
-{E.MUTE} Muted: {"Yes" if user_data['is_muted'] else "No"}
-{E.WARN} Warnings: {user_data['warnings']}"""
-
-    await update.message.reply_text(info_text, parse_mode=ParseMode.HTML)
+async def myinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /myinfo — the sender's own info card."""
+    await _send_info(update, context, update.effective_user)
 
 
 async def userinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /userinfo @user — show user info (admin only)."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.",
-            parse_mode=ParseMode.HTML)
-        return
-
-    # Check if user is admin
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-
-    try:
-        member = await context.bot.get_chat_member(chat_id, user_id)
-        if member.status not in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]:
-            await update.message.reply_text(f"{E.ERROR} You need admin permissions to use this command.",
-            parse_mode=ParseMode.HTML)
-            return
-    except Exception:
-        await update.message.reply_text(f"{E.ERROR} Error checking permissions.",
-            parse_mode=ParseMode.HTML)
-        return
-
-    # Get target user
-    target_user = None
-    if update.message.reply_to_message:
-        target_user = update.message.reply_to_message.from_user
-    elif context.args and context.args[0].startswith("@"):
-        try:
-            member = await context.bot.get_chat_member(chat_id, context.args[0])
-            target_user = member.user
-        except Exception:
-            pass
-    elif context.args:
-        try:
-            member = await context.bot.get_chat_member(chat_id, int(context.args[0]))
-            target_user = member.user
-        except Exception:
-            pass
-
-    if not target_user:
+    """Handle /userinfo @user — another user's info card (target required)."""
+    target = await _resolve_info_target(update, context, default_self=False)
+    if target is None:
         await update.message.reply_text(
             f"{E.ERROR} Please specify a user.\n\n"
             "<b>Usage:</b>\n"
-            "• /userinfo @user\n"
+            "• /userinfo @user or /userinfo USER_ID\n"
             "• Reply to a message with /userinfo",
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
         )
         return
+    await _send_info(update, context, target)
 
-    user_data = db.get_user(target_user.id)
 
-    if not user_data:
-        await update.message.reply_text(f"{E.ERROR} User not found in database.",
-            parse_mode=ParseMode.HTML)
+async def info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle info:* callbacks — My Info (re-render for clicker) / Close."""
+    query = update.callback_query
+    if query is None or not (query.data or "").startswith("info:"):
+        return
+    action = query.data.split(":", 1)[1]
+
+    if action == "close":
+        await query.answer()
+        try:
+            await query.message.delete()
+        except Exception:
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
         return
 
-    username = f"@{user_data['username']}" if user_data['username'] else "No username"
-    name = user_data['first_name'] or "Unknown"
+    if action == "me":
+        await query.answer()
+        try:
+            text = await _build_info_text(context.bot, query.from_user)
+            await query.edit_message_text(
+                text, parse_mode=ParseMode.HTML, reply_markup=info_keyboard()
+            )
+        except Exception as e:
+            logger.debug(f"info:me render failed: {e}")
+        return
 
-    info_text = f"""{E.USER} User Information
+    await query.answer("Unknown option", show_alert=True)
 
-🆔 User ID: <code>{user_data['user_id']}</code>
-📛 Username: {username}
-📛 Name: {name}
-📅 First Seen: {user_data['first_seen']}
-📅 Last Seen: {user_data['last_seen']}
 
-{E.CHECK} Status: {"🔴 Banned" if user_data['is_banned'] else "🟢 Active"}
-{E.MUTE} Muted: {"Yes" if user_data['is_muted'] else "No"}
-{E.WARN} Warnings: {user_data['warnings']}"""
+async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /id — chat ID and your user ID (plus reply target if any)."""
+    chat = update.effective_chat
+    user = update.effective_user
+    fields = [
+        field_extra(E.FOLDER, "Chat ID", f"<code>{chat.id}</code>"),
+        field_extra(E.USER, "Your ID", f"<code>{user.id}</code>"),
+    ]
 
-    await update.message.reply_text(info_text, parse_mode=ParseMode.HTML)
+    reply = update.message.reply_to_message if update.message else None
+    if reply and reply.from_user:
+        target = reply.from_user
+        target_name = escape(target.full_name or str(target.id))
+        mention = f'<a href="tg://user?id={target.id}">{target_name}</a>'
+        fields.append(
+            field_extra(E.WATCH, "Target", f"<code>{target.id}</code> · {mention}")
+        )
+
+    await update.message.reply_text(
+        action_card("ID", fields, icon=E.INFO),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def recentactivity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -395,9 +521,12 @@ def setup(app: Application) -> list[str]:
 
     # Commands
     app.add_handler(CommandHandler("userstats", userstats_command))
+    app.add_handler(CommandHandler("info", info_command))
+    app.add_handler(CommandHandler("id", id_command))
     app.add_handler(CommandHandler("myinfo", myinfo_command))
     app.add_handler(CommandHandler("userinfo", userinfo_command))
     app.add_handler(CommandHandler("recentactivity", recentactivity_command))
+    app.add_handler(CallbackQueryHandler(info_callback, pattern=r"^info:"))
 
     handlers.extend([
         "new_chat_members tracker",

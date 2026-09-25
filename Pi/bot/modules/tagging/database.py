@@ -15,11 +15,13 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from bot.database import db as _db
+from bot.database import db as _db, ThreadLocalConn
 from bot.logger import logger
 
-# Shared connection from bot.database (WAL, busy_timeout already set).
-_conn = _db.connection
+# Thread-safe view of the shared connection (WAL, busy_timeout already
+# set). Never bind `_conn = _db.connection` — that pins one thread's
+# connection and corrupts under executor use.
+_conn = ThreadLocalConn(_db)
 
 
 def now() -> float:
@@ -240,6 +242,29 @@ def mark_leave(chat_id: int, user_id: int) -> None:
     _conn.execute(
         "UPDATE tag_members SET left_at=? WHERE chat_id=? AND user_id=?",
         (now(), chat_id, user_id),
+    )
+    _conn.commit()
+
+
+def mark_left_except(chat_id: int, keep_ids: set) -> None:
+    """Full-sync reconcile: mark registry rows NOT in `keep_ids` as left.
+
+    Only called after a COMPLETE participant enumeration — guards against
+    an empty/partial list mass-expelling everyone.
+    """
+    if not keep_ids:
+        return
+    rows = _conn.execute(
+        "SELECT user_id FROM tag_members WHERE chat_id=? AND left_at IS NULL",
+        (chat_id,),
+    ).fetchall()
+    stale = [int(r["user_id"]) for r in rows if int(r["user_id"]) not in keep_ids]
+    if not stale:
+        return
+    ts = now()
+    _conn.executemany(
+        "UPDATE tag_members SET left_at=? WHERE chat_id=? AND user_id=?",
+        [(ts, chat_id, uid) for uid in stale],
     )
     _conn.commit()
 

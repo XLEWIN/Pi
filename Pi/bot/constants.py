@@ -233,6 +233,7 @@ HELP_MENU: list[dict] = [
                 "/resetgoodbye — Reset goodbye to default",
                 "/cleanwelcome [on|off] — Delete old welcome messages",
                 "/cleangoodbye [on|off] — Delete old goodbye messages",
+                "/request [on|off] - Join-request approval card",
             ]),
         ],
         "notes": [
@@ -267,10 +268,12 @@ HELP_MENU: list[dict] = [
         "title": "Users & Stats",
         "sections": [
             (None, [
-                "/myinfo — See your info",
-                "/userinfo @user — See user info (admin)",
-                "/userstats — Bot statistics (admin)",
-                "/recentactivity — Recent activity (admin)",
+                "/info [user] - Full user info card",
+                "/myinfo - See your info",
+                "/userinfo @user - See another user's info",
+                "/id - Chat ID + Your ID",
+                "/userstats - Bot statistics (admin)",
+                "/recentactivity - Recent activity (admin)",
             ]),
         ],
         "notes": [],
@@ -297,6 +300,9 @@ HELP_MENU: list[dict] = [
                 "/tagabort — Stop a running tag (admin)",
                 "/allsettings [mode|window|max|batch|send|registry] [value] — Tag settings (admin)",
                 "/tagstats — Tagging stats (admin)",
+                "/tagall [text] — Mention everyone by name; also @all (admin)",
+                "/etagall [text] — Mention everyone with random emojis; also @eall (admin)",
+                "/cancel — Stop a running tag (alias of /tagabort)",
             ]),
         ],
         "notes": [

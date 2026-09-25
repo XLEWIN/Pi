@@ -4,6 +4,7 @@ import os
 import shutil
 import sqlite3
 import logging
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
@@ -40,35 +41,63 @@ if (
 
 
 class Database:
-    """SQLite database manager for the bot."""
+    """SQLite database manager for the bot.
+
+    Thread model: ONE connection per thread (`db.connection` is a
+    property backed by `threading.local()`). PTB's event loop and the
+    `run_in_executor` DB workers all write concurrently; a single shared
+    connection corrupts Python's transaction state machine — symptoms:
+    "cannot commit - no transaction is active" and
+    "error return without exception set". WAL + busy_timeout (below)
+    make the per-thread connections safe against each other.
+    """
 
     def __init__(self, db_path: Path = DB_PATH):
         self.db_path = db_path
-        self.connection: Optional[sqlite3.Connection] = None
+        self._local = threading.local()
         self.connect()
         self.create_tables()
 
+    def _open_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(
+            self.db_path,
+            check_same_thread=False,
+            timeout=5.0,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        """The calling thread's connection — opened lazily, never shared."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = self._open_connection()
+            self._local.conn = conn
+        return conn
+
+    @connection.setter
+    def connection(self, value: Optional[sqlite3.Connection]) -> None:
+        self._local.conn = value
+
     def connect(self):
-        """Connect to the SQLite database."""
+        """Connect to the SQLite database (this thread's connection)."""
         try:
-            self.connection = sqlite3.connect(
-                self.db_path,
-                check_same_thread=False,
-                timeout=5.0,
-            )
-            self.connection.row_factory = sqlite3.Row
-            self.connection.execute("PRAGMA journal_mode=WAL")
-            self.connection.execute("PRAGMA busy_timeout=5000")
-            self.connection.execute("PRAGMA synchronous=NORMAL")
+            self.connection = self._open_connection()
             logger.info(f"Connected to database: {self.db_path}")
         except sqlite3.Error as e:
             logger.error(f"Database connection error: {e}")
             raise
 
     def close(self):
-        """Close the database connection."""
-        if self.connection:
-            self.connection.close()
+        """Close this thread's database connection."""
+        conn = getattr(self._local, "conn", None)
+        if conn:
+            conn.close()
+            self._local.conn = None
             logger.info("Database connection closed")
 
     def create_tables(self):
@@ -223,6 +252,14 @@ class Database:
                 clean_service INTEGER DEFAULT 0,
                 last_welcome_msg_id INTEGER,
                 last_goodbye_msg_id INTEGER
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS join_request_settings (
+                chat_id INTEGER PRIMARY KEY,
+                enabled INTEGER DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
@@ -1016,6 +1053,19 @@ class Database:
             logger.error(f"Error getting group count: {e}")
             return 0
 
+    def count_user_groups(self, user_id: int) -> int:
+        """Number of tracked groups a user is a member of."""
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                "SELECT COUNT(DISTINCT chat_id) FROM group_members WHERE user_id = ?",
+                (user_id,),
+            )
+            return cursor.fetchone()[0]
+        except sqlite3.Error as e:
+            logger.error(f"Error counting user groups: {e}")
+            return 0
+
     def get_recent_activity(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Get recent user activity."""
         try:
@@ -1455,6 +1505,33 @@ class Database:
     def reset_goodbye(self, chat_id: int):
         self.set_goodbye_text(chat_id, "Sad to see you leaving {first}. Take Care! 👋")
 
+    # ── Join requests ────────────────────────────────────
+    def set_join_requests(self, chat_id: int, enabled: bool):
+        """Enable/disable the join-request approval card for a chat."""
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO join_request_settings (chat_id, enabled, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+            """, (chat_id, 1 if enabled else 0))
+            self.connection.commit()
+        except sqlite3.Error as e:
+            logger.error(f"Error setting join requests: {e}")
+
+    def get_join_requests(self, chat_id: int) -> bool:
+        """Whether join-request approval is enabled for a chat."""
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                "SELECT enabled FROM join_request_settings WHERE chat_id = ?",
+                (chat_id,),
+            )
+            row = cursor.fetchone()
+            return bool(row and row[0])
+        except sqlite3.Error as e:
+            logger.error(f"Error getting join requests: {e}")
+            return False
+
     # ── Leveling system ──────────────────────────────────
     def get_user_level(self, user_id: int) -> Dict[str, Any]:
         try:
@@ -1680,3 +1757,21 @@ class Database:
 
 # Global database instance
 db = Database()
+
+
+class ThreadLocalConn:
+    """Import-time stand-in for `db.connection`.
+
+    Modules do `_conn = db.connection` at import, which would pin ONE
+    thread's connection forever and reopen the cross-thread corruption.
+    `_conn = ThreadLocalConn(db)` delegates every attribute access to
+    the calling thread's own connection instead.
+    """
+
+    __slots__ = ("_db_ref",)
+
+    def __init__(self, database: Database):
+        self._db_ref = database
+
+    def __getattr__(self, name: str):
+        return getattr(self._db_ref.connection, name)
