@@ -8,9 +8,10 @@ import logging
 import tempfile
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 from telegram.constants import ParseMode
 
+from bot.command_handler import CommandHandler
 from bot.database import db
 from bot.profile_templates import THEMES, generate_template_preview
 

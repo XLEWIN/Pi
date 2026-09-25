@@ -10,13 +10,13 @@ from typing import Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
-    CommandHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
 from telegram.constants import ParseMode
 
+from bot.command_handler import COMMAND, CommandHandler
 from bot.database import db
 from bot.emojis import E
 
@@ -232,6 +232,6 @@ def setup(app: Application) -> list:
     app.add_handler(CommandHandler("filter", add_filter, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("stop", stop_filter, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("filters", filters_list, filters=filters.ChatType.GROUPS))
-    app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, check_filters), group=1)
+    app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~COMMAND, check_filters), group=1)
 
     return ["filter", "stop", "filters"]

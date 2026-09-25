@@ -22,9 +22,12 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+
+from telegram.error import BadRequest
 
 # ── Environment isolation — must precede bot imports ──────────────
 ROOT = Path(__file__).resolve().parents[1]
@@ -341,6 +344,183 @@ class TestDatabase(unittest.TestCase):
         self.assertEqual(tdb.count_active(CHAT, now - 200000), 2)
 
 
+class TestSeedFromHistory(unittest.TestCase):
+    """Registry backfill from the shared history tables.
+
+    seed_from_history() exists so /all works right after a restart:
+    user_activity (UTC), daily_messages (local date) and group_members
+    (joined_at) are merged per user, identity comes from `users`, and
+    bulk_observe() upserts with MAX semantics (no regressions, no
+    un-leaving members).
+    """
+
+    UID = 730001
+    UID2 = 730002
+    UID_BOT = 730003
+
+    def setUp(self):
+        self._wipe()
+
+    def tearDown(self):
+        self._wipe()
+
+    def _wipe(self):
+        c = tdb._conn
+        c.execute("DELETE FROM user_activity WHERE chat_id=?", (CHAT,))
+        c.execute("DELETE FROM daily_messages WHERE chat_id=?", (CHAT,))
+        c.execute("DELETE FROM group_members WHERE chat_id=?", (CHAT,))
+        c.execute(
+            "DELETE FROM users WHERE user_id IN (?, ?, ?)",
+            (self.UID, self.UID2, self.UID_BOT),
+        )
+        c.execute("DELETE FROM tag_members WHERE chat_id=?", (CHAT,))
+        c.commit()
+
+    def _insert_user(self, uid, first, last=None, username=None, bot=0):
+        tdb._conn.execute(
+            "INSERT INTO users (user_id, username, first_name, last_name, is_bot) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (uid, username, first, last, bot),
+        )
+        tdb._conn.commit()
+
+    @staticmethod
+    def _utc(text: str) -> float:
+        return datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=timezone.utc
+        ).timestamp()
+
+    def test_empty_history_returns_zero(self):
+        self.assertEqual(tdb.seed_from_history(CHAT), 0)
+        self.assertEqual(tdb.count_members(CHAT), 0)
+
+    def test_seeds_activity_with_identity(self):
+        self._insert_user(self.UID, "Alice", "Smith", username="alice")
+        tdb._conn.execute(
+            "INSERT INTO user_activity (user_id, action, chat_id, timestamp) "
+            "VALUES (?, 'sent message', ?, '2026-09-24 18:22:01')",
+            (self.UID, CHAT),
+        )
+        tdb._conn.commit()
+        self.assertEqual(tdb.seed_from_history(CHAT), 1)
+        rows = tdb.fetch_members(CHAT)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["user_id"], self.UID)
+        self.assertEqual(row["username"], "alice")
+        self.assertEqual(row["display_name"], "Alice Smith")
+        self.assertAlmostEqual(
+            row["last_active_at"], self._utc("2026-09-24 18:22:01"),
+            places=3,
+        )
+
+    def test_daily_date_parses_local_midnight(self):
+        self._insert_user(self.UID2, "Bob")
+        tdb._conn.execute(
+            "INSERT INTO daily_messages (chat_id, user_id, date, messages) "
+            "VALUES (?, ?, '2026-09-24', 10)",
+            (CHAT, self.UID2),
+        )
+        tdb._conn.commit()
+        self.assertEqual(tdb.seed_from_history(CHAT), 1)
+        row = tdb.fetch_members(CHAT)[0]
+        expected = datetime(2026, 9, 24).timestamp()  # local midnight
+        self.assertAlmostEqual(row["last_active_at"], expected, places=3)
+
+    def test_merges_sources_newest_wins_and_idempotent(self):
+        # Older daily rollup must lose to the newer activity row.
+        self._insert_user(self.UID, "Alice")
+        tdb._conn.execute(
+            "INSERT INTO daily_messages (chat_id, user_id, date, messages) "
+            "VALUES (?, ?, '2026-01-05', 4)",
+            (CHAT, self.UID),
+        )
+        tdb._conn.execute(
+            "INSERT INTO user_activity (user_id, action, chat_id, timestamp) "
+            "VALUES (?, 'sent message', ?, '2026-09-24 18:22:01')",
+            (self.UID, CHAT),
+        )
+        tdb._conn.commit()
+        self.assertEqual(tdb.seed_from_history(CHAT), 1)
+        first = tdb.fetch_members(CHAT)[0]
+        # Second run must not change anything (MAX semantics).
+        self.assertEqual(tdb.seed_from_history(CHAT), 1)
+        second = tdb.fetch_members(CHAT)[0]
+        self.assertEqual(first["last_active_at"], second["last_active_at"])
+        self.assertEqual(first["first_seen"], second["first_seen"])
+        self.assertAlmostEqual(
+            second["last_active_at"], self._utc("2026-09-24 18:22:01"),
+            places=3,
+        )
+
+    def test_never_regresses_live_rows_and_keeps_leave(self):
+        now = time.time()
+        # Live registry row, much fresher than the 2020 history stub.
+        tdb.upsert_member(CHAT, self.UID, display_name="Live",
+                          seen_at=now, active_at=now)
+        # Left member: history predates the leave → left_at must stay.
+        tdb.upsert_member(CHAT, self.UID2, display_name="Gone",
+                          seen_at=now, active_at=now)
+        tdb.mark_leave(CHAT, self.UID2)
+        for uid in (self.UID, self.UID2):
+            tdb._conn.execute(
+                "INSERT INTO user_activity (user_id, action, chat_id, timestamp) "
+                "VALUES (?, 'sent message', ?, '2020-01-01 00:00:00')",
+                (uid, CHAT),
+            )
+        tdb._conn.commit()
+
+        tdb.seed_from_history(CHAT)
+
+        rows = {r["user_id"]: r for r in tdb.fetch_members(CHAT)}
+        self.assertIn(self.UID, rows)  # fresh row untouched
+        self.assertAlmostEqual(rows[self.UID]["last_active_at"], now, places=1)
+        self.assertNotIn(self.UID2, rows)  # still excluded via left_at
+        left = tdb._conn.execute(
+            "SELECT left_at FROM tag_members WHERE chat_id=? AND user_id=?",
+            (CHAT, self.UID2),
+        ).fetchone()
+        self.assertIsNotNone(left["left_at"])
+
+    def test_bot_flags_from_users_and_group_members(self):
+        self._insert_user(self.UID_BOT, "PiBot", bot=1)
+        self._insert_user(self.UID, "Carol")
+        tdb._conn.execute(
+            "INSERT INTO group_members (chat_id, user_id, role, joined_at) "
+            "VALUES (?, ?, 'member', '2026-09-20 10:00:00'), "
+            "(?, ?, 'bot', '2026-09-20 10:00:00')",
+            (CHAT, self.UID, CHAT, self.UID_BOT),
+        )
+        tdb._conn.commit()
+        self.assertEqual(tdb.seed_from_history(CHAT), 2)
+        flags = {
+            r["user_id"]: bool(r["is_bot"])
+            for r in tdb._conn.execute(
+                "SELECT user_id, is_bot FROM tag_members WHERE chat_id=?",
+                (CHAT,),
+            ).fetchall()
+        }
+        self.assertTrue(flags[self.UID_BOT])
+        self.assertFalse(flags[self.UID])
+
+    def test_parse_ts_formats(self):
+        self.assertAlmostEqual(
+            tdb._parse_ts("2026-09-24 18:22:01"),
+            self._utc("2026-09-24 18:22:01"), places=3,
+        )  # SQLite CURRENT_TIMESTAMP → UTC
+        local = datetime(2026, 9, 24, 18, 22, 1, 500000).timestamp()
+        self.assertAlmostEqual(
+            tdb._parse_ts("2026-09-24T18:22:01.500000"), local, places=3,
+        )  # Python isoformat → local wall-clock
+        self.assertAlmostEqual(
+            tdb._parse_ts("2026-09-24"),
+            datetime(2026, 9, 24).timestamp(), places=3,
+        )  # bare date → local midnight
+        self.assertEqual(tdb._parse_ts(None), 0.0)
+        self.assertEqual(tdb._parse_ts("garbage"), 0.0)
+        self.assertEqual(tdb._parse_ts(""), 0.0)
+
+
 # ═════════════════════════════════════════════════════════════════
 # Settings
 # ═════════════════════════════════════════════════════════════════
@@ -437,7 +617,7 @@ def _fake_source(chat_id=CHAT, message_id=77):
 
 
 def _fake_status():
-    msg = SimpleNamespace(deleted=False, edits=[])
+    msg = SimpleNamespace(deleted=False, edits=[], replies=[])
 
     async def edit_message_text(text, parse_mode=None, reply_markup=None):
         msg.edits.append(text)
@@ -445,8 +625,23 @@ def _fake_status():
     async def delete():
         msg.deleted = True
 
+    async def reply_text(text, parse_mode=None, reply_markup=None):
+        msg.replies.append(text)
+
     msg.edit_message_text = edit_message_text
     msg.delete = delete
+    msg.reply_text = reply_text
+    return msg
+
+
+def _failing_status():
+    """Status message whose edits always fail (stale/deleted card)."""
+    msg = _fake_status()
+
+    async def boom(text, parse_mode=None, reply_markup=None):
+        raise BadRequest("message to edit not found")
+
+    msg.edit_message_text = boom
     return msg
 
 
@@ -797,6 +992,101 @@ class TestObservers(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
         msg2.left_chat_member = joiner
         await member_observer(_fake_update(msg2), _fake_context())
         self.assertEqual(tdb.count_members(CHAT), 0)
+
+
+class _RunBot(_FakeBot):
+    """Adds send/copy recorders so sender.run() can execute unmocked."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.sent = []
+        self.copied = []
+
+    async def send_message(self, **kwargs):
+        self.sent.append(kwargs)
+        return SimpleNamespace(message_id=900 + len(self.sent))
+
+    async def copy_message(self, **kwargs):
+        self.copied.append(kwargs)
+        return SimpleNamespace(message_id=899)
+
+
+def _run_session(status_message, st):
+    """Real tag_sessions row + in-memory session, as all_command builds."""
+    sid = tdb.create_session(
+        CHAT, 42, mode=st.mode, window_hours=st.window_hours
+    )
+    return sess_mod.create(
+        chat_id=CHAT, session_id=sid, invoker_id=42,
+        source_message=_fake_source(), status_message=status_message,
+        settings=st, admin_ids={42},
+    )
+
+
+class TestSenderRun(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
+    """Full sender.run() flows: nobody card, edit fallback, tagging."""
+
+    async def test_run_nobody_card_and_db(self):
+        st = settings_mod.get(CHAT)  # defaults: online_first / 24h
+        status = _fake_status()
+        s = _run_session(status, st)
+        bot = _RunBot()
+
+        await sender.run(s, _fake_context(bot=bot))
+
+        self.assertTrue(s.done.is_set())
+        self.assertIsNone(sess_mod.get(CHAT))  # discarded after finish
+        self.assertTrue(status.edits)
+        card = status.edits[-1]
+        self.assertIn("No One to Tag", card)
+        self.assertIn(config.MSG_NOBODY, card)
+        self.assertIn("members known", card)
+        self.assertIn("learned as they chat", card)
+        row = tdb.last_session(CHAT)
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["error"], "nobody")
+        self.assertEqual(bot.copied, [])  # nobody → no source copy
+        self.assertEqual(bot.sent, [])
+
+    async def test_edit_failure_falls_back_to_reply(self):
+        st = settings_mod.get(CHAT)
+        status = _failing_status()  # every edit raises BadRequest
+        s = _run_session(status, st)
+
+        await sender.run(s, _fake_context(bot=_RunBot()))
+
+        self.assertTrue(status.replies)  # fresh reply landed instead
+        self.assertIn(config.MSG_NOBODY, status.replies[-1])
+        self.assertEqual(tdb.last_session(CHAT)["status"], "failed")
+
+    async def test_run_tags_and_completes(self):
+        now = time.time()
+        tdb.upsert_member(CHAT, 201, display_name="Alpha",
+                          seen_at=now - 60, active_at=now - 60)
+        tdb.upsert_member(CHAT, 202, display_name="Beta",
+                          seen_at=now - 60, active_at=now - 60)
+        st = TagSettings(chat_id=CHAT, mode="all", window_hours=0)
+        status = _fake_status()
+        s = _run_session(status, st)
+        bot = _RunBot()
+
+        await sender.run(s, _fake_context(bot=bot))
+
+        self.assertEqual(s.state, "completed")
+        self.assertEqual(len(bot.copied), 1)  # source copied once
+        self.assertEqual(len(bot.sent), 1)  # both mentions in one batch
+        sent = bot.sent[0]
+        self.assertEqual(sent["chat_id"], CHAT)
+        self.assertEqual(sent["parse_mode"], "HTML")
+        self.assertIn("tg://user?id=201", sent["text"])
+        self.assertIn("tg://user?id=202", sent["text"])
+        self.assertIn("Tagging Complete", status.edits[-1])
+        self.assertEqual(s.tagged, 2)
+        self.assertEqual(s.total, 2)
+        row = tdb.last_session(CHAT)
+        self.assertEqual(row["status"], "completed")
+        self.assertEqual(row["total"], 2)
+        self.assertEqual(row["tagged"], 2)
 
 
 if __name__ == "__main__":

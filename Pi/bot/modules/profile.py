@@ -11,8 +11,9 @@ from typing import Optional
 
 from telegram import Update, User
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, ContextTypes
 
+from bot.command_handler import CommandHandler
 from bot.database import db
 from bot.emojis import E
 from bot.responses import action_card, field_extra, field_user, user_label

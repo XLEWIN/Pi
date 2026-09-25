@@ -4,8 +4,9 @@ Auto-discovered by bot.loader as package `bot.modules.bind`.
 setup(app) must live here so the top-level module exposes setup().
 """
 
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
 
+from bot.command_handler import COMMAND, CommandHandler
 from bot.logger import logger
 
 from . import database as bdb
@@ -49,7 +50,7 @@ def setup(app: Application) -> list[str]:
     # Waiting-for-input text (custom message / change channel) — after gates
     # would have already deleted non-member messages; admins only anyway.
     app.add_handler(
-        MessageHandler(group_filter & filters.TEXT & ~filters.COMMAND, waiting_text_handler),
+        MessageHandler(group_filter & filters.TEXT & ~COMMAND, waiting_text_handler),
         group=HANDLER_GROUP + 1,
     )
 

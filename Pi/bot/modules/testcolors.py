@@ -6,9 +6,10 @@ Sends a message with colored inline buttons and handles callback queries.
 import logging
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, filters
+from telegram.ext import Application, ContextTypes, CallbackQueryHandler, filters
 from telegram.constants import ParseMode
 
+from bot.command_handler import CommandHandler
 from bot.keyboards.colored import btn_primary, btn_success, btn_danger, btn_default, build_keyboard
 
 logger = logging.getLogger(__name__)

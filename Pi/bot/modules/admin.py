@@ -8,9 +8,10 @@ import logging
 from html import escape
 
 from telegram import Update, ChatMember, ChatPermissions
-from telegram.ext import Application, CommandHandler, ContextTypes, filters
+from telegram.ext import Application, ContextTypes, filters
 from telegram.constants import ParseMode
 
+from bot.command_handler import CommandHandler
 from bot.emojis import E
 from bot.responses import (
     action_card,

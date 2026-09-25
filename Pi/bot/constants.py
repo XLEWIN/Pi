@@ -15,168 +15,325 @@ START_TEXT = (
     "{arrow} /help for the full command list."
 )
 
-HELP_TEXT = """{info} Help Menu
+# ── Help menu data ───────────────────────────────────────────────
+# Rendered by bot/modules/help.py into the paginated inline menu.
+# Each entry:
+#   key      unique slug (callback data: help:open:<key>:<page>)
+#   icon     E.* custom-emoji HTML for the header + button label
+#   title    display title (HTML-escaped at render time)
+#   sections list of (header | None, [command lines]) — HTML-safe text,
+#            escaping done here exactly like the old flat HELP_TEXT
+#   notes    extra HTML lines shown after the command list
+# Grid order defines the button order; PAGE_SIZE = 9 (3 rows × 3).
 
-Here are all the available commands:
-
-<b>{wave} General</b>
-/start — Open the main menu
-/help — Show this help menu
-/myinfo — See your info
-/userinfo @user — See user info (admin)
-/userstats — Bot statistics (admin)
-/recentactivity — Recent activity (admin)
-/profile [@user] — Reputation profile card
-
-<b>{alert} Security &amp; Anti-Raid</b>
-/shield [on|off] — View / toggle Group Shield (admin)
-/shieldcfg joins &lt;N&gt; &lt;sec&gt; — Join-burst threshold (admin)
-/shieldcfg msgs &lt;N&gt; &lt;sec&gt; — Message-burst threshold (admin)
-/shieldcfg action &lt;alert|mute|kick|ban&gt; — Raid response (admin)
-/lockdown [on|off] — Freeze non-admin messaging (admin)
-/raidlog [n] — Recent raid events (admin)
-
-<b>{settings} Analytics</b>
-/stats [day|week|month] — Analytics dashboard (admin)
-/analytics — Alias of /stats (admin)
-/topactive [day|week|month] — Most active users (admin)
-/peakhours [days] — Busiest hours (admin)
-
-<b>{web} Instagram Downloader</b>
-/igdl &lt;url&gt; — Download a post/reel (or reply to a link)
-/igsettings [auto on|off] [max N] — Auto-download settings (admin)
-/igstats — Downloader metrics (admin)
-/igcache [clear] — file_id cache (owner)
-/igbenchmark &lt;url&gt; — Time a resolve (owner)
-Auto: Instagram links in groups/DMs download automatically when enabled.
-
-<b>{announce} Mass Tagging</b>
-/all — Tag members (reply to a message) (admin)
-/tagabort — Stop a running tag (admin)
-/allsettings [mode|window|max|batch|send|registry] [value] — Tag settings (admin)
-/tagstats — Tagging stats (admin)
-Tags order by presence &amp; recent activity; admins &amp; bots are never tagged.
-
-<b>{mute} Moderation</b>
-
-<b>Mute Commands</b>
-/mute @user [period] [reason] — Mute a user
-/dmute (reply) [period] [reason] — Mute and delete message
-/smute @user [period] [reason] — Silent mute
-/tmute @user &lt;period&gt; [reason] — Temporary mute
-/unmute @username — Unmute a user
-
-<b>Ban Commands</b>
-/ban @user [period] [reason] — Ban a user
-/dban (reply) [period] [reason] — Ban and delete message
-/sban @user [period] [reason] — Silent ban
-/tban @user &lt;period&gt; [reason] — Temporary ban
-/unban @user — Unban a user
-
-<b>Kick Commands</b>
-/kick @user [reason] — Kick a user
-/dkick (reply) [reason] — Kick and delete message
-/skick @user [reason] — Silent kick
-
-<b>Warning Commands</b>
-/warn @user [reason] — Issue a warning
-/dwarn (reply) [reason] — Warn and delete message
-/swarn @user [reason] — Silent warn
-/warns @user — Show user warnings
-/rmwarn @user — Remove latest warning
-/resetwarn @user — Clear all user warnings
-/resetallwarns — Clear all warnings in chat
-
-<b>Warning Configuration</b>
-/warnlimit [number] — Set warning limit
-/warnmode [action] [duration] — Set warning action
-/warntime [duration|off] — Set warning expiration
-
-<b>Rules Commands</b>
-/rules — Show chat rules
-/setrules &lt;text&gt; — Set rules
-/resetrules — Clear rules
-/privaterules &lt;on|off&gt; — Toggle private rules mode
-
-<b>Duration Formats:</b>
-30s • 5m • 1h • 2d • 1w
-
-<b>{settings} Filters</b>
-/filter &lt;trigger&gt; — Add a filter (reply to message)
-/stop &lt;trigger&gt; — Remove a filter
-/filters — List all filters in chat
-
-<b>{cross} Blocklist</b>
-/blocklist &lt;word1&gt; &lt;word2&gt; — Add blocked words
-/unblocklist &lt;word1&gt; — Remove blocked words
-/blocklistview — View blocked words
-/unblocklistall — Clear all blocked words
-/setblocklistaction &lt;delete|warn|mute|kick|ban&gt; — Set action
-/blocklistreason &lt;reason&gt; — Set reason
-
-<b>{sparkle} Fun</b>
-/hug [user] — Hug someone
-/kiss [user] — Kiss someone
-/slap [user] — Slap someone
-/poke [user] — Poke someone
-/tickle [user] — Tickle someone
-/highfive [user] — High five
-/wave [user] — Wave hello
-/pat [user] — Pat on the head
-/punch [user] — Punch someone
-/kill [user] — Playfully eliminate
-/yeet [user] — YEET!
-
-<b>{crown} Admin</b>
-/promote @user — Promote to admin
-/demote @user — Demote an admin
-/pin — Pin a message
-/unpin — Unpin messages
-/adminlist — List all admins
-/admincount — Count admins
-/fullpromote — Self-promote to full admin (owner only)
-
-<b>{alert} Gban &amp; Sudo</b>
-/gban @user [reason] — Globally ban (sudo)
-/ungban @user — Globally unban (sudo)
-/gbanlist — List gbanned users (sudo)
-/massban ID ID — Mass ban (owner)
-/addsudo @user — Add sudo user (owner)
-/rmsudo @user — Remove sudo user (owner)
-/sudolist — List sudo users (owner)
-
-<b>{eyes} Watch Words</b>
-/watch &lt;word&gt; — Add a watched word (admin)
-/unwatch &lt;word&gt; — Remove a watched word (admin)
-/watchlist — List your watched words (admin)
-/watchmode &lt;copy|forward&gt; — Set delivery mode (admin)
-
-<b>{wave} Welcome/Goodbye</b>
-/welcome [on|off] — Toggle/view welcome messages
-/goodbye [on|off] — Toggle/view goodbye messages
-/setwelcome &lt;text&gt; — Set custom welcome message
-/setgoodbye &lt;text&gt; — Set custom goodbye message
-/resetwelcome — Reset welcome to default
-/resetgoodbye — Reset goodbye to default
-/cleanwelcome [on|off] — Delete old welcome messages
-/cleangoodbye [on|off] — Delete old goodbye messages
-
-<b>Variables:</b> {{first}} {{last}} {{fullname}} {{username}} {{mention}} {{chatname}} {{id}}
-
-<b>{fire} Leveling &amp; Leaderboard</b>
-/rank [@user] — View rank card
-/template — Pick rank card template with preview (DM only)
-/ranktemplate — Pick rank card template (DM only)
-/nextlevel — XP needed for next level
-/streak — Your message streaks
-/leaderboard /lb — Chat leaderboard
-/daily — Top chatters today
-/weekly — Top chatters this week
-/monthly — Top chatters this month
-
-<b>Leveling Rules:</b>
-+1 chat level per 50 messages • +1 global level per 100 messages
-"""
+HELP_MENU: list[dict] = [
+    {
+        "key": "general",
+        "icon": E.INFO,
+        "title": "General",
+        "sections": [
+            (None, [
+                "/start — Open the main menu",
+                "/help — Show this help menu",
+                "/testcolors — Preview colored buttons (groups)",
+            ]),
+        ],
+        "notes": [],
+    },
+    {
+        "key": "moderation",
+        "icon": E.MUTE,
+        "title": "Moderation",
+        "sections": [
+            ("Mute Commands", [
+                "/mute @user [period] [reason] — Mute a user",
+                "/dmute (reply) [period] [reason] — Mute and delete message",
+                "/smute @user [period] [reason] — Silent mute",
+                "/tmute @user &lt;period&gt; [reason] — Temporary mute",
+                "/unmute @username — Unmute a user",
+            ]),
+            ("Ban Commands", [
+                "/ban @user [period] [reason] — Ban a user",
+                "/dban (reply) [period] [reason] — Ban and delete message",
+                "/sban @user [period] [reason] — Silent ban",
+                "/tban @user &lt;period&gt; [reason] — Temporary ban",
+                "/unban @user — Unban a user",
+            ]),
+            ("Kick Commands", [
+                "/kick @user [reason] — Kick a user",
+                "/dkick (reply) [reason] — Kick and delete message",
+                "/skick @user [reason] — Silent kick",
+            ]),
+            ("Warning Commands", [
+                "/warn @user [reason] — Issue a warning",
+                "/dwarn (reply) [reason] — Warn and delete message",
+                "/swarn @user [reason] — Silent warn",
+                "/warns @user — Show user warnings",
+                "/rmwarn @user — Remove latest warning",
+                "/resetwarn @user — Clear all user warnings",
+                "/resetallwarns — Clear all warnings in chat",
+            ]),
+            ("Warning Configuration", [
+                "/warnlimit [number] — Set warning limit",
+                "/warnmode [action] [duration] — Set warning action",
+                "/warntime [duration|off] — Set warning expiration",
+            ]),
+            ("Rules Commands", [
+                "/rules — Show chat rules",
+                "/setrules &lt;text&gt; — Set rules",
+                "/resetrules — Clear rules",
+                "/privaterules &lt;on|off&gt; — Toggle private rules mode",
+            ]),
+        ],
+        "notes": ["<b>Duration Formats:</b> 30s • 5m • 1h • 2d • 1w"],
+    },
+    {
+        "key": "admin",
+        "icon": E.CROWN,
+        "title": "Admin",
+        "sections": [
+            (None, [
+                "/promote @user — Promote to admin",
+                "/demote @user — Demote an admin",
+                "/pin — Pin a message",
+                "/unpin — Unpin messages",
+                "/adminlist — List all admins",
+                "/admincount — Count admins",
+                "/setchatphoto — Set chat photo (reply to a photo)",
+                "/setchatname — Set the chat title",
+                "/setchatdescription — Set the chat description",
+                "/fullpromote — Self-promote to full admin (owner only)",
+            ]),
+        ],
+        "notes": [],
+    },
+    {
+        "key": "gban",
+        "icon": E.KICK,
+        "title": "Gban & Sudo",
+        "sections": [
+            (None, [
+                "/gban @user [reason] — Globally ban (sudo)",
+                "/ungban @user — Globally unban (sudo)",
+                "/gbanlist — List gbanned users (sudo)",
+                "/massban ID ID — Mass ban (owner)",
+                "/addsudo @user — Add sudo user (owner)",
+                "/rmsudo @user — Remove sudo user (owner)",
+                "/sudolist — List sudo users (owner)",
+            ]),
+        ],
+        "notes": [],
+    },
+    {
+        "key": "security",
+        "icon": E.ALERT,
+        "title": "Security",
+        "sections": [
+            (None, [
+                "/shield [on|off] — View / toggle Group Shield (admin)",
+                "/shieldcfg joins &lt;N&gt; &lt;sec&gt; — Join-burst threshold (admin)",
+                "/shieldcfg msgs &lt;N&gt; &lt;sec&gt; — Message-burst threshold (admin)",
+                "/shieldcfg action &lt;alert|mute|kick|ban&gt; — Raid response (admin)",
+                "/lockdown [on|off] — Freeze non-admin messaging (admin)",
+                "/raidlog [n] — Recent raid events (admin)",
+            ]),
+        ],
+        "notes": [],
+    },
+    {
+        "key": "analytics",
+        "icon": E.SETTINGS,
+        "title": "Analytics",
+        "sections": [
+            (None, [
+                "/stats [day|week|month] — Analytics dashboard (admin)",
+                "/analytics — Alias of /stats (admin)",
+                "/topactive [day|week|month] — Most active users (admin)",
+                "/peakhours [days] — Busiest hours (admin)",
+            ]),
+        ],
+        "notes": [],
+    },
+    {
+        "key": "leveling",
+        "icon": E.FIRE,
+        "title": "Leveling",
+        "sections": [
+            (None, [
+                "/rank [@user] — View rank card",
+                "/template — Pick rank card template with preview (DM only)",
+                "/ranktemplate — Pick rank card template (DM only)",
+                "/nextlevel — XP needed for next level",
+                "/streak — Your message streaks",
+                "/leaderboard /lb — Chat leaderboard",
+                "/daily — Top chatters today",
+                "/weekly — Top chatters this week",
+                "/monthly — Top chatters this month",
+            ]),
+        ],
+        "notes": [
+            "<b>Leveling Rules:</b> +1 chat level per 50 messages • "
+            "+1 global level per 100 messages"
+        ],
+    },
+    {
+        "key": "filters",
+        "icon": E.BOOKMARK,
+        "title": "Filters",
+        "sections": [
+            (None, [
+                "/filter &lt;trigger&gt; — Add a filter (reply to message)",
+                "/stop &lt;trigger&gt; — Remove a filter",
+                "/filters — List all filters in chat",
+            ]),
+        ],
+        "notes": [],
+    },
+    {
+        "key": "blocklist",
+        "icon": E.CROSS,
+        "title": "Blocklist",
+        "sections": [
+            (None, [
+                "/blocklist &lt;word1&gt; &lt;word2&gt; — Add blocked words",
+                "/unblocklist &lt;word1&gt; — Remove blocked words",
+                "/blocklistview — View blocked words",
+                "/unblocklistall — Clear all blocked words",
+                "/setblocklistaction &lt;delete|warn|mute|kick|ban&gt; — Set action",
+                "/blocklistreason &lt;reason&gt; — Set reason",
+            ]),
+        ],
+        "notes": [],
+    },
+    {
+        "key": "watchwords",
+        "icon": E.EYES,
+        "title": "Watch Words",
+        "sections": [
+            (None, [
+                "/watch &lt;word&gt; — Add a watched word (admin)",
+                "/unwatch &lt;word&gt; — Remove a watched word (admin)",
+                "/watchlist — List your watched words (admin)",
+                "/watchmode &lt;copy|forward&gt; — Set delivery mode (admin)",
+            ]),
+        ],
+        "notes": [],
+    },
+    {
+        "key": "welcome",
+        "icon": E.WAVE,
+        "title": "Welcome/Goodbye",
+        "sections": [
+            (None, [
+                "/welcome [on|off] — Toggle/view welcome messages",
+                "/goodbye [on|off] — Toggle/view goodbye messages",
+                "/setwelcome &lt;text&gt; — Set custom welcome message",
+                "/setgoodbye &lt;text&gt; — Set custom goodbye message",
+                "/resetwelcome — Reset welcome to default",
+                "/resetgoodbye — Reset goodbye to default",
+                "/cleanwelcome [on|off] — Delete old welcome messages",
+                "/cleangoodbye [on|off] — Delete old goodbye messages",
+            ]),
+        ],
+        "notes": [
+            "<b>Variables:</b> {{first}} {{last}} {{fullname}} {{username}} "
+            "{{mention}} {{chatname}} {{id}}"
+        ],
+    },
+    {
+        "key": "fun",
+        "icon": E.GUITAR,
+        "title": "Fun",
+        "sections": [
+            (None, [
+                "/hug [user] — Hug someone",
+                "/kiss [user] — Kiss someone",
+                "/slap [user] — Slap someone",
+                "/poke [user] — Poke someone",
+                "/tickle [user] — Tickle someone",
+                "/highfive [user] — High five",
+                "/wave [user] — Wave hello",
+                "/pat [user] — Pat on the head",
+                "/punch [user] — Punch someone",
+                "/kill [user] — Playfully eliminate",
+                "/yeet [user] — YEET!",
+            ]),
+        ],
+        "notes": [],
+    },
+    {
+        "key": "users",
+        "icon": E.USER,
+        "title": "Users & Stats",
+        "sections": [
+            (None, [
+                "/myinfo — See your info",
+                "/userinfo @user — See user info (admin)",
+                "/userstats — Bot statistics (admin)",
+                "/recentactivity — Recent activity (admin)",
+            ]),
+        ],
+        "notes": [],
+    },
+    {
+        "key": "profile",
+        "icon": E.HEART,
+        "title": "Profile",
+        "sections": [
+            (None, [
+                "/profile [@user] — Reputation profile card",
+                "/rep — Alias of /profile",
+            ]),
+        ],
+        "notes": [],
+    },
+    {
+        "key": "tagging",
+        "icon": E.ANNOUNCE,
+        "title": "Mass Tagging",
+        "sections": [
+            (None, [
+                "/all — Tag members (reply to a message) (admin)",
+                "/tagabort — Stop a running tag (admin)",
+                "/allsettings [mode|window|max|batch|send|registry] [value] — Tag settings (admin)",
+                "/tagstats — Tagging stats (admin)",
+            ]),
+        ],
+        "notes": [
+            "Tags order by presence &amp; recent activity; admins &amp; bots "
+            "are never tagged."
+        ],
+    },
+    {
+        "key": "instagram",
+        "icon": E.WEB,
+        "title": "Instagram",
+        "sections": [
+            (None, [
+                "/igdl &lt;url&gt; — Download a post/reel (or reply to a link)",
+                "/igsettings [auto on|off] [max N] — Auto-download settings (admin)",
+                "/igstats — Downloader metrics (admin)",
+                "/igcache [clear] — file_id cache (owner)",
+                "/igbenchmark &lt;url&gt; — Time a resolve (owner)",
+            ]),
+        ],
+        "notes": [
+            "Auto: Instagram links in groups/DMs download automatically when enabled."
+        ],
+    },
+    {
+        "key": "bind",
+        "icon": E.PIN,
+        "title": "Bind",
+        "sections": [
+            (None, [
+                "/bind [channel] — Bind this group to a channel (admin)",
+                "/bindmenu — Open the bind settings menu (admin)",
+            ]),
+        ],
+        "notes": [],
+    },
+]
 
 # ── URLs ────────────────────────────────────────────────
 URL_ADD_TO_GROUP = "http://t.me/PiModulerBot?startgroup=botstart"
