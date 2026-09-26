@@ -8,7 +8,6 @@ Everything else (borders, icons, glow, skyline) stays untouched.
 import os
 import logging
 from io import BytesIO
-from typing import Optional
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -36,18 +35,59 @@ PURPLE = (190, 45, 255, 255)
 RED = (255, 30, 35, 255)
 
 # ============================================================
-# FONTS — Windows Arial fallback (DejaVu not available)
+# FONTS — bundled Noto first (works on Railway/Linux), then
+# Windows Arial; _font() never raises so imports can't crash.
 # ============================================================
 
-FONT_BOLD = r"C:\Windows\Fonts\arialbd.ttf"
-FONT_REG = r"C:\Windows\Fonts\arial.ttf"
+_ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 
-FONT_NAME = ImageFont.truetype(FONT_BOLD, 58)
-FONT_USERNAME = ImageFont.truetype(FONT_BOLD, 35)
-FONT_LEVEL_LABEL = ImageFont.truetype(FONT_BOLD, 31)
-FONT_LEVEL_VALUE = ImageFont.truetype(FONT_BOLD, 31)
-FONT_STAT_LABEL = ImageFont.truetype(FONT_BOLD, 30)
-FONT_STAT_VALUE = ImageFont.truetype(FONT_BOLD, 30)
+
+def _find_font() -> str:
+    """First usable TrueType — bundled asset beats OS-specific paths.
+
+    rank_image.py resolves fonts the same way; a hardcoded Windows
+    fonts path crashed the bot at import on Linux (Railway).
+    """
+    bundled = os.path.join(_ASSETS_DIR, "NotoSans-Bold.ttf")
+    if os.path.isfile(bundled):
+        return bundled
+    if os.name == "nt":
+        for cand in (
+            r"C:\Windows\Fonts\arialbd.ttf",
+            r"C:\Windows\Fonts\arial.ttf",
+        ):
+            if os.path.isfile(cand):
+                return cand
+    for cand in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ):
+        if os.path.isfile(cand):
+            return cand
+    return bundled  # missing → _font() falls back to load_default()
+
+
+FONT_BOLD = _find_font()
+FONT_REG = FONT_BOLD  # only one face ships in bot/assets
+
+
+def _font(size: int):
+    """TrueType at ``size``; bitmap default as the never-crash floor."""
+    try:
+        return ImageFont.truetype(FONT_BOLD, size)
+    except Exception:
+        try:
+            return ImageFont.load_default(size=size)
+        except TypeError:  # Pillow < 10.1 has no size argument
+            return ImageFont.load_default()
+
+
+FONT_NAME = _font(58)
+FONT_USERNAME = _font(35)
+FONT_LEVEL_LABEL = _font(31)
+FONT_LEVEL_VALUE = _font(31)
+FONT_STAT_LABEL = _font(30)
+FONT_STAT_VALUE = _font(30)
 
 # ============================================================
 # FIXED POSITIONS (1672 x 941 master)

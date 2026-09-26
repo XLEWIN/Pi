@@ -395,7 +395,14 @@ async def convert_video(filename: str) -> Optional[str]:
 
 
 def _pick_font() -> str:
-    """First usable TrueType font — Windows ships these, Linux has DejaVu."""
+    """First usable TrueType — bundled Noto (Railway/Linux), then system."""
+    bundled = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "assets",
+        "NotoSans-Bold.ttf",
+    )
+    if os.path.isfile(bundled):
+        return bundled
     names = (
         "arialbd.ttf", "arial.ttf", "segoeuib.ttf", "segoeui.ttf",
         "tahoma.ttf", "verdana.ttf", "consolab.ttf", "consola.ttf",
