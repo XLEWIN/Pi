@@ -711,6 +711,37 @@ class TestPresence(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(mgr.mtproto.available)
         self.assertEqual(mgr.source_label, "Activity (MTProto off)")
 
+    async def test_refresh_once_resolves_known_chat_ids(self):
+        """Regression: the refresh pass must find the MODULE helper.
+
+        `presence/__init__` re-exports the singleton instance as
+        `manager`, shadowing the submodule — a `from . import manager`
+        in the loop used to raise
+        "'PresenceManager' object has no attribute 'known_chat_ids'"
+        on every tick. Calling _refresh_once() directly fails loudly
+        if that import path ever regresses.
+        """
+        from bot.modules.tagging.presence.mtproto import MtprotoPresence
+
+        tdb.upsert_member(CHAT, 424242, display_name="Ref")
+        try:
+            prov = MtprotoPresence()
+            synced = []
+
+            async def _fake_sync(chat_id):
+                synced.append(chat_id)
+                return 0
+
+            prov.sync_chat = _fake_sync
+            await prov._refresh_once()          # no AttributeError
+            self.assertIn(CHAT, synced)          # registry chat was visited
+        finally:
+            tdb._conn.execute(
+                "DELETE FROM tag_members WHERE chat_id=? AND user_id=?",
+                (CHAT, 424242),
+            )
+            tdb._conn.commit()
+
 
 class _StubPresence:
     """No-op presence: leaves ranks at defaults, records calls."""

@@ -25,7 +25,7 @@ from bot.database import db
 from bot.modules.start import send_log, format_user_log
 from bot.emojis import E, EID, custom_emoji
 from bot.keyboards.colored import btn_danger, btn_primary, build_keyboard
-from bot.responses import action_card, field_extra
+from bot.responses import action_card, field_extra, rank_value
 
 logger = logging.getLogger(__name__)
 
@@ -238,7 +238,7 @@ Use /recentactivity to see recent activity."""
     await update.message.reply_text(stats_text, parse_mode=ParseMode.HTML)
 
 
-async def _build_info_text(bot, target) -> str:
+async def _build_info_text(bot, target, chat_id: Optional[int] = None) -> str:
     """Full user-info card (bot tree style) with real data sources.
 
     Fields without a Bot API source show n/a:
@@ -247,6 +247,8 @@ async def _build_info_text(bot, target) -> str:
     * AFK Status — Pi has no AFK system.
     Health is derived from real moderation data:
     ``100 − 25 × warnings`` (each warning costs 25%).
+    Messages/ranks derive from daily_messages (same numbers as /rank);
+    pass ``chat_id`` (groups only) to include the Chat Rank field.
     """
     uid = target.id
     first = getattr(target, "first_name", None) or "n/a"
@@ -287,25 +289,44 @@ async def _build_info_text(bot, target) -> str:
     filled = health // 10
     bar = "▰" * filled + "▱" * (10 - filled)
 
+    # Unified rank info — same source as /rank, /rankings and /profile.
+    rank_info = db.get_user_rank_info(uid, chat_id)
+
+    fields = [
+        field_extra(custom_emoji("💭", EID.INFO), "ID", f"<code>{uid}</code>"),
+        field_extra(E.USER, "First Name", escape(first)),
+        field_extra(E.USER, "Last Name", escape(last)),
+        field_extra(E.ANNOUNCE, "Username", username),
+        field_extra(E.WAVE, "Mention", mention),
+        field_extra(E.WEB, "DC ID", "n/a"),
+        field_extra(E.BOOKMARK, "Bio", bio),
+        field_extra(E.SPARKLE, "Custom Bio", "n/a"),
+        field_extra(E.LOCATION, "Custom Tag", "n/a"),
+        field_extra(E.WATCH, "Profile Photos", photos_display),
+        field_extra(E.HEART, "Health", f"{health}% {bar}"),
+        field_extra(E.INFO, "Messages", f"{rank_info['global_messages']:,}"),
+    ]
+    if chat_id is not None:
+        fields.append(field_extra(
+            E.CROWN, "Chat Rank",
+            rank_value(rank_info["chat_rank"], rank_info["chat_position"],
+                       rank_info["chat_members"], rank_info["chat_messages"]),
+        ))
+    fields.extend([
+        field_extra(
+            E.WEB, "Global Rank",
+            rank_value(rank_info["global_rank"], rank_info["global_position"],
+                       rank_info["global_members"], rank_info["global_messages"]),
+        ),
+        field_extra(E.TIME, "AFK Status", "No"),
+        field_extra(E.FOLDER, "Common Groups", str(db.count_user_groups(uid))),
+        field_extra(E.CROSS, "Globally Banned", "Yes" if db.is_gbanned(uid) else "No"),
+        field_extra(E.MUTE, "Globally Muted", "Yes" if user_row.get("is_muted") else "No"),
+    ])
+
     return action_card(
         "User Information",
-        [
-            field_extra(custom_emoji("💭", EID.INFO), "ID", f"<code>{uid}</code>"),
-            field_extra(E.USER, "First Name", escape(first)),
-            field_extra(E.USER, "Last Name", escape(last)),
-            field_extra(E.ANNOUNCE, "Username", username),
-            field_extra(E.WAVE, "Mention", mention),
-            field_extra(E.WEB, "DC ID", "n/a"),
-            field_extra(E.BOOKMARK, "Bio", bio),
-            field_extra(E.SPARKLE, "Custom Bio", "n/a"),
-            field_extra(E.LOCATION, "Custom Tag", "n/a"),
-            field_extra(E.WATCH, "Profile Photos", photos_display),
-            field_extra(E.HEART, "Health", f"{health}% {bar}"),
-            field_extra(E.TIME, "AFK Status", "No"),
-            field_extra(E.FOLDER, "Common Groups", str(db.count_user_groups(uid))),
-            field_extra(E.CROSS, "Globally Banned", "Yes" if db.is_gbanned(uid) else "No"),
-            field_extra(E.MUTE, "Globally Muted", "Yes" if user_row.get("is_muted") else "No"),
-        ],
+        fields,
         icon=E.USER,
     )
 
@@ -322,8 +343,16 @@ def info_keyboard():
     )
 
 
+def _chat_scope_id(update) -> Optional[int]:
+    """Group chat id for rank lookups, or None in private chats."""
+    chat = getattr(update, "effective_chat", None)
+    if chat is None or getattr(chat, "type", None) in (None, "private"):
+        return None
+    return getattr(chat, "id", None)
+
+
 async def _send_info(update: Update, context: ContextTypes.DEFAULT_TYPE, target) -> None:
-    text = await _build_info_text(context.bot, target)
+    text = await _build_info_text(context.bot, target, chat_id=_chat_scope_id(update))
     await update.message.reply_text(
         text, parse_mode=ParseMode.HTML, reply_markup=info_keyboard()
     )
@@ -427,7 +456,12 @@ async def info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "me":
         await query.answer()
         try:
-            text = await _build_info_text(context.bot, query.from_user)
+            # Chat scope from the message the button sits on (groups only).
+            cb_chat = getattr(query.message, "chat", None)
+            cb_chat_id = None
+            if cb_chat is not None and getattr(cb_chat, "type", None) not in (None, "private"):
+                cb_chat_id = getattr(cb_chat, "id", None)
+            text = await _build_info_text(context.bot, query.from_user, chat_id=cb_chat_id)
             await query.edit_message_text(
                 text, parse_mode=ParseMode.HTML, reply_markup=info_keyboard()
             )
@@ -516,8 +550,12 @@ def setup(app: Application) -> list[str]:
     # Track chat member updates (for privacy mode)
     app.add_handler(ChatMemberHandler(handle_new_member, ChatMemberHandler.CHAT_MEMBER))
 
-    # Track all messages to register active users
-    app.add_handler(MessageHandler(filters.ALL & ~COMMAND, track_message))
+    # Track all messages to register active users. Own group (19): PTB
+    # runs max ONE handler per group — in group 0 it was shadowed by
+    # antispam/chatstats for every plain group message.
+    app.add_handler(
+        MessageHandler(filters.ALL & ~COMMAND, track_message), group=19
+    )
 
     # Commands
     app.add_handler(CommandHandler("userstats", userstats_command))

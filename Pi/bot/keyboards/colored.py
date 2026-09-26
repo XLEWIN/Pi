@@ -45,9 +45,16 @@ def btn_default(text: str, data: str, icon_emoji_id: Optional[str] = None) -> In
     return InlineKeyboardButton(text, callback_data=data, api_kwargs=kwargs if kwargs else None)
 
 
-def btn_url(text: str, url: str, icon_emoji_id: Optional[str] = None) -> InlineKeyboardButton:
-    """URL button."""
+def btn_url(
+    text: str,
+    url: str,
+    icon_emoji_id: Optional[str] = None,
+    style: Optional[str] = None,
+) -> InlineKeyboardButton:
+    """URL button — optionally styled ("primary"/"success"/"danger")."""
     kwargs = {}
+    if style:
+        kwargs["style"] = style
     if icon_emoji_id:
         kwargs["icon_custom_emoji_id"] = icon_emoji_id
     return InlineKeyboardButton(text, url=url, api_kwargs=kwargs if kwargs else None)

@@ -1,7 +1,9 @@
 """Profile — user reputation card.
 
 /profile [@user | reply]
-Shows reputation, messages, active-since, rank, positives/warnings/restrictions.
+Shows reputation, messages, chat/global rank, active-since,
+positives/warnings/restrictions. Ranks derive from daily_messages —
+the same counts /rankings and /rank display.
 """
 
 import logging
@@ -16,7 +18,7 @@ from telegram.ext import Application, ContextTypes
 from bot.command_handler import CommandHandler
 from bot.database import db
 from bot.emojis import E
-from bot.responses import action_card, field_extra, field_user, user_label
+from bot.responses import action_card, field_extra, field_user, rank_value, user_label
 
 logger = logging.getLogger(__name__)
 
@@ -74,11 +76,17 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     uid = target.id
-    # Ensure row exists for rank math.
+    # Ensure row exists for reputation math.
     db._ensure_reputation(uid)
     rep = db.get_reputation(uid)
-    rank = db.get_reputation_rank(uid)
     active_days = db.get_active_days(uid)
+
+    # Chat context only in groups — ranks are derived from daily_messages.
+    chat = update.effective_chat
+    chat_id = None
+    if chat is not None and getattr(chat, "type", None) not in (None, "private"):
+        chat_id = chat.id
+    info = db.get_user_rank_info(uid, chat_id)
 
     # Prefer display name; fall back to DB if Telegram user is sparse.
     display_user = target
@@ -105,11 +113,23 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         field_extra(E.STAR, "Reputation", _fmt(score)),
         field_extra(E.INFO, "Messages", _fmt(messages)),
         field_extra(E.TIME, "Active Since", f"{active_days} days"),
-        field_extra(E.MEDAL_1, "Rank", f"#{rank}"),
+    ]
+    if chat_id is not None:
+        fields.append(field_extra(
+            E.CROWN, "Chat Rank",
+            rank_value(info["chat_rank"], info["chat_position"],
+                       info["chat_members"], info["chat_messages"]),
+        ))
+    fields.append(field_extra(
+        E.WEB, "Global Rank",
+        rank_value(info["global_rank"], info["global_position"],
+                   info["global_members"], info["global_messages"]),
+    ))
+    fields.extend([
         field_extra(E.CHECK, "Positive Actions", str(pos)),
         field_extra(E.WARN, "Warnings", str(warns)),
         field_extra(E.BAN, "Restrictions", str(restr)),
-    ]
+    ])
     text = action_card("User Profile", fields, icon=E.USER)
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 

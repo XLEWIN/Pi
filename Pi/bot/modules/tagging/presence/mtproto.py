@@ -118,14 +118,25 @@ class MtprotoPresence(PresenceProvider):
 
     # ── refresh loop ──────────────────────────────────────────────
 
+    async def _refresh_once(self) -> None:
+        """One background sync pass — split out so tests can call it.
+
+        Import the function from the submodule DIRECTLY: the presence
+        package re-exports the singleton instance under the attribute
+        name `manager`, which shadows the module for `from . import
+        manager` (that produced 'PresenceManager' object has no
+        attribute 'known_chat_ids' every refresh tick).
+        """
+        from .manager import known_chat_ids
+
+        for chat_id in known_chat_ids():
+            await self.sync_chat(chat_id)
+
     async def _refresh_loop(self) -> None:
         while True:
             await asyncio.sleep(config.MTPROTO_SYNC_INTERVAL)
             try:
-                from . import manager as _mgr  # late import: avoid cycle
-                chats = _mgr.known_chat_ids()
-                for chat_id in chats:
-                    await self.sync_chat(chat_id)
+                await self._refresh_once()
             except asyncio.CancelledError:
                 raise
             except Exception as e:

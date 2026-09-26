@@ -26,6 +26,7 @@ from bot.command_handler import COMMAND, CommandHandler
 from bot.database import db
 from bot.emojis import E
 from bot.responses import action_card, field_extra
+from bot.timeutils import ist_date, ist_monday, ist_month_start
 
 logger = logging.getLogger(__name__)
 
@@ -218,9 +219,17 @@ async def topactive_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     period = "week"
     if context.args and context.args[0].lower() in _PERIOD_DAYS:
         period = context.args[0].lower()
-    days = _PERIOD_DAYS.get(period, 7)
 
-    top = db.get_period_top(chat_id, days=days, limit=10)
+    # Same IST windows as /rankings: day = today, week = Monday,
+    # month = calendar month (all refresh on IST boundaries).
+    since = {
+        "day": ist_date(),
+        "today": ist_date(),
+        "week": ist_monday(),
+        "month": ist_month_start(),
+    }.get(period, ist_monday())
+
+    top = db.get_period_top(chat_id, since=since, limit=10)
     if not top:
         await update.message.reply_text(
             f"{E.INFO} No activity recorded yet.", parse_mode=ParseMode.HTML
