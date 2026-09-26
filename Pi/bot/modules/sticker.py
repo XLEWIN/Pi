@@ -757,7 +757,7 @@ async def kang_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # 6. success ──────────────────────────────────────────────
         markup = build_keyboard([[
             btn_url("View Sticker Pack", f"https://t.me/addstickers/{packname}",
-                    icon_emoji_id=EID.ADD),
+                    icon_emoji_id=EID.ADD, style="success"),
         ]])
         card = action_card(
             "Sticker added successfully",
@@ -1045,7 +1045,7 @@ async def stickerinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if getattr(st, "set_name", None):
         markup = build_keyboard([[
             btn_url("Add Sticker Pack", f"https://t.me/addstickers/{st.set_name}",
-                    icon_emoji_id=EID.ADD),
+                    icon_emoji_id=EID.ADD, style="primary"),
         ]])
     card = action_card("Sticker information", fields, icon=E.INFO)
     await _send_reply(msg, card, parse_mode=ParseMode.HTML, reply_markup=markup)

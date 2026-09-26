@@ -11,7 +11,7 @@ from bot.logger import logger
 
 from . import database as bdb
 from .callbacks import bind_callback
-from .config import CB_PREFIX, HANDLER_GROUP, JOIN_TRACKER_GROUP
+from .config import CB_PREFIX, HANDLER_GROUP, JOIN_TRACKER_GROUP, WAITING_TEXT_GROUP
 from .handlers import (
     bind_command,
     bindmenu_command,
@@ -47,11 +47,14 @@ def setup(app: Application) -> list[str]:
         group=HANDLER_GROUP,
     )
 
-    # Waiting-for-input text (custom message / change channel) — after gates
-    # would have already deleted non-member messages; admins only anyway.
+    # Waiting-for-input text (custom message / change channel) — own
+    # group (20, NOT HANDLER_GROUP+1=5: that collides with leveling's
+    # XP tracker and one-handler-per-group means the first registered
+    # wins). Still created right after the gates (group 4), so it runs
+    # after they've deleted non-member messages; admins only anyway.
     app.add_handler(
         MessageHandler(group_filter & filters.TEXT & ~COMMAND, waiting_text_handler),
-        group=HANDLER_GROUP + 1,
+        group=WAITING_TEXT_GROUP,
     )
 
     # Join timestamps for grace period (welcome uses group=10).

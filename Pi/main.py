@@ -80,8 +80,24 @@ async def post_init(app: Application) -> None:
     app.bot_data["name"] = me.full_name
     logger.info(f"Bot API connected as @{me.username} — {me.full_name}")
 
+    # Group privacy mode: when ON, Telegram does not deliver plain group
+    # messages to the bot at all — rankings/anti-flood would count nothing.
+    privacy_on = not getattr(me, "can_read_all_group_messages", True)
+    if privacy_on:
+        logger.warning(
+            "Group privacy is ON — plain group messages are NOT delivered to the "
+            "bot (chat rankings, XP and anti-flood won't see them). "
+            "Fix: BotFather → /setprivacy → Disable."
+        )
+
     async def _startup_log() -> None:
         try:
+            privacy_line = (
+                "<b>Privacy:</b> ON — plain messages HIDDEN! "
+                "BotFather /setprivacy → Disable"
+                if privacy_on else
+                "<b>Privacy:</b> OFF — all group messages visible"
+            )
             startup_msg = (
                 f"<b>Bot Started Successfully!</b>\n\n"
                 f"<b>Bot:</b> @{me.username}\n"
@@ -90,7 +106,8 @@ async def post_init(app: Application) -> None:
                 f"<b>Modules:</b> Loaded\n"
                 f"<b>Database:</b> Connected\n"
                 f"<b>Colored Buttons:</b> Active (Pure PTB)\n"
-                f"<b>Logging:</b> Active\n\n"
+                f"<b>Logging:</b> Active\n"
+                f"{privacy_line}\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━"
             )
             await app.bot.send_message(

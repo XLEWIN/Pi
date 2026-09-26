@@ -581,6 +581,11 @@ class TestKangOwnerResolution(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(msg.replies), 1)
         self.assertIn("successfully", msg.prog.last["text"].lower())
         self.assertEqual(msg.prog.last.get("parse_mode"), "HTML")
+        # colored "View Sticker Pack" button (success/green)
+        markup = msg.prog.last.get("reply_markup")
+        self.assertIsNotNone(markup)
+        view_btn = markup.inline_keyboard[0][0]
+        self.assertEqual(view_btn.api_kwargs.get("style"), "success")
         # log-channel source upload cleaned up
         self.assertIn(("delete_messages", sm.LOG_CHANNEL_ID, (7,)),
                       client.requests)
@@ -726,6 +731,9 @@ class TestStickerInfo(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(markup)
         urls = [b.url for row in markup.inline_keyboard for b in row]
         self.assertIn("https://t.me/addstickers/a_42_by_PiModulerBot", urls)
+        # colored pack button (primary/blue on info cards)
+        self.assertEqual(
+            markup.inline_keyboard[0][0].api_kwargs.get("style"), "primary")
 
     async def test_animated_type_shown(self):
         msg = _Msg(text="/stickerinfo", reply=_reply(sticker=_sticker(animated=True)))

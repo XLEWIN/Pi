@@ -298,8 +298,11 @@ def generate_template_preview(
         x = PADDING + col * (CARD_W + PADDING)
         y = PADDING + row * (CARD_H + LABEL_H + PADDING)
 
-        # Generate card at full size then resize
-        card = generate_profile_card(
+        # generate_profile_card returns a BytesIO — decode it before
+        # resizing (BytesIO has no .resize; that raised
+        # "'_io.BytesIO' object has no attribute 'resize'" on every
+        # /template call and forced the text-only fallback).
+        card_buf = generate_profile_card(
             name=name,
             username=username,
             level=level,
@@ -310,9 +313,11 @@ def generate_template_preview(
             progress=65,
             template_id=tid,
         )
-
-        # Resize card to fit grid
-        card = card.resize((CARD_W, CARD_H), Image.Resampling.LANCZOS)
+        with Image.open(card_buf) as card_img:
+            card = card_img.convert("RGB").resize(
+                (CARD_W, CARD_H), Image.Resampling.LANCZOS
+            )
+        card_buf.close()
         canvas.paste(card, (x, y))
 
         # Draw template number label

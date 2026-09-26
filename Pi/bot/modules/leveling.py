@@ -1,13 +1,19 @@
-"""Leveling module — XP, levels, rank cards, leaderboards, streaks."""
+"""Leveling module — ranks, rank cards, leaderboards, streaks.
+
+Every number shown here derives from daily_messages + the rank ladders
+in bot/constants.py (CHAT_RANK_MESSAGES / GLOBAL_RANK_MESSAGES) — the
+same source /rankings displays. XP and streaks are cosmetic extras.
+"""
 
 import os
 import logging
 import tempfile
-from datetime import date, timedelta
+from html import escape
 
 from telegram import Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
     filters,
@@ -15,10 +21,13 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 
 from bot.command_handler import COMMAND, CommandHandler
+from bot.constants import CHAT_RANK_MESSAGES, GLOBAL_RANK_MESSAGES
 from bot.database import db
+from bot.keyboards.colored import btn_primary, btn_url, build_keyboard
 from bot.profile_templates import get_theme_list, THEMES
 from bot.rank_image import create_rank_card
-from bot.emojis import E
+from bot.emojis import E, EID
+from bot.timeutils import ist_monday, ist_month_start
 
 logger = logging.getLogger(__name__)
 
@@ -26,28 +35,100 @@ logger = logging.getLogger(__name__)
 _cooldowns = {}
 
 
-def _get_xp_needed(level: int) -> int:
-    """XP needed to reach next level (100 per level)."""
-    return level * 100
+def _next_in_rank(messages: int, step: int) -> int:
+    """Messages still needed to reach the next rank on a `step` ladder."""
+    return step - (messages % step)
 
 
-def _format_number(n: int) -> str:
-    """Format number with K/M suffix."""
-    if n >= 1_000_000:
-        return f"{n/1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n/1_000:.1f}K"
-    return str(n)
+def _bar(done: int, total: int, width: int = 10) -> tuple[str, int]:
+    """Text progress bar + percent for a `done/total` step."""
+    pct = min(int(done * 100 / total), 100) if total else 0
+    filled = min(int(done * width / total), width) if total else 0
+    return "▰" * filled + "▱" * (width - filled), pct
+
+
+def _bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Bot username for deep links (same lookup as bot/modules/help.py)."""
+    try:
+        name = (context.bot_data or {}).get("username")
+    except (AttributeError, TypeError):
+        name = None
+    name = name or getattr(context.bot, "username", None)
+    return name or "PiModulerBot"
+
+
+def _see_rank_keyboard(context: ContextTypes.DEFAULT_TYPE):
+    """Colored 'See Your Rank' button — opens the bot DM and starts it."""
+    url = f"https://t.me/{_bot_username(context)}?start=rank"
+    return build_keyboard(
+        [[btn_url("See Your Rank", url, icon_emoji_id=EID.CROWN, style="primary")]]
+    )
+
+
+def _nextlevel_keyboard():
+    """Colored 'My Next Level' button — re-sends the progress card."""
+    return build_keyboard(
+        [[btn_primary("My Next Level", "nextlevel:me", icon_emoji_id=EID.FIRE)]]
+    )
+
+
+def _rank_caption(name: str) -> str:
+    """Rank-card caption: header line only (details live on the card)."""
+    return f"{E.CROWN} <b>Rank card for {escape(name)}</b>"
+
+
+def _progress_text(info: dict, is_group: bool) -> str:
+    """Unified next-level card — used by /nextlevel and its button."""
+    chat_msgs = info["chat_messages"]
+    global_msgs = info["global_messages"]
+    cr, gr = info["chat_rank"], info["global_rank"]
+
+    lines = [f"{E.CROWN} <b>Rank Progress</b>"]
+
+    if is_group:
+        done = chat_msgs % CHAT_RANK_MESSAGES
+        bar, pct = _bar(done, CHAT_RANK_MESSAGES)
+        lines.append(
+            f"├ {E.LEVEL} Chat: <b>Rank {cr} → {cr + 1}</b> · "
+            f"<b>{_next_in_rank(chat_msgs, CHAT_RANK_MESSAGES)}</b> messages to go"
+        )
+        lines.append(f"│  {done}/{CHAT_RANK_MESSAGES} {bar} ({pct}%)")
+
+    done = global_msgs % GLOBAL_RANK_MESSAGES
+    bar, pct = _bar(done, GLOBAL_RANK_MESSAGES)
+    lines.append(
+        f"├ {E.WEB} Global: <b>Rank {gr} → {gr + 1}</b> · "
+        f"<b>{_next_in_rank(global_msgs, GLOBAL_RANK_MESSAGES)}</b> messages to go"
+    )
+    lines.append(f"│  {done}/{GLOBAL_RANK_MESSAGES} {bar} ({pct}%)")
+
+    if is_group:
+        lines.append(
+            f"└ {E.INFO} Messages: {chat_msgs:,} in this group · {global_msgs:,} total"
+        )
+    else:
+        lines.append(
+            f"└ {E.INFO} Messages: {global_msgs:,} total · chat rank counts per group"
+        )
+    return "\n".join(lines)
 
 
 # ── Message tracker for XP ──────────────────────────────
 async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Track messages for XP gain (DB work runs off the event loop)."""
+    """Track messages for XP + streaks (DB work runs off the event loop).
+
+    Message COUNTS and rank-up announcements belong to the counter in
+    bot/modules/chatstats.py — this path only awards cosmetic XP.
+    """
     if not update.message or update.effective_chat.type == "private":
         return
 
     user = update.effective_user
     if not user or user.is_bot:
+        return
+
+    # Spam-blocked users earn no XP either (bot/modules/antispam.py).
+    if db.is_spam_blocked(user.id):
         return
 
     chat_id = update.effective_chat.id
@@ -63,27 +144,14 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     def _db_work():
         try:
-            return db.add_message_xp(user_id, chat_id)
+            db.add_message_xp(user_id, chat_id)
         except Exception as e:
             logger.warning(f"XP track failed: {e}")
-            return (0, 1, False)
 
     # SQLite is synchronous — run it off the event loop so commands stay fast.
     import asyncio
     loop = asyncio.get_running_loop()
-    _level_ups, new_level, leveled_up = await loop.run_in_executor(None, _db_work)
-
-    # Announce level up (only every 5 levels to avoid spam)
-    if leveled_up and new_level % 5 == 0:
-        name = user.first_name or "User"
-        try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"{E.FIRE} <b>{name}</b> leveled up to <b>Level {new_level}</b>!",
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass
+    await loop.run_in_executor(None, _db_work)
 
 
 # ── Command handlers ─────────────────────────────────────
@@ -111,21 +179,19 @@ async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = target_user.id
 
-    # Get data
-    user_data = db.get_user_level(user_id)
-    chat_data = db.get_chat_level(chat_id, user_id)
-    rank = db.get_user_rank_in_chat(chat_id, user_id)
-    total_members = db.get_total_chat_members(chat_id)
+    # Unified rank info — daily_messages is the source of truth.
+    info = db.get_user_rank_info(user_id, chat_id)
 
     name = target_user.first_name or "User"
     username = target_user.username or ""
-    level = user_data.get("global_level", 1)
-    global_msgs = user_data.get("global_messages", 0)
-    chat_msgs = chat_data.get("messages", 0)
-    xp = user_data.get("global_xp", 0)
-    template_id = user_data.get("template", 2)
-    needed = _get_xp_needed(level)
-    progress_pct = min(int((xp % needed) / needed * 100), 100) if needed > 0 else 0
+    level = info["chat_rank"]
+    chat_msgs = info["chat_messages"]
+    global_msgs = info["global_messages"]
+    template_id = info["template"]
+    in_rank = chat_msgs % CHAT_RANK_MESSAGES
+    progress_pct = min(int(in_rank * 100 / CHAT_RANK_MESSAGES), 100)
+    position = info["chat_position"]
+    total_members = info["chat_members"]
 
     # Download avatar
     avatar_path = None
@@ -147,7 +213,7 @@ async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             level=level,
             next_level=level + 1,
             progress_pct=progress_pct,
-            rank_text=f"#{rank}/{total_members}",
+            rank_text=f"#{position}/{total_members}" if position else f"—/{total_members}",
             messages=f"{chat_msgs:,}",
             global_messages=f"{global_msgs:,}",
             output_path=output_path,
@@ -156,8 +222,14 @@ async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if result and os.path.exists(output_path):
+            caption = _rank_caption(name)
             with open(output_path, "rb") as f:
-                await update.message.reply_photo(photo=f, caption=f"{E.CHART} Rank card for {name}", parse_mode=ParseMode.HTML)
+                await update.message.reply_photo(
+                    photo=f,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=_see_rank_keyboard(context),
+                )
         else:
             await update.message.reply_text("Error generating rank card.")
     except Exception as e:
@@ -207,21 +279,34 @@ async def ranktemplate_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def nextlevel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /nextlevel — show XP needed for next level."""
+    """Handle /nextlevel — messages needed for the next chat/global rank."""
     user_id = update.effective_user.id
-    user_data = db.get_user_level(user_id)
-    level = user_data.get("global_level", 1)
-    xp = user_data.get("global_xp", 0)
-    needed = _get_xp_needed(level)
-    current_xp = xp % needed
+    is_group = update.effective_chat.type != "private"
+    info = db.get_user_rank_info(user_id, update.effective_chat.id if is_group else None)
 
     await update.message.reply_text(
-        f"{E.CHART} Level: <b>{level}</b>\n"
-        f"├ Next: Level {level + 1}\n"
-        f"├ Progress: {_format_number(current_xp)} / {_format_number(needed)} XP\n"
-        f"├ Total XP: <b>{_format_number(xp)}</b>\n"
-        f"└ Messages: <b>{_format_number(user_data.get('global_messages', 0))}</b>",
+        _progress_text(info, is_group),
         parse_mode=ParseMode.HTML,
+        reply_markup=_nextlevel_keyboard(),
+    )
+
+
+async def nextlevel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the 'My Next Level' button — fresh progress card, new message."""
+    query = update.callback_query
+    if not query or not query.message or not query.from_user:
+        return
+    await query.answer()
+
+    chat = query.message.chat
+    is_group = getattr(chat, "type", "private") != "private"
+    info = db.get_user_rank_info(
+        query.from_user.id, chat.id if is_group else None
+    )
+    await query.message.reply_text(
+        _progress_text(info, is_group),
+        parse_mode=ParseMode.HTML,
+        reply_markup=_nextlevel_keyboard(),
     )
 
 
@@ -255,12 +340,15 @@ async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     medals = [E.MEDAL_1, E.MEDAL_2, E.MEDAL_3]
-    lines = [f"{E.CHART} <b>Leaderboard — {update.effective_chat.title}</b>\n"]
+    lines = [f"{E.STAR} <b>Leaderboard — {update.effective_chat.title}</b>\n"]
 
     for i, entry in enumerate(lb):
         name = entry.get("first_name") or entry.get("username") or str(entry["user_id"])
         medal = medals[i] if i < 3 else f"  {i+1}."
-        lines.append(f"{medal} <b>{name}</b> — Level {entry['level']} ({_format_number(entry.get('xp', 0))} XP)")
+        lines.append(
+            f"{medal} <b>{name}</b> — Rank {entry['rank']} · "
+            f"{entry['messages']:,} msgs"
+        )
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
@@ -285,19 +373,19 @@ async def daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, entry in enumerate(top):
         name = entry.get("first_name") or entry.get("username") or str(entry["user_id"])
         medal = medals[i] if i < 3 else f"  {i+1}."
-        lines.append(f"{medal} <b>{name}</b> — {entry['messages']} messages")
+        lines.append(f"{medal} <b>{name}</b> — {entry['messages']:,} messages")
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 async def weekly_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /weekly — top chatters this week."""
+    """Handle /weekly — top chatters this week (Monday IST, like /rankings)."""
     if update.effective_chat.type == "private":
         await update.message.reply_text("This command only works in groups.")
         return
 
     chat_id = update.effective_chat.id
-    top = db.get_period_top(chat_id, days=7, limit=10)
+    top = db.get_period_top(chat_id, since=ist_monday(), limit=10)
 
     if not top:
         await update.message.reply_text(f"{E.INFO} No messages this week yet!",
@@ -310,19 +398,19 @@ async def weekly_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, entry in enumerate(top):
         name = entry.get("first_name") or entry.get("username") or str(entry["user_id"])
         medal = medals[i] if i < 3 else f"  {i+1}."
-        lines.append(f"{medal} <b>{name}</b> — {_format_number(entry.get('total_messages', 0))} messages")
+        lines.append(f"{medal} <b>{name}</b> — {entry.get('total_messages', 0):,} messages")
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 async def monthly_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /monthly — top chatters this month."""
+    """Handle /monthly — top chatters this month (IST calendar month)."""
     if update.effective_chat.type == "private":
         await update.message.reply_text("This command only works in groups.")
         return
 
     chat_id = update.effective_chat.id
-    top = db.get_period_top(chat_id, days=30, limit=10)
+    top = db.get_period_top(chat_id, since=ist_month_start(), limit=10)
 
     if not top:
         await update.message.reply_text(f"{E.INFO} No messages this month yet!",
@@ -335,7 +423,7 @@ async def monthly_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, entry in enumerate(top):
         name = entry.get("first_name") or entry.get("username") or str(entry["user_id"])
         medal = medals[i] if i < 3 else f"  {i+1}."
-        lines.append(f"{medal} <b>{name}</b> — {_format_number(entry.get('total_messages', 0))} messages")
+        lines.append(f"{medal} <b>{name}</b> — {entry.get('total_messages', 0):,} messages")
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
@@ -347,6 +435,9 @@ def setup(app: Application) -> list:
     app.add_handler(CommandHandler("rank", rank_command))
     app.add_handler(CommandHandler("ranktemplate", ranktemplate_command))
     app.add_handler(CommandHandler("nextlevel", nextlevel_command))
+    app.add_handler(
+        CallbackQueryHandler(nextlevel_callback, pattern=r"^nextlevel:me$")
+    )
     app.add_handler(CommandHandler("streak", streak_command))
     app.add_handler(CommandHandler("leaderboard", leaderboard_command))
     app.add_handler(CommandHandler("lb", leaderboard_command))

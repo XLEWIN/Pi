@@ -4,6 +4,15 @@ from bot.emojis import E
 
 BOT_NAME = "Phi π"
 
+# ── Rank progression ─────────────────────────────────────────────
+# The ONE definition of the message ladder. Every rank surface
+# (/rank, /rankings, /mytop, /nextlevel, /leaderboard, /profile,
+# /info, /template) derives its numbers from these two values and
+# from daily_messages (bot/database.py) — never from the legacy
+# user_chat_level / user_level.global_messages columns.
+CHAT_RANK_MESSAGES = 100    # messages per chat rank (per group)
+GLOBAL_RANK_MESSAGES = 250  # messages per global rank (all groups)
+
 BOT_DESCRIPTION = (
     "The ultimate Telegram bot for community management. "
     "Leveling, moderation, giveaways, custom commands, and so much more."
@@ -36,9 +45,14 @@ HELP_MENU: list[dict] = [
                 "/start — Open the main menu",
                 "/help — Show this help menu",
                 "/testcolors — Preview colored buttons (groups)",
+                "/restart — Restart the bot (owner)",
+                "/free @user — Clear spam warnings &amp; block (sudo)",
             ]),
         ],
-        "notes": [],
+        "notes": [
+            "<b>Anti-flood:</b> 5 messages in 3 seconds → blocked "
+            "5 min, then 10 min, then 20 min (resets at IST midnight)"
+        ],
     },
     {
         "key": "moderation",
@@ -163,17 +177,34 @@ HELP_MENU: list[dict] = [
                 "/rank [@user] — View rank card",
                 "/template — Pick rank card template with preview (DM only)",
                 "/ranktemplate — Pick rank card template (DM only)",
-                "/nextlevel — XP needed for next level",
+                "/nextlevel — Messages needed for next rank",
                 "/streak — Your message streaks",
-                "/leaderboard /lb — Chat leaderboard",
+                "/leaderboard /lb — Chat ranks by messages",
                 "/daily — Top chatters today",
                 "/weekly — Top chatters this week",
                 "/monthly — Top chatters this month",
             ]),
         ],
         "notes": [
-            "<b>Leveling Rules:</b> +1 chat level per 50 messages • "
-            "+1 global level per 100 messages"
+            "<b>Ranking Rules:</b> +1 chat rank per 100 messages • "
+            "+1 global rank per 250 messages"
+        ],
+    },
+    {
+        "key": "stats",
+        "icon": E.CHART,
+        "title": "Chat Stats",
+        "sections": [
+            (None, [
+                "/rankings — Top chatters in this group",
+                "/mytop — Your groups ranked by your messages",
+            ]),
+        ],
+        "notes": [
+            "<b>Rankings:</b> counts text messages only • "
+            "switch Overall / Today / Weekly from the buttons • "
+            "weeks start Monday, Today refreshes at midnight IST • "
+            "milestones at 100 and every 500 messages"
         ],
     },
     {

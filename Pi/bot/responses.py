@@ -152,6 +152,18 @@ def field_status(value: str) -> Field:
     return (E.INFO, "Status", escape(str(value)))
 
 
+# ── Unified rank display ─────────────────────────────────────────
+
+def rank_value(rank: int, position: Optional[int], members: int,
+               messages: int) -> str:
+    """One rank line for every surface (/rank, /profile, /info, /mytop).
+
+    ``Rank 5 · #3/57 · 480 msgs`` — ``#—`` until the user has messages.
+    """
+    pos = f"#{position}" if position else "#—"
+    return f"Rank {rank} · {pos}/{members} · {messages:,} msgs"
+
+
 # ── Common one-liners (still branded) ──────────────────────────
 
 def plain_error(msg: str) -> str:

@@ -4,9 +4,11 @@ Works in both private chats and groups. Uses Bot API 9.4+ button styling.
 """
 
 import asyncio
+import re
 from html import escape
 
 from telegram import Update
+from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 from telegram.constants import ParseMode
 
@@ -74,6 +76,89 @@ def format_user_log(user, action: str, chat_title: str = None) -> str:
         log_text += f"\n💬 Chat: {escape(chat_title)}"
 
     return log_text
+
+
+# ── #Newuser — first-contact log (bot/modules/chatstats.py) ───────
+
+_TG_EMOJI_RE = re.compile(r"<tg-emoji[^>]*>(.*?)</tg-emoji>", re.DOTALL)
+
+
+def _strip_tgemoji(html: str) -> str:
+    """<tg-emoji …>glyph</tg-emoji> → plain glyph (chats that reject tags)."""
+    return _TG_EMOJI_RE.sub(r"\1", html)
+
+
+def format_newuser_log(user, chat_title: str = None, plain: bool = False) -> str:
+    """#Newuser log — Pi style, owner's custom emoji set.
+
+    Matches the requested shape (name / user id / username) with E.*
+    icons. ``plain=True`` swaps the tags for their fallback glyphs —
+    some chats reject <tg-emoji> with 400, so send_newuser_log retries
+    plain when the rich send fails.
+    """
+    from bot.emojis import E
+    if plain:
+        # Same glyphs as the rich form, minus the <tg-emoji> tags. E.*
+        # draws randomly per process from multi-candidate categories
+        # (e.g. FOLDER: 📁|💼, INFO: 💭|🌐), so hardcoding glyphs here
+        # made the plain retry (and the twin test) a coin flip.
+        e_new = _strip_tgemoji(E.NEW)
+        e_user = _strip_tgemoji(E.USER)
+        e_info = _strip_tgemoji(E.INFO)
+        e_web = _strip_tgemoji(E.WEB)
+        e_folder = _strip_tgemoji(E.FOLDER)
+    else:
+        e_new, e_user = E.NEW, E.USER
+        e_info, e_web, e_folder = E.INFO, E.WEB, E.FOLDER
+
+    username = f"@{escape(user.username)}" if getattr(user, "username", None) else "No username"
+    name = escape(getattr(user, "first_name", None) or getattr(user, "username", None) or "Unknown")
+
+    lines = [f"{e_new} <b>#Newuser</b>"]
+    lines.append(f"{e_user} <b>Name:</b> {name}")
+    lines.append(f"{e_info} <b>User ID:</b> <code>{user.id}</code>")
+    lines.append(f"{e_web} <b>Username:</b> {username}")
+    if chat_title:
+        lines.append(f"{e_folder} <b>Chat:</b> {escape(chat_title)}")
+    return "\n".join(lines)
+
+
+async def send_newuser_log(context, user, chat_title: str = None) -> None:
+    """Post #Newuser to the log channel. Fails soft — never raises.
+
+    Tries the custom-emoji (rich) form first; if the chat rejects
+    <tg-emoji> (400), retries once with plain fallback glyphs.
+    """
+    if context is None or getattr(context, "bot", None) is None:
+        return
+    rich = format_newuser_log(user, chat_title)
+    try:
+        await asyncio.wait_for(
+            context.bot.send_message(
+                chat_id=LOG_CHANNEL_ID, text=rich, parse_mode=ParseMode.HTML
+            ),
+            timeout=LOG_TIMEOUT_SECONDS,
+        )
+        return
+    except BadRequest as e:
+        logger.debug(f"rich #newuser rejected ({e}) — retrying plain")
+    except asyncio.TimeoutError:
+        logger.warning(f"#newuser log timed out after {LOG_TIMEOUT_SECONDS}s")
+        return
+    except Exception as e:
+        logger.warning(f"#newuser log send failed: {e}")
+        return
+    try:
+        await asyncio.wait_for(
+            context.bot.send_message(
+                chat_id=LOG_CHANNEL_ID,
+                text=format_newuser_log(user, chat_title, plain=True),
+                parse_mode=ParseMode.HTML,
+            ),
+            timeout=LOG_TIMEOUT_SECONDS,
+        )
+    except Exception as e:
+        logger.warning(f"#newuser plain log send failed: {e}")
 
 
 def build_start_keyboard(icons: bool = True):

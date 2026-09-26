@@ -1,104 +1,80 @@
-"""Template module — /template command with preview image and inline selection.
+"""Template module — /template command with inline selection.
 
-Shows all rank card templates in one preview image with numbered inline buttons.
+Lists the rank card templates in the house text style with numbered
+colored buttons; tapping one (or sending /template <number>) applies it.
 """
 
-import os
-import logging
-import tempfile
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 from telegram.constants import ParseMode
 
 from bot.command_handler import CommandHandler
 from bot.database import db
-from bot.profile_templates import THEMES, generate_template_preview
-
-logger = logging.getLogger(__name__)
+from bot.emojis import E, EID
+from bot.keyboards.colored import btn_danger, btn_primary, btn_success, build_keyboard
+from bot.profile_templates import THEMES
 
 
 def _build_template_buttons():
-    """Build inline keyboard with template numbers."""
-    buttons = []
+    """Colored keyboard — one icon-tagged button per template.
+
+    Colors keep the original mapping: #1 primary, evens success,
+    remaining odds danger.
+    """
+    rows = []
     row = []
     for tid, theme in THEMES.items():
-        row.append(InlineKeyboardButton(
-            f"{tid}. {theme['name']}",
-            callback_data=f"template:{tid}",
-            api_kwargs={"style": "primary" if tid == 1 else "success" if tid % 2 == 0 else "danger"}
-        ))
+        label = f"{tid}. {theme['name']}"
+        data = f"template:{tid}"
+        if tid == 1:
+            btn = btn_primary(label, data, icon_emoji_id=EID.SPARKLE)
+        elif tid % 2 == 0:
+            btn = btn_success(label, data, icon_emoji_id=EID.SPARKLE)
+        else:
+            btn = btn_danger(label, data, icon_emoji_id=EID.SPARKLE)
+        row.append(btn)
         if len(row) == 2:
-            buttons.append(row)
+            rows.append(row)
             row = []
     if row:
-        buttons.append(row)
-    return InlineKeyboardMarkup(buttons)
+        rows.append(row)
+    return build_keyboard(rows)
+
+
+def _header(active_name: str, active_id: int) -> str:
+    """Shared branded header — current selection always visible."""
+    return (
+        f"{E.SPARKLE} <b>Rank Templates</b>\n"
+        f"├ {E.CHECK} Active: <b>{active_name}</b> (#{active_id})"
+    )
 
 
 async def template_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /template — show all rank card templates with preview image."""
+    """Handle /template — list templates + inline selection (text only)."""
     if update.effective_chat.type != "private":
-        await update.message.reply_text("Use this command in my DM for privacy.")
+        await update.message.reply_text(
+            f"{E.INFO} Use this command in my DM for privacy.",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
-    user = update.effective_user
-    user_id = user.id
+    # Current selection — same source as /rank (user_level.template).
+    info = db.get_user_rank_info(update.effective_user.id)
+    active_id = info["template"]
+    active_name = THEMES.get(active_id, THEMES[1])["name"]
 
-    # Get user data for the preview
-    user_data = db.get_user_level(user_id)
-    level = user_data.get("global_level", 1)
-    global_msgs = user_data.get("global_messages", 0)
-
-    # Download avatar
-    avatar_bytes = None
-    try:
-        from io import BytesIO
-        photos = await context.bot.get_user_profile_photos(user_id, limit=1)
-        if photos.photos:
-            f = await context.bot.get_file(photos.photos[0][-1].file_id)
-            buf = BytesIO()
-            await f.download_to_memory(buf)
-            buf.seek(0)
-            avatar_bytes = buf.read()
-    except Exception as e:
-        logger.warning(f"Avatar download failed: {e}")
-
-    # Generate preview image with all templates
-    try:
-        preview = generate_template_preview(
-            name=user.first_name or "User",
-            username=user.username or "user",
-            level=level,
-            rank="#1",
-            chat_messages=f"{global_msgs // 2:,}",
-            global_messages=f"{global_msgs:,}",
-            avatar_bytes=avatar_bytes,
-        )
-
-        # Send preview image with inline buttons
-        await update.message.reply_photo(
-            photo=preview,
-            caption=(
-                f"<b>🎨 Rank Templates</b>\n\n"
-                f"Choose a template for your rank card:\n\n"
-                f"{get_theme_list()}\n\n"
-                f"Click a button below to select:"
-            ),
-            reply_markup=_build_template_buttons(),
-            parse_mode=ParseMode.HTML,
-        )
-        await update.message.delete()
-    except Exception as e:
-        logger.error(f"Failed to generate template preview: {e}")
-        await update.message.reply_text(
-            f"<b>🎨 Rank Templates</b>\n\n"
-            f"{get_theme_list()}\n\n"
-            f"<b>Usage:</b> /template &lt;number&gt;\n"
-            f"<b>Example:</b> /template 3",
-            reply_markup=_build_template_buttons(),
-            parse_mode=ParseMode.HTML,
-        )
+    theme_lines = "\n".join(
+        f"│  {line.strip()}" for line in get_theme_list().splitlines()
+    )
+    await update.message.reply_text(
+        f"{_header(active_name, active_id)}\n"
+        f"├ {E.INFO} Styles: tap a button below\n"
+        f"{theme_lines}\n"
+        f"└ {E.SETTINGS} Usage: <code>/template &lt;number&gt;</code>"
+        f" · Example: <code>/template 3</code>",
+        reply_markup=_build_template_buttons(),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def template_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -124,15 +100,14 @@ async def template_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer(f"Template set to {theme_name}!", show_alert=False)
 
-    # Update the message with confirmation
+    # Update the message with confirmation (it's a text message now —
+    # edit_message_text, not edit_message_caption; stale taps stay silent).
     try:
-        await query.edit_message_caption(
-            caption=(
-                f"<b>✅ Template Selected!</b>\n\n"
-                f"You chose: <b>{theme_name}</b> (#{template_id})\n\n"
-                f"Your rank card will now use this template.\n"
-                f"Use /template again to change it."
-            ),
+        await query.edit_message_text(
+            f"{E.CHECK} <b>Template Selected</b>\n"
+            f"├ {E.SPARKLE} Style: <b>{theme_name}</b> (#{template_id})\n"
+            f"├ {E.INFO} Applied to: your /rank card\n"
+            f"└ {E.SETTINGS} Change anytime with /template",
             parse_mode=ParseMode.HTML,
         )
     except Exception:

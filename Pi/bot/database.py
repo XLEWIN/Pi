@@ -9,6 +9,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 
+# Rank ladders + IST windows. Safe here: bot.constants only imports
+# bot.emojis (stdlib) and bot.timeutils is stdlib — no cycles.
+from bot.constants import CHAT_RANK_MESSAGES, GLOBAL_RANK_MESSAGES
+from bot.timeutils import ist_date
+
 logger = logging.getLogger(__name__)
 
 # Prefer a local (non-OneDrive) path so sync/locking cannot stall handlers.
@@ -216,6 +221,18 @@ class Database:
                 user_id INTEGER PRIMARY KEY,
                 added_by INTEGER,
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # ── Anti-flood state (bot/modules/antispam.py) ────
+        # offence_day: IST date the current streak started (resets at
+        # IST midnight); blocked_until: aware UTC ISO text.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS spam_protection (
+                user_id INTEGER PRIMARY KEY,
+                offence_day TEXT,
+                offences INTEGER DEFAULT 0,
+                blocked_until TEXT
             )
         """)
 
@@ -742,8 +759,7 @@ class Database:
             cursor = self.connection.cursor()
             cursor.execute("SELECT * FROM user_reputation WHERE user_id = ?", (user_id,))
             row = dict(cursor.fetchone())
-            lvl = self.get_user_level(user_id)
-            messages = int(lvl.get("global_messages") or 0)
+            messages = self.get_user_messages(user_id)
             pos = int(row.get("positive_actions") or 0)
             warns = int(row.get("warnings_total") or 0)
             restr = int(row.get("restrictions_total") or 0)
@@ -765,45 +781,6 @@ class Database:
                 "positive_actions": 0, "warnings": 0, "restrictions": 0,
                 "first_seen": None,
             }
-
-    def get_reputation_rank(self, user_id: int) -> int:
-        """1-based global rank by computed reputation (messages//5 + boosts)."""
-        try:
-            cursor = self.connection.cursor()
-            cursor.execute(
-                """
-                SELECT r.user_id,
-                       COALESCE(l.global_messages, 0) AS msgs,
-                       r.positive_actions, r.warnings_total, r.restrictions_total
-                FROM user_reputation r
-                LEFT JOIN user_level l ON l.user_id = r.user_id
-                """
-            )
-            scored = []
-            for row in cursor.fetchall():
-                score = max(
-                    0,
-                    (int(row[1]) // 5)
-                    + (int(row[2]) * 10)
-                    - (int(row[3]) * 20)
-                    - (int(row[4]) * 40),
-                )
-                scored.append((score, int(row[0])))
-            # Include users who have messages but no reputation row yet.
-            cursor.execute("SELECT user_id, global_messages FROM user_level")
-            known = {uid for _, uid in scored}
-            for row in cursor.fetchall():
-                uid, msgs = int(row[0]), int(row[1])
-                if uid not in known:
-                    scored.append((max(0, int(msgs) // 5), uid))
-            scored.sort(key=lambda x: (-x[0], x[1]))
-            for i, (_, uid) in enumerate(scored, start=1):
-                if uid == user_id:
-                    return i
-            return len(scored) + 1
-        except sqlite3.Error as e:
-            logger.error(f"get_reputation_rank: {e}")
-            return 1
 
     def get_active_days(self, user_id: int) -> int:
         """Days since first_seen (users table)."""
@@ -1018,6 +995,25 @@ class Database:
             self.connection.commit()
         except sqlite3.Error as e:
             logger.error(f"Error adding group member: {e}")
+
+    def cache_group_member(self, chat_id: int, user_id: int,
+                           role: str = "member") -> bool:
+        """Group-members cache touch (chatstats first-contact path).
+
+        INSERT OR IGNORE — keeps the original joined_at; safe to call
+        on every message. Returns True when the row is new.
+        """
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute("""
+                INSERT OR IGNORE INTO group_members (chat_id, user_id, role)
+                VALUES (?, ?, ?)
+            """, (chat_id, user_id, role))
+            self.connection.commit()
+            return cursor.rowcount > 0
+        except sqlite3.Error as e:
+            logger.error(f"Error caching group member: {e}")
+            return False
 
     def log_moderation(self, moderator_id: int, target_id: int, action: str,
                        reason: str, chat_id: int, chat_title: str, duration: str = None):
@@ -1252,6 +1248,100 @@ class Database:
             return cursor.fetchone() is not None
         except sqlite3.Error as e:
             return False
+
+    # ── Anti-flood state (bot/modules/antispam.py) ────────
+    def spam_bump_offence(self, user_id: int, offence_day: str) -> int:
+        """Count one offence for this IST day; resets on a new day.
+
+        Returns the offence number: 1st, 2nd, 3rd… (24h refresh = IST date).
+        """
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                "SELECT offence_day, offences FROM spam_protection WHERE user_id = ?",
+                (user_id,),
+            )
+            row = cursor.fetchone()
+            if row is None or row[0] != offence_day:
+                offences = 1
+            else:
+                offences = int(row[1] or 0) + 1
+            cursor.execute(
+                "INSERT INTO spam_protection (user_id, offence_day, offences) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET offence_day = ?, offences = ?",
+                (user_id, offence_day, offences, offence_day, offences),
+            )
+            self.connection.commit()
+            return offences
+        except sqlite3.Error as e:
+            logger.error(f"Error recording spam offence: {e}")
+            return 1
+
+    def spam_set_block(self, user_id: int, blocked_until_iso: str) -> bool:
+        """Block the user until the given aware-UTC ISO timestamp."""
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                "UPDATE spam_protection SET blocked_until = ? WHERE user_id = ?",
+                (blocked_until_iso, user_id),
+            )
+            if cursor.rowcount == 0:
+                cursor.execute(
+                    "INSERT INTO spam_protection (user_id, blocked_until) "
+                    "VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET blocked_until = ?",
+                    (user_id, blocked_until_iso, blocked_until_iso),
+                )
+            self.connection.commit()
+            return True
+        except sqlite3.Error as e:
+            logger.error(f"Error setting spam block: {e}")
+            return False
+
+    def is_spam_blocked(self, user_id: int) -> bool:
+        """True while the user's block is still active (UTC compare)."""
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                "SELECT blocked_until FROM spam_protection WHERE user_id = ?",
+                (user_id,),
+            )
+            row = cursor.fetchone()
+            if row is None or not row[0]:
+                return False
+            from datetime import datetime, timezone
+            until = datetime.fromisoformat(row[0])
+            return until > datetime.now(timezone.utc)
+        except (sqlite3.Error, ValueError) as e:
+            logger.error(f"Error checking spam block: {e}")
+            return False
+
+    def spam_clear(self, user_id: int) -> bool:
+        """Wipe warnings + block (/free). Returns True if anything existed."""
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                "DELETE FROM spam_protection WHERE user_id = ?", (user_id,)
+            )
+            self.connection.commit()
+            return cursor.rowcount > 0
+        except sqlite3.Error as e:
+            logger.error(f"Error clearing spam state: {e}")
+            return False
+
+    def spam_get(self, user_id: int) -> Optional[Dict[str, Any]]:
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                "SELECT user_id, offence_day, offences, blocked_until "
+                "FROM spam_protection WHERE user_id = ?",
+                (user_id,),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        except sqlite3.Error as e:
+            logger.error(f"Error reading spam state: {e}")
+            return None
 
     # ── Gbanned users ─────────────────────────────────────
     def add_gban(self, user_id: int, reason: str = "No reason provided", banned_by: int = None) -> bool:
@@ -1570,33 +1660,30 @@ class Database:
             logger.error(f"Error updating user level: {e}")
 
     def add_message_xp(self, user_id: int, chat_id: int) -> Tuple[int, int, bool]:
-        """Add XP for a message. Returns (level_ups, new_level, leveled_up)."""
-        from datetime import date
-        today = date.today().isoformat()
+        """Award XP + advance the daily streak for one message.
 
-        # Update global messages
+        ``chat_id`` stays in the signature for callers but is unused:
+        message COUNTS live in daily_messages (bot/modules/chatstats.py
+        counts every message, no XP cooldown), and ranks are derived from
+        those counts — this path must not write counters of any kind.
+        Rank-up announcements are owned by the counting path.
+
+        Returns the legacy tuple ``(0, 0, False)`` — no level-ups here.
+        """
+        today = ist_date()
+
         user = self.get_user_level(user_id)
-        global_msgs = user.get("global_messages", 0) + 1
-        global_level = user.get("global_level", 1)
         global_xp = user.get("global_xp", 0)
-        leveled_up = False
-
-        # +1 level every 100 messages globally
-        new_global_level = (global_msgs // 100) + 1
-        if new_global_level > global_level:
-            leveled_up = True
-            global_level = new_global_level
 
         # Add XP per message (10-20 XP)
         import random
         xp_gain = random.randint(10, 20)
         global_xp += xp_gain
 
-        # Update streak
+        # Update streak (IST days — same window as the rankings boards)
         streak_current = user.get("streak_current", 0)
         streak_best = user.get("streak_best", 0)
         last_msg_date = user.get("last_message_date")
-        last_streak_date = user.get("last_streak_date")
 
         if last_msg_date != today:
             from datetime import date, timedelta
@@ -1608,91 +1695,151 @@ class Database:
             if streak_current > streak_best:
                 streak_best = streak_current
 
+        # global_level / global_messages are intentionally NOT written:
+        # they are legacy columns (frozen values) — every reader uses
+        # get_user_messages()/get_user_rank_info() over daily_messages.
         self.update_user_level(user_id,
-            global_level=global_level,
             global_xp=global_xp,
-            global_messages=global_msgs,
             streak_current=streak_current,
             streak_best=streak_best,
             last_message_date=today,
         )
 
-        # Update chat messages and level
-        cursor = self.connection.cursor()
-        cursor.execute("SELECT messages, level FROM user_chat_level WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
-        row = cursor.fetchone()
-        if row:
-            chat_msgs = row[0] + 1
-            chat_level = row[1]
-        else:
-            chat_msgs = 1
-            chat_level = 1
+        return (0, 0, False)
 
-        # +1 level every 50 messages per chat
-        new_chat_level = (chat_msgs // 50) + 1
-        chat_level_up = new_chat_level > chat_level
+    # ── Rank math — derived from daily_messages (single source) ──
+    #
+    # daily_messages (the rows /rankings shows) is the ONE counter.
+    # user_chat_level / user_level.global_messages are legacy columns:
+    # frozen history, never read for ranks anymore.
 
-        cursor.execute("""
-            INSERT OR REPLACE INTO user_chat_level (chat_id, user_id, messages, level, xp)
-            VALUES (?, ?, ?, ?, ?)
-        """, (chat_id, user_id, chat_msgs, new_chat_level, chat_msgs * 10))
-        self.connection.commit()
+    @staticmethod
+    def chat_rank_for(messages: int) -> int:
+        """Chat rank ladder: 100 messages → +1 rank (1 at 0 msgs)."""
+        return int(messages) // CHAT_RANK_MESSAGES + 1
 
-        # Update daily messages
-        cursor.execute("SELECT messages FROM daily_messages WHERE chat_id = ? AND user_id = ? AND date = ?", (chat_id, user_id, today))
-        daily_row = cursor.fetchone()
-        daily_msgs = (daily_row[0] if daily_row else 0) + 1
-        cursor.execute("""
-            INSERT OR REPLACE INTO daily_messages (chat_id, user_id, date, messages)
-            VALUES (?, ?, ?, ?)
-        """, (chat_id, user_id, today, daily_msgs))
-        self.connection.commit()
+    @staticmethod
+    def global_rank_for(messages: int) -> int:
+        """Global rank ladder: 250 messages → +1 rank (1 at 0 msgs)."""
+        return int(messages) // GLOBAL_RANK_MESSAGES + 1
 
-        return (1 if leveled_up else 0) + (1 if chat_level_up else 0), global_level, leveled_up
+    @staticmethod
+    def _position_in(totals: List[Tuple[int, int]], user_id: int,
+                     mine: int) -> int:
+        """1-based position: higher totals first, ties → lower user_id."""
+        pos = 1
+        for uid, msgs in totals:
+            if uid == user_id:
+                continue
+            if msgs > mine or (msgs == mine and uid < user_id):
+                pos += 1
+        return pos
 
-    def get_chat_level(self, chat_id: int, user_id: int) -> Dict[str, Any]:
+    def get_user_messages(self, user_id: int) -> int:
+        """A user's message total across all groups — daily_messages sum."""
         try:
             cursor = self.connection.cursor()
-            cursor.execute("SELECT * FROM user_chat_level WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+            cursor.execute(
+                "SELECT COALESCE(SUM(messages), 0) FROM daily_messages "
+                "WHERE user_id = ?",
+                (user_id,),
+            )
             row = cursor.fetchone()
-            if row:
-                return dict(row)
-            return {"chat_id": chat_id, "user_id": user_id, "messages": 0, "level": 1, "xp": 0}
+            return int(row[0] or 0)
         except sqlite3.Error as e:
-            return {}
+            logger.error(f"Error totalling user messages: {e}")
+            return 0
+
+    def get_user_message_totals(self, chat_id: int,
+                                user_id: int) -> Tuple[int, int]:
+        """(chat, global) message totals — same rows /rankings counts."""
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                "SELECT COALESCE(SUM(messages), 0) FROM daily_messages "
+                "WHERE chat_id = ? AND user_id = ?",
+                (chat_id, user_id),
+            )
+            chat_msgs = int(cursor.fetchone()[0] or 0)
+            return chat_msgs, self.get_user_messages(user_id)
+        except sqlite3.Error as e:
+            logger.error(f"Error totalling user messages: {e}")
+            return 0, 0
+
+    def get_user_rank_info(self, user_id: int,
+                           chat_id: Optional[int] = None) -> Dict[str, Any]:
+        """Unified rank info — what every rank surface displays.
+
+        Counts come from daily_messages (identical to /rankings); ranks
+        derive from CHAT_RANK_MESSAGES / GLOBAL_RANK_MESSAGES. A ``None``
+        position means the user has no messages in that scope yet.
+        Also carries template/streak/xp from user_level (never messages).
+        """
+        info: Dict[str, Any] = {
+            "user_id": user_id,
+            "chat_messages": 0, "chat_rank": 1, "chat_position": None,
+            "chat_members": 0,
+            "global_messages": 0, "global_rank": 1, "global_position": None,
+            "global_members": 0,
+            "template": 1, "global_xp": 0,
+            "streak_current": 0, "streak_best": 0,
+        }
+        try:
+            cursor = self.connection.cursor()
+            # Global: every chatter across all groups, all time.
+            cursor.execute(
+                "SELECT user_id, SUM(messages) AS m "
+                "FROM daily_messages GROUP BY user_id"
+            )
+            rows = [(int(r[0]), int(r[1] or 0)) for r in cursor.fetchall()]
+            mine = dict(rows).get(user_id, 0)
+            info["global_messages"] = mine
+            info["global_members"] = len(rows)
+            if mine > 0:
+                info["global_rank"] = self.global_rank_for(mine)
+                info["global_position"] = self._position_in(rows, user_id, mine)
+
+            # Chat scope (groups only — skip for DM callers).
+            if chat_id is not None:
+                cursor.execute(
+                    "SELECT user_id, SUM(messages) AS m "
+                    "FROM daily_messages WHERE chat_id = ? "
+                    "GROUP BY user_id",
+                    (chat_id,),
+                )
+                crows = [(int(r[0]), int(r[1] or 0))
+                         for r in cursor.fetchall()]
+                cmine = dict(crows).get(user_id, 0)
+                info["chat_messages"] = cmine
+                info["chat_members"] = len(crows)
+                if cmine > 0:
+                    info["chat_rank"] = self.chat_rank_for(cmine)
+                    info["chat_position"] = self._position_in(
+                        crows, user_id, cmine
+                    )
+
+            # Presentation extras (template / xp / streaks — no counters).
+            lvl = self.get_user_level(user_id)
+            info["template"] = int(lvl.get("template") or 1)
+            info["global_xp"] = int(lvl.get("global_xp") or 0)
+            info["streak_current"] = int(lvl.get("streak_current") or 0)
+            info["streak_best"] = int(lvl.get("streak_best") or 0)
+        except sqlite3.Error as e:
+            logger.error(f"Error building rank info: {e}")
+        return info
 
     def get_leaderboard(self, chat_id: int, limit: int = 10) -> List[Dict[str, Any]]:
-        try:
-            cursor = self.connection.cursor()
-            cursor.execute("""
-                SELECT ucl.*, u.username, u.first_name
-                FROM user_chat_level ucl
-                LEFT JOIN users u ON ucl.user_id = u.user_id
-                WHERE ucl.chat_id = ?
-                ORDER BY ucl.level DESC, ucl.xp DESC
-                LIMIT ?
-            """, (chat_id, limit))
-            return [dict(row) for row in cursor.fetchall()]
-        except sqlite3.Error as e:
-            return []
-
-    def get_global_leaderboard(self, limit: int = 10) -> List[Dict[str, Any]]:
-        try:
-            cursor = self.connection.cursor()
-            cursor.execute("""
-                SELECT ul.*, u.username, u.first_name
-                FROM user_level ul
-                LEFT JOIN users u ON ul.user_id = u.user_id
-                ORDER BY ul.global_level DESC, ul.global_xp DESC
-                LIMIT ?
-            """, (limit,))
-            return [dict(row) for row in cursor.fetchall()]
-        except sqlite3.Error as e:
-            return []
+        """Chat leaderboard — derives from get_chat_top (same counts,
+        same order as /rankings) and adds the derived chat rank."""
+        rows = self.get_chat_top(chat_id, limit=limit)
+        for row in rows:
+            msgs = int(row.get("total_messages") or 0)
+            row["messages"] = msgs
+            row["rank"] = self.chat_rank_for(msgs)
+        return rows
 
     def get_daily_top(self, chat_id: int, limit: int = 10) -> List[Dict[str, Any]]:
-        from datetime import date
-        today = date.today().isoformat()
+        today = ist_date()  # IST day — same window as /rankings Today
         try:
             cursor = self.connection.cursor()
             cursor.execute("""
@@ -1707,9 +1854,8 @@ class Database:
         except sqlite3.Error as e:
             return []
 
-    def get_period_top(self, chat_id: int, days: int, limit: int = 10) -> List[Dict[str, Any]]:
-        from datetime import date, timedelta
-        start_date = (date.today() - timedelta(days=days)).isoformat()
+    def get_period_top(self, chat_id: int, since: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Top senders since an inclusive date (IST windows: week/month)."""
         try:
             cursor = self.connection.cursor()
             cursor.execute("""
@@ -1718,41 +1864,134 @@ class Database:
                 LEFT JOIN users u ON dm.user_id = u.user_id
                 WHERE dm.chat_id = ? AND dm.date >= ?
                 GROUP BY dm.user_id
-                ORDER BY total_messages DESC
+                ORDER BY total_messages DESC, dm.user_id ASC
                 LIMIT ?
-            """, (chat_id, start_date, limit))
+            """, (chat_id, since, limit))
             return [dict(row) for row in cursor.fetchall()]
         except sqlite3.Error as e:
             return []
 
-    def set_template(self, user_id: int, template: int):
-        self.update_user_level(user_id, template=template)
+    # ── Chat message rankings (bot/modules/chatstats.py) ──────
 
-    def get_user_rank_in_chat(self, chat_id: int, user_id: int) -> int:
+    def count_message(self, chat_id: int, user_id: int, date: str,
+                      chat_title: Optional[str] = None) -> bool:
+        """Count one text message into daily_messages (+ refresh group title)."""
         try:
             cursor = self.connection.cursor()
             cursor.execute("""
-                SELECT COUNT(*) + 1 as rank
-                FROM user_chat_level
-                WHERE chat_id = ? AND (level > ? OR (level = ? AND xp > ?))
-            """, (chat_id,
-                  *self._get_chat_level_tuple(chat_id, user_id)))
-            row = cursor.fetchone()
-            return row[0] if row else 1
+                INSERT INTO daily_messages (chat_id, user_id, date, messages)
+                VALUES (?, ?, ?, 1)
+                ON CONFLICT(chat_id, user_id, date)
+                DO UPDATE SET messages = messages + 1
+            """, (chat_id, user_id, date))
+            if chat_title:
+                now = datetime.now().isoformat()
+                cursor.execute(
+                    "UPDATE groups SET chat_title = ?, last_active = ? WHERE chat_id = ?",
+                    (chat_title, now, chat_id),
+                )
+                if cursor.rowcount == 0:
+                    cursor.execute("""
+                        INSERT INTO groups (chat_id, chat_title, first_seen, last_active)
+                        VALUES (?, ?, ?, ?)
+                    """, (chat_id, chat_title, now, now))
+            self.connection.commit()
+            return True
         except sqlite3.Error as e:
-            return 1
+            logger.error(f"Error counting message: {e}")
+            return False
 
-    def _get_chat_level_tuple(self, chat_id: int, user_id: int):
-        data = self.get_chat_level(chat_id, user_id)
-        return (data.get("level", 1), data.get("level", 1), data.get("xp", 0))
-
-    def get_total_chat_members(self, chat_id: int) -> int:
+    def get_chat_top(self, chat_id: int, since: Optional[str] = None,
+                     limit: int = 10) -> List[Dict[str, Any]]:
+        """Top senders in one chat (since = inclusive ISO lower bound)."""
         try:
             cursor = self.connection.cursor()
-            cursor.execute("SELECT COUNT(*) FROM user_chat_level WHERE chat_id = ?", (chat_id,))
-            return cursor.fetchone()[0]
+            if since is None:
+                where, params = "WHERE dm.chat_id = ?", [chat_id]
+            else:
+                where, params = "WHERE dm.chat_id = ? AND dm.date >= ?", \
+                    [chat_id, since]
+            cursor.execute(f"""
+                SELECT dm.user_id,
+                       SUM(dm.messages) AS total_messages,
+                       u.username, u.first_name, u.last_name
+                FROM daily_messages dm
+                LEFT JOIN users u ON u.user_id = dm.user_id
+                {where}
+                GROUP BY dm.user_id
+                ORDER BY total_messages DESC, dm.user_id ASC
+                LIMIT ?
+            """, (*params, limit))
+            return [dict(row) for row in cursor.fetchall()]
         except sqlite3.Error as e:
+            logger.error(f"Error ranking chat: {e}")
+            return []
+
+    def get_chat_message_total(self, chat_id: int,
+                               since: Optional[str] = None) -> int:
+        """Total messages in a chat (all senders, same window as get_chat_top)."""
+        try:
+            cursor = self.connection.cursor()
+            if since is None:
+                cursor.execute(
+                    "SELECT COALESCE(SUM(messages), 0) FROM daily_messages WHERE chat_id = ?",
+                    (chat_id,),
+                )
+            else:
+                cursor.execute(
+                    "SELECT COALESCE(SUM(messages), 0) FROM daily_messages "
+                    "WHERE chat_id = ? AND date >= ?",
+                    (chat_id, since),
+                )
+            row = cursor.fetchone()
+            return int(row[0]) if row else 0
+        except sqlite3.Error as e:
+            logger.error(f"Error totalling chat: {e}")
             return 0
+
+    def get_chat_day_total(self, chat_id: int, date: str) -> int:
+        """One chat's total on one date — milestone threshold checks."""
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                "SELECT COALESCE(SUM(messages), 0) FROM daily_messages "
+                "WHERE chat_id = ? AND date = ?",
+                (chat_id, date),
+            )
+            row = cursor.fetchone()
+            return int(row[0]) if row else 0
+        except sqlite3.Error as e:
+            logger.error(f"Error totalling chat day: {e}")
+            return 0
+
+    def get_user_top_groups(self, user_id: int, since: Optional[str] = None,
+                            limit: int = 10) -> List[Dict[str, Any]]:
+        """A user's groups ranked by how much they chatted in each."""
+        try:
+            cursor = self.connection.cursor()
+            if since is None:
+                where, params = "WHERE dm.user_id = ?", [user_id]
+            else:
+                where, params = "WHERE dm.user_id = ? AND dm.date >= ?", \
+                    [user_id, since]
+            cursor.execute(f"""
+                SELECT dm.chat_id,
+                       SUM(dm.messages) AS total_messages,
+                       g.chat_title
+                FROM daily_messages dm
+                LEFT JOIN groups g ON g.chat_id = dm.chat_id
+                {where}
+                GROUP BY dm.chat_id
+                ORDER BY total_messages DESC, dm.chat_id ASC
+                LIMIT ?
+            """, (*params, limit))
+            return [dict(row) for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            logger.error(f"Error ranking user groups: {e}")
+            return []
+
+    def set_template(self, user_id: int, template: int):
+        self.update_user_level(user_id, template=template)
 
 
 # Global database instance
