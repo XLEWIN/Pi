@@ -840,5 +840,36 @@ class TestHelpEntry(unittest.TestCase):
                 self.assertIn("\u2014", line, line)
 
 
+class TestFfmpegBin(unittest.TestCase):
+    """_ffmpeg_bin resolution: PATH → FFMPEG_PATH → imageio-ffmpeg → WinGet.
+
+    The imageio-ffmpeg leg is what makes video kangs work on Railway,
+    where there is no system ffmpeg, no WinGet and no FFMPEG_PATH.
+    """
+
+    def test_imageio_fallback_when_no_system_ffmpeg(self):
+        fake = SimpleNamespace(get_ffmpeg_exe=lambda: __file__)
+        with mock.patch.dict(sys.modules, {"imageio_ffmpeg": fake}), \
+                mock.patch.object(sm.shutil, "which", return_value=None), \
+                mock.patch.dict(os.environ,
+                                {"FFMPEG_PATH": "", "LOCALAPPDATA": ""}):
+            self.assertEqual(sm._ffmpeg_bin(), __file__)
+
+    def test_none_when_no_source_available(self):
+        # sys.modules[name] = None makes the import raise ImportError,
+        # simulating a box without imageio-ffmpeg installed.
+        with mock.patch.dict(sys.modules, {"imageio_ffmpeg": None}), \
+                mock.patch.object(sm.shutil, "which", return_value=None), \
+                mock.patch.object(sm.os.path, "isdir", return_value=False), \
+                mock.patch.dict(os.environ,
+                                {"FFMPEG_PATH": "", "LOCALAPPDATA": ""}):
+            self.assertIsNone(sm._ffmpeg_bin())
+
+    def test_env_path_wins_over_imageio(self):
+        with mock.patch.object(sm.shutil, "which", return_value=None), \
+                mock.patch.dict(os.environ, {"FFMPEG_PATH": __file__}):
+            self.assertEqual(sm._ffmpeg_bin(), __file__)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -57,24 +57,37 @@ cp .env.example .env
 | `TAG_MTPROTO` | Tagging module MTProto session |
 | `MONGO_URI` | MongoDB connection string (database defaults to `pi_bot`) |
 
-### Migrating from the old SQLite database
-
-If you have legacy data in `bot_database.db`:
-
-```bash
-python scripts/migrate_sqlite_to_mongo.py --dry-run   # inspect first
-python scripts/migrate_sqlite_to_mongo.py             # then migrate
-```
-
-The script never modifies the source files (it copies db + WAL to a
-temp dir), preserves all IDs, and rewinds the ID counters. It refuses
-to write into a non-empty database unless you pass `--overwrite`.
-
 ## Run
 
 ```bash
 python main.py
 ```
+
+## Deploy on Railway
+
+The repo ships a `Procfile` (`worker: python main.py`) — the bot long-
+polls, so use a **worker** service with no port/healthcheck.
+
+1. Import the GitHub repo into Railway; it builds with Nixpacks from
+   `requirements.txt` (Python auto-detected).
+2. Add these **Service Variables** (same keys as `.env.example`; no
+   `.env` file is needed in the cloud):
+
+   | Required | Optional |
+   |----------|----------|
+   | `BOT_TOKEN` | `TELEGRAM_API_ID` + `TELEGRAM_API_HASH` + `TAG_MTPROTO=1` (MTProto tagging presence — needs a one-time authorized session; gracefully disabled otherwise) |
+   | `OWNER_ID` | `FFMPEG_PATH`, `LOCAL_BOT_API_URL`, `IG_TEMP_DIR` |
+   | `MONGO_URI` | |
+   | `BOT_USERNAME` | |
+
+3. Deploy. Startup posts a confirmation card to the log channel;
+   `/restart` (owner) re-execs the process in place via `os.execvp`.
+
+Notes: video/GIF kangs use the bundled `imageio-ffmpeg` binary — no
+system ffmpeg needed. Runtime state writes to `LOCALAPPDATA` when set,
+otherwise to the project folder (ephemeral on Railway — sessions and
+logs reset on redeploy). `/setprivacy → Disable` in BotFather is
+required for group message features.
 
 ## Tests
 
@@ -82,13 +95,14 @@ python main.py
 python -m unittest discover -s tests
 ```
 
-514 tests, no network access, no real MongoDB required (tests run
+616 tests, no network access, no real MongoDB required (tests run
 against an in-memory mongomock backend).
 
 ## Layout
 
 ```
 main.py            entry point (polling loop)
+Procfile           Railway worker start command
 bot/
   config.py        .env loading
   database.py      MongoDB layer (indexes, ID counters)
@@ -96,7 +110,6 @@ bot/
   command_handler.py  prefix-aware command wrappers
   modules/         feature modules (one file or package each)
   keyboards/       inline keyboard builders
-scripts/           one-shot utilities (SQLite → Mongo migration)
 tests/             unittest suite
 ```
 

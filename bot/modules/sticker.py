@@ -320,13 +320,23 @@ def resize_image(filename: str) -> str:
 
 
 def _ffmpeg_bin() -> Optional[str]:
-    """Locate ffmpeg: PATH → FFMPEG_PATH → WinGet's ffmpeg packages."""
+    """Locate ffmpeg: PATH → FFMPEG_PATH → imageio-ffmpeg → WinGet."""
     found = shutil.which("ffmpeg")
     if found:
         return found
     env = os.getenv("FFMPEG_PATH", "")
     if env and os.path.isfile(env):
         return env
+    # imageio-ffmpeg (moviepy dependency) ships a static ffmpeg build —
+    # this is the path that works on Railway/containers with no system
+    # ffmpeg and no WinGet.
+    try:
+        import imageio_ffmpeg
+        cand = imageio_ffmpeg.get_ffmpeg_exe()
+        if cand and os.path.isfile(cand):
+            return cand
+    except Exception:
+        pass
     base = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WinGet", "Packages")
     if os.path.isdir(base):
         for pkg in sorted(os.listdir(base)):

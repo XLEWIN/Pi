@@ -5,9 +5,6 @@ No Telethon dependency.
 """
 
 import asyncio
-import logging
-import signal
-import sys
 import traceback
 from datetime import datetime
 
@@ -19,7 +16,7 @@ from bot.config import settings
 from bot.constants import BOT_NAME, LOG_CHANNEL_ID
 from bot.loader import load_modules
 from bot.logger import logger
-from bot.database import DB_DIR, db
+from bot.database import DB_DIR
 
 
 # ── Startup log ──────────────────────────────────────────
