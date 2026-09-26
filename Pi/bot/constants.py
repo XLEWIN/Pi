@@ -263,6 +263,27 @@ HELP_MENU: list[dict] = [
         "notes": [],
     },
     {
+        "key": "stickers",
+        "icon": E.SPARKLE,
+        "title": "Stickers",
+        "sections": [
+            (None, [
+                "/kang [pack#] [emoji] — Kang a replied sticker/photo/animation into your pack",
+                "/unkang — Remove the replied sticker from your pack",
+                "/stickerinfo — Sticker details + pack link (also /stinfo)",
+                "/stickerid — Show a sticker's file ID",
+                "/getsticker — Download a static sticker as an image",
+                "/getvidsticker — Download a video sticker as MP4",
+                "/getvideo — Download a replied GIF as MP4 video",
+                "/mmf &lt;text&gt; — Memify replied image/video (; splits top/bottom)",
+            ]),
+        ],
+        "notes": [
+            "Kangs need MTProto (TAG_MTPROTO=1); GIF/video conversion needs "
+            "ffmpeg. Packs are named a&lt;#&gt;_yourid_by_&lt;bot&gt;.",
+        ],
+    },
+    {
         "key": "users",
         "icon": E.USER,
         "title": "Users & Stats",
