@@ -87,9 +87,6 @@ async def register_group_members(update: Update, context: ContextTypes.DEFAULT_T
     bot_added = any(member.id == context.bot.id for member in update.message.new_chat_members)
 
     if bot_added:
-        from html import escape
-        safe_title = escape(str(chat_title))
-
         def _db_work() -> None:
             try:
                 bot_user = context.bot_data.get("_me")
@@ -106,7 +103,6 @@ async def register_group_members(update: Update, context: ContextTypes.DEFAULT_T
             except Exception as e:
                 logger.warning(f"bot-added DB failed: {e}")
 
-        me = context.bot_data.get("username")
         # Keep identity in bot_data for background DB work.
         try:
             bot_user = await context.bot.get_me()
@@ -120,30 +116,11 @@ async def register_group_members(update: Update, context: ContextTypes.DEFAULT_T
 
         asyncio.get_running_loop().run_in_executor(None, _db_work)
 
-        log_message = (
-            f"🤖 <b>Bot added to chat</b>\n"
-            f"💬 Chat: <b>{safe_title}</b>\n"
-            f"🆔 Chat ID: <code>{chat_id}</code>"
-        )
-        asyncio.create_task(send_log(context, log_message))
+        # The #BOT_ADDED log is sent by handle_bot_membership
+        # (my_chat_member): it fires regardless of privacy mode, carries
+        # the adder identity, and also covers admin-added cases — never
+        # double-log from this service-message path.
         logger.info(f"Bot added to group {chat_title} ({chat_id})")
-
-        # Group stats are informational — fire and forget.
-        async def _stats() -> None:
-            try:
-                member_count = await asyncio.wait_for(
-                    context.bot.get_chat_member_count(chat_id), timeout=5
-                )
-                await send_log(
-                    context,
-                    f"📊 <b>Group stats</b>\n"
-                    f"💬 Chat: <b>{safe_title}</b>\n"
-                    f"👥 Members: {member_count}",
-                )
-            except Exception as e:
-                logger.warning(f"Group stats log failed: {e}")
-
-        asyncio.create_task(_stats())
 
     # Register other new members without blocking this handler.
     for member in update.message.new_chat_members:
@@ -156,6 +133,116 @@ async def register_group_members(update: Update, context: ContextTypes.DEFAULT_T
                     action=f"joined {chat_title}",
                 )
             )
+
+
+# ── #BOT_ADDED / #BOT_REMOVED — own-membership logs ─────────────
+
+
+def _chat_link(chat) -> str:
+    """t.me link for a chat: public username first, else the /c/ form."""
+    if getattr(chat, "username", None):
+        return f"https://t.me/{chat.username}"
+    cid = str(chat.id)
+    if cid.startswith("-100"):
+        return f"https://t.me/c/{cid[4:]}"
+    return "No link"
+
+
+def format_bot_log(kind: str, chat, actor, member_count: str) -> str:
+    """#BOT_ADDED / #BOT_REMOVED in the owner's exact log template.
+
+    Small-caps labels, `` : `` separators, plain HTML (fields escaped,
+    no structural emojis) — matches the requested sample line for line.
+    ``member_count`` is a pre-resolved string ("22" / "Unknown").
+    """
+    title = escape(chat.title or chat.first_name or "Unknown")
+    chat_uname = (
+        f"@{escape(chat.username)}" if getattr(chat, "username", None)
+        else "No username"
+    )
+    name = escape(actor.full_name or actor.first_name or "Unknown")
+    actor_uname = f"@{escape(actor.username)}" if actor.username else "No username"
+    link = _chat_link(chat)
+    when = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
+
+    chat_block = (
+        f"ᴄʜᴀᴛ ɴᴀᴍᴇ : {title}\n"
+        f"ᴄʜᴀᴛ ɪᴅ : {chat.id}\n"
+        f"ᴄʜᴀᴛ ᴜsᴇʀɴᴀᴍᴇ : {chat_uname}\n"
+        f"ɢʀᴏᴜᴘ ᴍᴇᴍʙᴇʀs : {member_count}\n"
+    )
+    tail = (
+        f"ᴄʜᴀᴛ ʟɪɴᴋ : {link}\n"
+        f"ᴛɪᴍᴇ : {when}"
+    )
+
+    if kind == "added":
+        actor_block = (
+            f"ᴀᴅᴅᴇᴅ ʙʏ : {name}\n"
+            f"ᴀᴅᴅᴇʀ ᴜsᴇʀɴᴀᴍᴇ : {actor_uname}\n"
+            f"ᴀᴅᴅᴇʀ ɪᴅ : {actor.id}\n"
+        )
+        header = "#BOT_ADDED"
+    else:
+        actor_block = (
+            f"ʀᴇᴍᴏᴠᴇᴅ ʙʏ : {name}\n"
+            f"ʀᴇᴍᴏᴠᴇʀ ᴜsᴇʀɴᴀᴍᴇ : {actor_uname}\n"
+            f"ʀᴇᴍᴏᴠᴇʀ ɪᴅ : {actor.id}\n"
+        )
+        header = "#BOT_REMOVED"
+
+    return f"{header}\n\n{chat_block}\n{actor_block}\n{tail}"
+
+
+async def handle_bot_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send #BOT_ADDED / #BOT_REMOVED when THIS bot's status changes.
+
+    my_chat_member is the authoritative signal: it fires regardless of
+    privacy mode, carries the actor identity, and still reaches the bot
+    when it is removed (no service message can reach a removed bot).
+    Promotions/demotions are ignored — only real add/remove transitions.
+    """
+    if not update.my_chat_member:
+        return
+    cmu = update.my_chat_member
+    old = cmu.old_chat_member.status
+    new = cmu.new_chat_member.status
+    added = old in (ChatMember.LEFT, ChatMember.BANNED) and new in (
+        ChatMember.MEMBER, ChatMember.ADMINISTRATOR,
+    )
+    removed = new in (ChatMember.LEFT, ChatMember.BANNED) and old not in (
+        ChatMember.LEFT, ChatMember.BANNED,
+    )
+    if not (added or removed):
+        return  # promote/demote/restrict — not an add/remove event
+
+    actor = cmu.from_user
+    if actor is None:
+        logger.warning("my_chat_member without actor — bot log skipped")
+        return
+
+    chat = update.effective_chat
+    if added:
+        try:
+            n = await asyncio.wait_for(
+                context.bot.get_chat_member_count(chat.id), timeout=5
+            )
+            member_count = f"{n:,}"
+        except Exception:
+            member_count = "Unknown"
+    else:
+        member_count = "Unknown"  # bot is out — the count is unreachable
+
+    asyncio.create_task(
+        send_log(
+            context,
+            format_bot_log("added" if added else "removed", chat, actor, member_count),
+        )
+    )
+    logger.info(
+        f"Bot {'added to' if added else 'removed from'} "
+        f"{chat.title or chat.first_name or chat.id}"
+    )
 
 
 async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -550,6 +637,12 @@ def setup(app: Application) -> list[str]:
     # Track chat member updates (for privacy mode)
     app.add_handler(ChatMemberHandler(handle_new_member, ChatMemberHandler.CHAT_MEMBER))
 
+    # Own membership — #BOT_ADDED / #BOT_REMOVED logs. Different update
+    # type from CHAT_MEMBER above, so group 0 is fine.
+    app.add_handler(
+        ChatMemberHandler(handle_bot_membership, ChatMemberHandler.MY_CHAT_MEMBER)
+    )
+
     # Track all messages to register active users. Own group (19): PTB
     # runs max ONE handler per group — in group 0 it was shadowed by
     # antispam/chatstats for every plain group message.
@@ -569,6 +662,7 @@ def setup(app: Application) -> list[str]:
     handlers.extend([
         "new_chat_members tracker",
         "chat_member handler",
+        "bot add/remove logs",
         "message tracker",
         "/userstats",
         "/myinfo",

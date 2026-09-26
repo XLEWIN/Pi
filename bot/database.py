@@ -842,6 +842,68 @@ class Database:
             logger.error(f"Error getting group count: {e}")
             return 0
 
+    def get_all_groups(self) -> List[Dict[str, Any]]:
+        """All tracked groups — ``chat_id`` + ``chat_title`` (``/mychats``)."""
+        try:
+            return list(
+                self._mongo["groups"]
+                .find({}, {"_id": 0, "chat_id": 1, "chat_title": 1})
+                .sort("chat_title", 1)
+            )
+        except Exception as e:
+            logger.error(f"Error listing groups: {e}")
+            return []
+
+    # ── /bstats counters ──────────────────────────────────────────
+
+    def count_filters(self) -> int:
+        """Total filter triggers across all chats (``/bstats``)."""
+        try:
+            return self._mongo["filters"].count_documents({})
+        except Exception as e:
+            logger.error(f"Error counting filters: {e}")
+            return 0
+
+    def count_gmuted(self) -> int:
+        """Globally muted users (``/bstats``) — 0 until gmute ships."""
+        try:
+            return self._mongo["gmuted_users"].count_documents({})
+        except Exception as e:
+            logger.error(f"Error counting gmuted users: {e}")
+            return 0
+
+    def get_lock_stats(self) -> Tuple[int, int]:
+        """``(chats_with_locks, total_locks)`` for ``/bstats``.
+
+        Reads the ``locks`` collection (``{chat_id, lock_type}``);
+        returns ``(0, 0)`` until a locks feature creates it.
+        """
+        try:
+            total = self._mongo["locks"].count_documents({})
+            chats = len(self._mongo["locks"].distinct("chat_id"))
+            return chats, total
+        except Exception as e:
+            logger.error(f"Error getting lock stats: {e}")
+            return 0, 0
+
+    # ── /broadcast targets ────────────────────────────────────────
+
+    def get_all_chat_ids(self) -> List[int]:
+        """Every tracked chat id — broadcast group targets."""
+        try:
+            return list(self._mongo["groups"].distinct("chat_id"))
+        except Exception as e:
+            logger.error(f"Error listing chat ids: {e}")
+            return []
+
+    def get_all_user_ids(self) -> List[int]:
+        """Every non-bot user id — broadcast user targets."""
+        try:
+            return list(self._mongo["users"].distinct("user_id", {"is_bot": 0}))
+        except Exception as e:
+            logger.error(f"Error listing user ids: {e}")
+            return []
+
     def count_user_groups(self, user_id: int) -> int:
         """Number of tracked groups a user is a member of."""
         try:

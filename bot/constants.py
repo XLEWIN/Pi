@@ -1,8 +1,15 @@
 """Bot-wide constants: texts, URLs and callback data."""
 
+import time
+
 from bot.emojis import E
 
 BOT_NAME = "Phi π"
+
+# ── Process start ────────────────────────────────────────────────
+# First import ≈ process launch — powers /bstats and /ping uptime
+# ("Uptime" / "Started At").
+BOT_START_TIME = time.time()
 
 # ── Logging group ────────────────────────────────────────────────
 # The log GC where joins/leaves, warnings, errors and kang sources
@@ -53,6 +60,9 @@ HELP_MENU: list[dict] = [
                 "/help — Show this help menu",
                 "/testcolors — Preview colored buttons (groups)",
                 "/restart — Restart the bot (owner)",
+                "/mychats — List chats where I'm admin (owner)",
+                "/bstats — Bot stats: DB, locks, uptime (owner)",
+                "/ping — API latency + uptime",
                 "/free @user — Clear spam warnings &amp; block (sudo)",
             ]),
         ],
@@ -142,6 +152,7 @@ HELP_MENU: list[dict] = [
                 "/addsudo @user — Add sudo user (owner)",
                 "/rmsudo @user — Remove sudo user (owner)",
                 "/sudolist — List sudo users (owner)",
+                "/broadcast -user|-chat|-pin — Forward a reply everywhere (owner)",
             ]),
         ],
         "notes": [],
