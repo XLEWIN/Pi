@@ -13,14 +13,12 @@ from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 from telegram.constants import ParseMode
 
 from bot.command_handler import CommandHandler
-from bot.constants import BOT_DESCRIPTION, START_TEXT, URL_ADD_TO_GROUP, URL_OFFICIAL_CHANNEL, URL_NETWORK
+from bot.constants import BOT_DESCRIPTION, LOG_CHANNEL_ID, START_TEXT, URL_ADD_TO_GROUP, URL_OFFICIAL_CHANNEL, URL_NETWORK
 from bot.database import db
 from bot.emojis import E
 from bot.keyboards.colored import btn_primary, btn_success, btn_url, build_keyboard
 from bot.logger import logger
 
-# Log channel configuration
-LOG_CHANNEL_ID = -1003845687680
 # Background only — never on the reply path. Generous so slow routes still land.
 LOG_TIMEOUT_SECONDS = 10
 # Hot-path reply: fail fast if the network is dead, but allow one real RTT.

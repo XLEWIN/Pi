@@ -91,8 +91,7 @@ def tearDownModule():
     """Remove all rows this suite created (temp DB is deleted at exit)."""
     for chat in (CHAT, OTHER_CHAT):
         for table in ("tag_settings", "tag_members", "tag_activity", "tag_sessions"):
-            tdb._conn.execute(f"DELETE FROM {table} WHERE chat_id=?", (chat,))
-    tdb._conn.commit()
+            tdb._db.collection(table).delete_many({"chat_id": chat})
 
 
 class _DbCleanupMixin:
@@ -100,8 +99,7 @@ class _DbCleanupMixin:
         sess_mod.reset()
         activity_tracker.reset()
         for table in ("tag_settings", "tag_members", "tag_activity", "tag_sessions"):
-            tdb._conn.execute(f"DELETE FROM {table} WHERE chat_id=?", (CHAT,))
-        tdb._conn.commit()
+            tdb._db.collection(table).delete_many({"chat_id": CHAT})
         await super().asyncTearDown()
 
 
@@ -284,8 +282,7 @@ class TestSpecStrings(unittest.TestCase):
 class TestDatabase(unittest.TestCase):
     def setUp(self):
         for table in ("tag_members", "tag_activity", "tag_sessions", "tag_settings"):
-            tdb._conn.execute(f"DELETE FROM {table} WHERE chat_id=?", (CHAT,))
-        tdb._conn.commit()
+            tdb._db.collection(table).delete_many({"chat_id": CHAT})
 
     def test_upsert_dedups(self):
         tdb.upsert_member(CHAT, 101, display_name="A", seen_at=1000.0)
@@ -313,11 +310,10 @@ class TestDatabase(unittest.TestCase):
     def test_activity_flush(self):
         tdb.flush_activity([(CHAT, 501, 3, 5000.0)])
         tdb.flush_activity([(CHAT, 501, 2, 6000.0)])
-        row = tdb._conn.execute(
-            "SELECT message_count, last_message_at FROM tag_activity "
-            "WHERE chat_id=? AND user_id=?",
-            (CHAT, 501),
-        ).fetchone()
+        row = tdb._db.collection("tag_activity").find_one(
+            {"chat_id": CHAT, "user_id": 501},
+            {"message_count": 1, "last_message_at": 1, "_id": 0},
+        )
         self.assertEqual(row["message_count"], 5)
         self.assertEqual(row["last_message_at"], 6000.0)
 
@@ -365,24 +361,31 @@ class TestSeedFromHistory(unittest.TestCase):
         self._wipe()
 
     def _wipe(self):
-        c = tdb._conn
-        c.execute("DELETE FROM user_activity WHERE chat_id=?", (CHAT,))
-        c.execute("DELETE FROM daily_messages WHERE chat_id=?", (CHAT,))
-        c.execute("DELETE FROM group_members WHERE chat_id=?", (CHAT,))
-        c.execute(
-            "DELETE FROM users WHERE user_id IN (?, ?, ?)",
-            (self.UID, self.UID2, self.UID_BOT),
+        c = tdb._db
+        c.collection("user_activity").delete_many({"chat_id": CHAT})
+        c.collection("daily_messages").delete_many({"chat_id": CHAT})
+        c.collection("group_members").delete_many({"chat_id": CHAT})
+        c.collection("users").delete_many(
+            {"user_id": {"$in": [self.UID, self.UID2, self.UID_BOT]}}
         )
-        c.execute("DELETE FROM tag_members WHERE chat_id=?", (CHAT,))
-        c.commit()
+        c.collection("tag_members").delete_many({"chat_id": CHAT})
 
     def _insert_user(self, uid, first, last=None, username=None, bot=0):
-        tdb._conn.execute(
-            "INSERT INTO users (user_id, username, first_name, last_name, is_bot) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (uid, username, first, last, bot),
+        tdb._db.collection("users").insert_one(
+            {
+                "user_id": uid,
+                "username": username,
+                "first_name": first,
+                "last_name": last,
+                "is_bot": bot,
+                "first_seen": tdb._db._now(),
+                "last_seen": tdb._db._now(),
+                "total_messages": 0,
+                "warnings": 0,
+                "is_banned": 0,
+                "is_muted": 0,
+            }
         )
-        tdb._conn.commit()
 
     @staticmethod
     def _utc(text: str) -> float:
@@ -396,12 +399,17 @@ class TestSeedFromHistory(unittest.TestCase):
 
     def test_seeds_activity_with_identity(self):
         self._insert_user(self.UID, "Alice", "Smith", username="alice")
-        tdb._conn.execute(
-            "INSERT INTO user_activity (user_id, action, chat_id, timestamp) "
-            "VALUES (?, 'sent message', ?, '2026-09-24 18:22:01')",
-            (self.UID, CHAT),
+        tdb._db.collection("user_activity").insert_one(
+            {
+                "id": tdb._db._next_id("user_activity"),
+                "user_id": self.UID,
+                "action": "sent message",
+                "chat_id": CHAT,
+                "chat_title": None,
+                "timestamp": "2026-09-24 18:22:01",
+                "details": None,
+            }
         )
-        tdb._conn.commit()
         self.assertEqual(tdb.seed_from_history(CHAT), 1)
         rows = tdb.fetch_members(CHAT)
         self.assertEqual(len(rows), 1)
@@ -416,12 +424,14 @@ class TestSeedFromHistory(unittest.TestCase):
 
     def test_daily_date_parses_local_midnight(self):
         self._insert_user(self.UID2, "Bob")
-        tdb._conn.execute(
-            "INSERT INTO daily_messages (chat_id, user_id, date, messages) "
-            "VALUES (?, ?, '2026-09-24', 10)",
-            (CHAT, self.UID2),
+        tdb._db.collection("daily_messages").insert_one(
+            {
+                "chat_id": CHAT,
+                "user_id": self.UID2,
+                "date": "2026-09-24",
+                "messages": 10,
+            }
         )
-        tdb._conn.commit()
         self.assertEqual(tdb.seed_from_history(CHAT), 1)
         row = tdb.fetch_members(CHAT)[0]
         expected = datetime(2026, 9, 24).timestamp()  # local midnight
@@ -430,17 +440,25 @@ class TestSeedFromHistory(unittest.TestCase):
     def test_merges_sources_newest_wins_and_idempotent(self):
         # Older daily rollup must lose to the newer activity row.
         self._insert_user(self.UID, "Alice")
-        tdb._conn.execute(
-            "INSERT INTO daily_messages (chat_id, user_id, date, messages) "
-            "VALUES (?, ?, '2026-01-05', 4)",
-            (CHAT, self.UID),
+        tdb._db.collection("daily_messages").insert_one(
+            {
+                "chat_id": CHAT,
+                "user_id": self.UID,
+                "date": "2026-01-05",
+                "messages": 4,
+            }
         )
-        tdb._conn.execute(
-            "INSERT INTO user_activity (user_id, action, chat_id, timestamp) "
-            "VALUES (?, 'sent message', ?, '2026-09-24 18:22:01')",
-            (self.UID, CHAT),
+        tdb._db.collection("user_activity").insert_one(
+            {
+                "id": tdb._db._next_id("user_activity"),
+                "user_id": self.UID,
+                "action": "sent message",
+                "chat_id": CHAT,
+                "chat_title": None,
+                "timestamp": "2026-09-24 18:22:01",
+                "details": None,
+            }
         )
-        tdb._conn.commit()
         self.assertEqual(tdb.seed_from_history(CHAT), 1)
         first = tdb.fetch_members(CHAT)[0]
         # Second run must not change anything (MAX semantics).
@@ -463,12 +481,17 @@ class TestSeedFromHistory(unittest.TestCase):
                           seen_at=now, active_at=now)
         tdb.mark_leave(CHAT, self.UID2)
         for uid in (self.UID, self.UID2):
-            tdb._conn.execute(
-                "INSERT INTO user_activity (user_id, action, chat_id, timestamp) "
-                "VALUES (?, 'sent message', ?, '2020-01-01 00:00:00')",
-                (uid, CHAT),
+            tdb._db.collection("user_activity").insert_one(
+                {
+                    "id": tdb._db._next_id("user_activity"),
+                    "user_id": uid,
+                    "action": "sent message",
+                    "chat_id": CHAT,
+                    "chat_title": None,
+                    "timestamp": "2020-01-01 00:00:00",
+                    "details": None,
+                }
             )
-        tdb._conn.commit()
 
         tdb.seed_from_history(CHAT)
 
@@ -476,29 +499,38 @@ class TestSeedFromHistory(unittest.TestCase):
         self.assertIn(self.UID, rows)  # fresh row untouched
         self.assertAlmostEqual(rows[self.UID]["last_active_at"], now, places=1)
         self.assertNotIn(self.UID2, rows)  # still excluded via left_at
-        left = tdb._conn.execute(
-            "SELECT left_at FROM tag_members WHERE chat_id=? AND user_id=?",
-            (CHAT, self.UID2),
-        ).fetchone()
+        left = tdb._db.collection("tag_members").find_one(
+            {"chat_id": CHAT, "user_id": self.UID2},
+            {"left_at": 1, "_id": 0},
+        )
         self.assertIsNotNone(left["left_at"])
 
     def test_bot_flags_from_users_and_group_members(self):
         self._insert_user(self.UID_BOT, "PiBot", bot=1)
         self._insert_user(self.UID, "Carol")
-        tdb._conn.execute(
-            "INSERT INTO group_members (chat_id, user_id, role, joined_at) "
-            "VALUES (?, ?, 'member', '2026-09-20 10:00:00'), "
-            "(?, ?, 'bot', '2026-09-20 10:00:00')",
-            (CHAT, self.UID, CHAT, self.UID_BOT),
+        tdb._db.collection("group_members").insert_many(
+            [
+                {
+                    "chat_id": CHAT,
+                    "user_id": self.UID,
+                    "role": "member",
+                    "joined_at": "2026-09-20 10:00:00",
+                },
+                {
+                    "chat_id": CHAT,
+                    "user_id": self.UID_BOT,
+                    "role": "bot",
+                    "joined_at": "2026-09-20 10:00:00",
+                },
+            ]
         )
-        tdb._conn.commit()
         self.assertEqual(tdb.seed_from_history(CHAT), 2)
         flags = {
             r["user_id"]: bool(r["is_bot"])
-            for r in tdb._conn.execute(
-                "SELECT user_id, is_bot FROM tag_members WHERE chat_id=?",
-                (CHAT,),
-            ).fetchall()
+            for r in tdb._db.collection("tag_members").find(
+                {"chat_id": CHAT},
+                {"user_id": 1, "is_bot": 1, "_id": 0},
+            )
         }
         self.assertTrue(flags[self.UID_BOT])
         self.assertFalse(flags[self.UID])
@@ -527,8 +559,7 @@ class TestSeedFromHistory(unittest.TestCase):
 
 class TestSettings(unittest.TestCase):
     def tearDown(self):
-        tdb._conn.execute("DELETE FROM tag_settings WHERE chat_id=?", (CHAT,))
-        tdb._conn.commit()
+        tdb._db.collection("tag_settings").delete_many({"chat_id": CHAT})
 
     def test_defaults(self):
         st = settings_mod.get(CHAT)
@@ -736,11 +767,9 @@ class TestPresence(unittest.IsolatedAsyncioTestCase):
             await prov._refresh_once()          # no AttributeError
             self.assertIn(CHAT, synced)          # registry chat was visited
         finally:
-            tdb._conn.execute(
-                "DELETE FROM tag_members WHERE chat_id=? AND user_id=?",
-                (CHAT, 424242),
+            tdb._db.collection("tag_members").delete_one(
+                {"chat_id": CHAT, "user_id": 424242}
             )
-            tdb._conn.commit()
 
 
 class _StubPresence:
@@ -760,8 +789,7 @@ class _StubPresence:
 class TestAssembly(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
     async def _seed(self):
         now = time.time()
-        tdb._conn.execute("DELETE FROM tag_members WHERE chat_id=?", (CHAT,))
-        tdb._conn.commit()
+        tdb._db.collection("tag_members").delete_many({"chat_id": CHAT})
         # active member (1h ago)
         tdb.upsert_member(CHAT, 201, display_name="active",
                           seen_at=now - 3600, active_at=now - 3600)
@@ -989,10 +1017,10 @@ class TestObservers(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(activity_tracker.pending(), 1)
         flushed = activity_tracker.flush_now()
         self.assertEqual(flushed, 1)
-        row = tdb._conn.execute(
-            "SELECT user_id FROM tag_members WHERE chat_id=? AND user_id=?",
-            (CHAT, 777),
-        ).fetchone()
+        row = tdb._db.collection("tag_members").find_one(
+            {"chat_id": CHAT, "user_id": 777},
+            {"_id": 0},
+        )
         self.assertIsNotNone(row)
 
     async def test_anonymous_sender_ignored(self):

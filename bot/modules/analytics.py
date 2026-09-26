@@ -155,13 +155,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from datetime import date, timedelta as td
     start = (date.today() - td(days=days - 1)).isoformat()
     try:
-        cursor = db.connection.cursor()
-        cursor.execute(
-            "SELECT COALESCE(SUM(messages),0) FROM daily_messages "
-            "WHERE chat_id = ? AND date >= ?",
-            (chat_id, start),
-        )
-        msg_sum = int(cursor.fetchone()[0] or 0)
+        msg_sum = db.sum_daily_messages(chat_id, start)
     except Exception:
         msg_sum = stats.get("messages", 0)
 
@@ -173,13 +167,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if days >= 1:
         prev_start = (date.today() - td(days=days * 2 - 1)).isoformat()
         try:
-            cursor = db.connection.cursor()
-            cursor.execute(
-                "SELECT COALESCE(SUM(messages),0) FROM daily_messages "
-                "WHERE chat_id = ? AND date >= ? AND date < ?",
-                (chat_id, prev_start, start),
-            )
-            prev = int(cursor.fetchone()[0] or 0)
+            prev = db.sum_daily_messages(chat_id, prev_start, start)
             if prev > 0:
                 delta = msg_sum - prev
                 pct = int(abs(delta) / prev * 100)

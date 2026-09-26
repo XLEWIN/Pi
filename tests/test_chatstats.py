@@ -166,20 +166,14 @@ def _real_update(text: str, chat_id: int = CHAT_A,
 
 def _seed(chat_id: int, user_id: int, n: int, day: str = TODAY) -> None:
     """Insert n messages straight into daily_messages."""
-    db.connection.execute(
-        """
-        INSERT INTO daily_messages (chat_id, user_id, date, messages)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(chat_id, user_id, date)
-        DO UPDATE SET messages = messages + excluded.messages
-        """,
-        (chat_id, user_id, day, n),
+    db.collection("daily_messages").update_one(
+        {"chat_id": chat_id, "user_id": user_id, "date": day},
+        {"$inc": {"messages": n}},
+        upsert=True,
     )
-    db.connection.commit()
 
 
 def _cleanup() -> None:
-    conn = db.connection
     for tbl, col, ids in (
         ("daily_messages", "chat_id", (CHAT_A, CHAT_B, CHAT_C)),
         ("daily_messages", "user_id", (*USERS, NEW_USER)),
@@ -189,12 +183,7 @@ def _cleanup() -> None:
         ("users", "user_id", (*USERS, NEW_USER)),
         ("spam_protection", "user_id", (*USERS, NEW_USER)),
     ):
-        conn.execute(
-            f"DELETE FROM {tbl} WHERE {col} IN "
-            f"({','.join('?' * len(ids))})",
-            ids,
-        )
-    conn.commit()
+        db.collection(tbl).delete_many({col: {"$in": list(ids)}})
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -228,24 +217,23 @@ class TestCountMessage(_DBTest):
 
     def test_group_title_insert_and_refresh(self):
         db.count_message(CHAT_A, USER_1, TODAY, "Old Title")
-        row = db.connection.execute(
-            "SELECT chat_title FROM groups WHERE chat_id = ?", (CHAT_A,)
-        ).fetchone()
-        self.assertEqual(row[0], "Old Title")
+        row = db.collection("groups").find_one(
+            {"chat_id": CHAT_A}, {"chat_title": 1, "_id": 0}
+        )
+        self.assertEqual(row["chat_title"], "Old Title")
         db.count_message(CHAT_A, USER_1, TODAY, "New Title")
-        row = db.connection.execute(
-            "SELECT chat_title FROM groups WHERE chat_id = ?", (CHAT_A,)
-        ).fetchone()
-        self.assertEqual(row[0], "New Title")
+        row = db.collection("groups").find_one(
+            {"chat_id": CHAT_A}, {"chat_title": 1, "_id": 0}
+        )
+        self.assertEqual(row["chat_title"], "New Title")
 
 
 class TestAddMessageXpNoDoubleCount(_DBTest):
     def test_add_message_xp_no_longer_touches_daily_messages(self):
         db.add_message_xp(USER_1, CHAT_A)
-        n = db.connection.execute(
-            "SELECT COUNT(*) FROM daily_messages WHERE chat_id = ? AND user_id = ?",
-            (CHAT_A, USER_1),
-        ).fetchone()[0]
+        n = db.collection("daily_messages").count_documents(
+            {"chat_id": CHAT_A, "user_id": USER_1}
+        )
         self.assertEqual(n, 0, "XP cooldown path must not write daily_messages")
 
 
@@ -348,12 +336,10 @@ class TestCountHandler(unittest.IsolatedAsyncioTestCase):
         # …but the sender is still auto-registered (registration ≠ counting)
         self.assertIsNotNone(db.get_user(USER_1))
         # once the block is gone, counting resumes
-        db.connection.execute(
-            "UPDATE spam_protection SET blocked_until = '2000-01-01T00:00:00+00:00' "
-            "WHERE user_id = ?",
-            (USER_1,),
+        db.collection("spam_protection").update_one(
+            {"user_id": USER_1},
+            {"$set": {"blocked_until": "2000-01-01T00:00:00+00:00"}},
         )
-        db.connection.commit()
         await cs.count_message(_update("back"), None)
         self.assertEqual(db.get_chat_top(CHAT_A)[0]["total_messages"], 1)
 
@@ -420,10 +406,10 @@ class TestNewUserRegistration(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(db.get_user(NEW_USER))
         self.assertEqual(db.get_chat_top(CHAT_A)[0]["user_id"], NEW_USER)
         # group-members cache touched
-        row = db.connection.execute(
-            "SELECT role FROM group_members WHERE chat_id = ? AND user_id = ?",
-            (CHAT_A, NEW_USER),
-        ).fetchone()
+        row = db.collection("group_members").find_one(
+            {"chat_id": CHAT_A, "user_id": NEW_USER},
+            {"role": 1, "_id": 0},
+        )
         self.assertIsNotNone(row, "sender must be cached for this group")
         # one-time #Newuser log with (context, user, chat_title)
         log.assert_called_once()

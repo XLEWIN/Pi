@@ -140,6 +140,7 @@ class TestDispatch(unittest.TestCase):
         fired = self._fired(_make_update("hello there"))
         keys = [_key(h) for h in fired]
         for expected in (
+            "bot.modules.adminbox.adminbox_message",
             "bot.modules.antispam.flood_watch",
             "bot.modules.chatstats.count_message",
             "bot.modules.users.track_message",
@@ -164,6 +165,7 @@ class TestDispatch(unittest.TestCase):
 
     def test_pipelines_use_distinct_groups(self):
         want = {
+            "bot.modules.adminbox.adminbox_message",
             "bot.modules.antispam.flood_watch",
             "bot.modules.chatstats.count_message",
             "bot.modules.users.track_message",

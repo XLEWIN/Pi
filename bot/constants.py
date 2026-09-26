@@ -4,6 +4,13 @@ from bot.emojis import E
 
 BOT_NAME = "Phi π"
 
+# ── Logging group ────────────────────────────────────────────────
+# The log GC where joins/leaves, warnings, errors and kang sources
+# are posted. The bot must be admin here (delete + send permissions).
+# Single source of truth — main.py, modules/start.py and
+# modules/sticker.py all import this; never re-hardcode it.
+LOG_CHANNEL_ID = -1003884436085
+
 # ── Rank progression ─────────────────────────────────────────────
 # The ONE definition of the message ladder. Every rank surface
 # (/rank, /rankings, /mytop, /nextlevel, /leaderboard, /profile,
@@ -107,6 +114,7 @@ HELP_MENU: list[dict] = [
         "title": "Admin",
         "sections": [
             (None, [
+                "/adminbox — Inline admin panel (groups)",
                 "/promote @user — Promote to admin",
                 "/demote @user — Demote an admin",
                 "/pin — Pin a message",

@@ -69,16 +69,14 @@ def setUpModule():
 def tearDownModule():
     """Remove all rows this suite created (temp DB is deleted at exit)."""
     for table in ("tag_settings", "tag_members", "tag_activity", "tag_sessions"):
-        tdb._conn.execute(f"DELETE FROM {table} WHERE chat_id=?", (CHAT,))
-    tdb._conn.commit()
+        tdb._db.collection(table).delete_many({"chat_id": CHAT})
 
 
 class _DbCleanupMixin:
     async def asyncTearDown(self):
         sess_mod.reset()
         for table in ("tag_settings", "tag_members", "tag_activity", "tag_sessions"):
-            tdb._conn.execute(f"DELETE FROM {table} WHERE chat_id=?", (CHAT,))
-        tdb._conn.commit()
+            tdb._db.collection(table).delete_many({"chat_id": CHAT})
         await super().asyncTearDown()
 
 

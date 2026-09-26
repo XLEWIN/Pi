@@ -216,3 +216,23 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ── Pi Bot project specifics ─────────────────────────────────────
+# Secrets / local config
+.env
+
+# SQLite databases (pre-migration; Mongo is remote)
+*.db
+*.db-wal
+*.db-shm
+
+# Telethon session files (contain auth keys — never commit)
+*.session
+*.session-journal
+*.session-shm
+*.session-wal
+
+# Local run artifacts
+_o.txt
+_e.txt
+temp_profiles/

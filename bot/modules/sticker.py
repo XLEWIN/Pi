@@ -80,14 +80,15 @@ from telethon.tl.types import (
 
 from bot.command_handler import CommandHandler, parse_command
 from bot.config import settings
+from bot.constants import LOG_CHANNEL_ID
 from bot.emojis import E, EID
 from bot.keyboards.colored import btn_url, build_keyboard
 from bot.logger import logger
 from bot.responses import action_card, field_extra, plain_error
 
-#: Log channel (same as main.py) — kang sources land here to mint an
-#: InputDocument; the log message is deleted right after the pack op.
-LOG_CHANNEL_ID = -1003845687680
+#: Log GC (from bot.constants, same as main.py) — kang sources land
+#: here to mint an InputDocument; the log message is deleted right
+#: after the pack op.
 
 #: Sticker emoji used when neither the sticker nor the command gives one.
 DEFAULT_EMOJI = "\u2714\ufe0f"  # ✔️ (boabot's default)

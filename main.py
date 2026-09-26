@@ -16,14 +16,13 @@ from telegram.error import NetworkError
 from telegram.ext import Application, ContextTypes
 
 from bot.config import settings
-from bot.constants import BOT_NAME
+from bot.constants import BOT_NAME, LOG_CHANNEL_ID
 from bot.loader import load_modules
 from bot.logger import logger
 from bot.database import DB_DIR, db
 
 
 # ── Startup log ──────────────────────────────────────────
-LOG_CHANNEL_ID = -1003845687680  # Pi_Logs
 HANDLER_ERRORS_FILE = DB_DIR / "handler_errors.log"
 
 

@@ -59,20 +59,15 @@ U1, U2, U3 = 99777001, 99777002, 99777003
 # ── Scaffolding ───────────────────────────────────────────────────
 
 def _cleanup() -> None:
-    # Refuse to touch anything but a temp-dir DB. In a shared discover
-    # run another test file may have imported bot.database first (its
-    # mkdtemp dir wins) — that is still a throwaway copy, including the
-    # one-time legacy migration. The live DB (%LOCALAPPDATA%\PiBot) and
-    # the project-folder legacy DB must never be wiped.
-    db_path = str(db.db_path)
-    assert (
-        db_path.startswith(tempfile.gettempdir())
-        and not db_path.startswith(str(ROOT))
-    ), f"refusing to clean non-test DB: {db_path}"
-    conn = db.connection
+    # Refuse to touch anything but the in-memory test backend. Test
+    # runs always select mongomock (unittest is imported before
+    # bot.database), so a live cluster can never be wiped from here.
+    assert "mongomock" in db.backend, (
+        f"refusing to clean non-test DB: {db.backend}"
+    )
     # Whole-table wipe: global ranks/members count EVERY user, so
     # per-id deletes can't isolate the assertions.
-    conn.execute("DELETE FROM daily_messages")
+    db.collection("daily_messages").delete_many({})
     for tbl, col, ids in (
         ("groups", "chat_id", (CHAT, CHAT2)),
         ("group_members", "chat_id", (CHAT, CHAT2)),
@@ -82,25 +77,16 @@ def _cleanup() -> None:
         ("user_level", "user_id", (U1, U2, U3)),
         ("user_chat_level", "chat_id", (CHAT, CHAT2)),
     ):
-        conn.execute(
-            f"DELETE FROM {tbl} WHERE {col} IN ({','.join('?' * len(ids))})",
-            ids,
-        )
-    conn.commit()
+        db.collection(tbl).delete_many({col: {"$in": list(ids)}})
 
 
 def _seed(chat_id: int, user_id: int, n: int, day: str = TODAY) -> None:
     """Insert n messages straight into daily_messages."""
-    db.connection.execute(
-        """
-        INSERT INTO daily_messages (chat_id, user_id, date, messages)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(chat_id, user_id, date)
-        DO UPDATE SET messages = ?
-        """,
-        (chat_id, user_id, day, n, n),
+    db.collection("daily_messages").update_one(
+        {"chat_id": chat_id, "user_id": user_id, "date": day},
+        {"$set": {"messages": n}},
+        upsert=True,
     )
-    db.connection.commit()
 
 
 class _Msg:
@@ -290,14 +276,10 @@ class TestXpPath(_Base):
         result = db.add_message_xp(U1, CHAT)
         self.assertEqual(result, (0, 0, False))
 
-        n = db.connection.execute(
-            "SELECT COUNT(*) FROM daily_messages WHERE user_id = ?", (U1,)
-        ).fetchone()[0]
+        n = db.collection("daily_messages").count_documents({"user_id": U1})
         self.assertEqual(n, 0, "XP path must not count messages")
 
-        n = db.connection.execute(
-            "SELECT COUNT(*) FROM user_chat_level WHERE user_id = ?", (U1,)
-        ).fetchone()[0]
+        n = db.collection("user_chat_level").count_documents({"user_id": U1})
         self.assertEqual(n, 0, "legacy chat-level table must stay untouched")
 
         lvl = db.get_user_level(U1)

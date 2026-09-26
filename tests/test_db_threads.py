@@ -1,20 +1,21 @@
-"""Regression tests: per-thread SQLite connections (thread safety).
+"""Regression tests: MongoDB backend thread safety.
 
 Run from the Pi/Pi root:
 
     python tests/test_db_threads.py
 
-Reproduces the production failure —
-    "cannot commit - no transaction is active"
-    "error return without exception set"
-— that occurred when the PTB event loop and the run_in_executor DB
-workers shared ONE sqlite3 connection (check_same_thread=False, no
-serialization of the transaction state machine).
+The old SQLite layer needed per-thread connections because one shared
+connection corrupted Python's transaction state under PTB's event loop
++ run_in_executor workers ("cannot commit - no transaction is active",
+"error return without exception set"). The Mongo layer uses ONE pooled,
+thread-safe MongoClient instead — these tests hammer the shared backend
+from multiple threads and verify it stays consistent.
 
 Environment isolation (BEFORE any bot import):
     * BOT_TOKEN is forced — bot.config exits without one.
-    * LOCALAPPDATA points at a temp dir so bot.database creates a fresh,
-      empty SQLite file (a placeholder file prevents the legacy-DB copy).
+    * unittest is already imported → bot.database always selects
+      mongomock, so the suite never touches a real MongoDB server
+      (even when MONGO_URI is configured).
 """
 
 from __future__ import annotations
@@ -36,47 +37,15 @@ if str(ROOT) not in sys.path:
 os.environ["BOT_TOKEN"] = "1:TEST-TOKEN-FOR-UNIT-TESTS"
 _TEST_DIR = tempfile.mkdtemp(prefix="pi_dbthread_test_")
 os.environ["LOCALAPPDATA"] = _TEST_DIR
-_PIBOT = Path(_TEST_DIR) / "PiBot"
-_PIBOT.mkdir(parents=True, exist_ok=True)
-(_PIBOT / "bot_database.db").touch()
 atexit.register(shutil.rmtree, _TEST_DIR, ignore_errors=True)
 
 # ── Imports (after env) ───────────────────────────────────────────
-from bot.database import ThreadLocalConn, db  # noqa: E402
+from bot.database import db  # noqa: E402
 
 
-class TestThreadLocalConnections(unittest.TestCase):
-    def test_connection_is_per_thread(self):
-        main_conn = db.connection
-        seen = {}
-
-        def worker():
-            seen["conn"] = db.connection
-            db.close()  # this thread's own connection
-
-        t = threading.Thread(target=worker)
-        t.start()
-        t.join()
-        # A different thread must get its own connection …
-        self.assertIsNot(seen["conn"], main_conn)
-        # … while the calling thread keeps reusing its own.
-        self.assertIs(db.connection, main_conn)
-
-    def test_proxy_delegates_to_current_thread(self):
-        proxy = ThreadLocalConn(db)
-        main_cursor_conn = proxy.cursor().connection
-        self.assertIs(main_cursor_conn, db.connection)
-
-        seen = {}
-
-        def worker():
-            seen["conn"] = proxy.cursor().connection
-            db.close()  # this thread's own connection
-
-        t = threading.Thread(target=worker)
-        t.start()
-        t.join()
-        self.assertIsNot(seen["conn"], db.connection)
+class TestMongoThreadSafety(unittest.TestCase):
+    def test_backend_is_mongomock_in_tests(self):
+        self.assertIn("mongomock", db.backend)
 
     def test_concurrent_writes_do_not_corrupt(self):
         """8 threads × 20 mixed write cycles — the original failure mode."""
@@ -103,8 +72,6 @@ class TestThreadLocalConnections(unittest.TestCase):
                     )
             except Exception as e:  # noqa: BLE001 — every raise is a bug
                 errors.append(f"{type(e).__name__}: {e}")
-            finally:
-                db.close()  # this thread's own connection
 
         threads = [threading.Thread(target=worker, args=(n,)) for n in range(8)]
         for t in threads:
@@ -113,11 +80,33 @@ class TestThreadLocalConnections(unittest.TestCase):
             t.join()
 
         self.assertEqual(errors, [])
-        row = db.connection.execute(
-            "SELECT COUNT(*) FROM users "
-            "WHERE user_id >= 100000 AND user_id < 200000"
-        ).fetchone()
-        self.assertEqual(row[0], 160)
+        n = db.collection("users").count_documents(
+            {"user_id": {"$gte": 100000, "$lt": 200000}}
+        )
+        self.assertEqual(n, 160)
+
+    def test_shared_counter_is_atomic_under_threads(self):
+        """6 threads × 25 count_message on one bucket must sum exactly."""
+        chat, uid, day = -100999901, 880000001, "2026-01-01"
+        db.collection("daily_messages").delete_many({"chat_id": chat})
+        errors = []
+
+        def worker() -> None:
+            try:
+                for _ in range(25):
+                    db.count_message(chat, uid, day)
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{type(e).__name__}: {e}")
+
+        threads = [threading.Thread(target=worker) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(db.get_chat_message_total(chat), 150)
+        db.collection("daily_messages").delete_many({"chat_id": chat})
 
 
 if __name__ == "__main__":

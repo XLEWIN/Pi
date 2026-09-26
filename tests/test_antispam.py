@@ -102,32 +102,27 @@ def _ctx(args=None):
 
 
 def _cleanup() -> None:
-    conn = db.connection
-    for tbl, col, ids in (
-        ("spam_protection", "user_id", (USER_S, USER_OTHER, USER_CLEAN, USER_NOSUDO)),
-        ("daily_messages", "user_id", (USER_S, USER_OTHER, USER_CLEAN)),
-        ("users", "user_id", (USER_S, USER_OTHER, USER_CLEAN)),
-    ):
-        conn.execute(
-            f"DELETE FROM {tbl} WHERE {col} IN ({','.join('?' * len(ids))})", ids
-        )
-    conn.commit()
+    db.collection("spam_protection").delete_many(
+        {"user_id": {"$in": [USER_S, USER_OTHER, USER_CLEAN, USER_NOSUDO]}}
+    )
+    db.collection("daily_messages").delete_many(
+        {"user_id": {"$in": [USER_S, USER_OTHER, USER_CLEAN]}}
+    )
+    db.collection("users").delete_many(
+        {"user_id": {"$in": [USER_S, USER_OTHER, USER_CLEAN]}}
+    )
 
 
 def _unblock(user_id: int) -> None:
-    db.connection.execute(
-        "UPDATE spam_protection SET blocked_until = ? WHERE user_id = ?",
-        (_PAST, user_id),
+    db.collection("spam_protection").update_one(
+        {"user_id": user_id}, {"$set": {"blocked_until": _PAST}}
     )
-    db.connection.commit()
 
 
 def _set_offence_day(user_id: int, day: str) -> None:
-    db.connection.execute(
-        "UPDATE spam_protection SET offence_day = ? WHERE user_id = ?",
-        (day, user_id),
+    db.collection("spam_protection").update_one(
+        {"user_id": user_id}, {"$set": {"offence_day": day}}
     )
-    db.connection.commit()
 
 
 async def _flood(user_id=USER_S, chat_id=CHAT_S, n=5, **user_kw):

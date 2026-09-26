@@ -140,10 +140,10 @@ def known_chat_ids() -> List[int]:
     """Chats with registry rows — used by the MTProto refresh loop."""
     from .. import database as tdb
 
-    rows = tdb._conn.execute(
-        "SELECT DISTINCT chat_id FROM tag_members LIMIT 100"
-    ).fetchall()
-    return [int(r[0]) for r in rows]
+    return [
+        int(cid)
+        for cid in tdb._db.collection("tag_members").distinct("chat_id")[:100]
+    ]
 
 
 # Module-level singleton used by handler/sender.
