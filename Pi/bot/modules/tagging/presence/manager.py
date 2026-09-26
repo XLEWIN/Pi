@@ -79,6 +79,18 @@ class PresenceManager:
         fn = getattr(self._mtproto, "iter_members", None)
         return fn(chat_id) if fn else None
 
+    async def raw_client(self):
+        """Connected Telethon client for raw MTProto calls, or None.
+
+        Used by the sticker suite (create/add/remove sticker sets).
+        Starts MTProto on first use — idempotent, never raises.
+        None when TAG_MTPROTO is off or the session is unauthorized.
+        """
+        await self.start()
+        if not self._mtproto.available:
+            return None
+        return getattr(self._mtproto, "_client", None)
+
     async def start(self) -> None:
         """Configure + connect MTProto if enabled (never raises; idempotent).
 
