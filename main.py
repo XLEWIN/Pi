@@ -128,6 +128,13 @@ async def post_shutdown(app: Application) -> None:
         await asyncio.to_thread(db.flush_buffers)
     except Exception as e:
         logger.warning(f"final buffer flush failed: {e}")
+    try:
+        from bot.modules.tagging import activity_tracker
+
+        # Tagging activity write-behind (~3s buffer) — persist on exit.
+        await asyncio.to_thread(activity_tracker.flush_now)
+    except Exception as e:
+        logger.warning(f"final activity flush failed: {e}")
     logger.info("Shutdown complete")
 
 

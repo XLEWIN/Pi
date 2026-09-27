@@ -4,7 +4,8 @@ This bot runs Pure Bot API; Bot API cannot list group members or read
 last-seen status. When the owner provides TELEGRAM_API_ID/API_HASH (from
 my.telegram.org, a *user* account) and installs telethon, this provider:
 
-    * connects once at startup (uses the existing session file if any)
+    * connects once at startup (TELETHON_SESSION env string when set,
+      otherwise the local sqlite session file)
     * periodically syncs participants → tag_members + presence timestamps
     * lets ActivityPresence upgrade users to RANK_ONLINE honestly
 
@@ -29,10 +30,12 @@ from .base import PresenceProvider
 
 try:  # pragma: no cover - exercised only when telethon is installed
     from telethon import TelegramClient
+    from telethon.sessions import StringSession
     from telethon.tl.types import UserStatusOnline
     _TELETHON_OK = True
 except Exception:  # ImportError and any packaging failure
     TelegramClient = None  # type: ignore
+    StringSession = None  # type: ignore
     UserStatusOnline = None  # type: ignore
     _TELETHON_OK = False
 
@@ -64,9 +67,20 @@ class MtprotoPresence(PresenceProvider):
                         config.ENV_API_ID, config.ENV_API_HASH)
             return False
         try:
-            self._client = TelegramClient(
-                str(DB_DIR / "pi_tag"), int(api_id), api_hash
-            )
+            # TELETHON_SESSION (authorized StringSession from
+            # scripts/mtproto_login.py) wins — the sqlite session file
+            # is wiped on every Railway redeploy, the env var is not.
+            session = os.getenv(config.ENV_SESSION_STRING, "").strip()
+            if session:
+                logger.info("Tagging MTProto: session source: %s env",
+                            config.ENV_SESSION_STRING)
+                self._client = TelegramClient(
+                    StringSession(session), int(api_id), api_hash
+                )
+            else:
+                self._client = TelegramClient(
+                    str(DB_DIR / "pi_tag"), int(api_id), api_hash
+                )
         except Exception as e:
             logger.warning(f"Tagging MTProto init failed: {e}")
             self._client = None
@@ -82,9 +96,10 @@ class MtprotoPresence(PresenceProvider):
             await self._client.connect()
             if not await self._client.is_user_authorized():
                 logger.warning(
-                    "Tagging MTProto: session unauthorized — run an "
-                    "interactive Telethon login once with this session "
-                    "file; falling back to activity presence."
+                    "Tagging MTProto: session unauthorized — run "
+                    "`python scripts/mtproto_login.py` once (phone login), "
+                    "then set TELETHON_SESSION (.env / Railway variables); "
+                    "falling back to activity presence."
                 )
                 self.available = False
                 await self._close_client()

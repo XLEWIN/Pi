@@ -55,6 +55,7 @@ cp .env.example .env
 | `BOT_USERNAME` | Bot username (no @) |
 | `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` | MTProto credentials |
 | `TAG_MTPROTO` | Tagging module MTProto session |
+| `TELETHON_SESSION` | Authorized MTProto session (one-time: `python scripts/mtproto_login.py`) |
 | `MONGO_URI` | MongoDB connection string (database defaults to `pi_bot`) |
 
 ## Run
@@ -75,13 +76,19 @@ polls, so use a **worker** service with no port/healthcheck.
 
    | Required | Optional |
    |----------|----------|
-   | `BOT_TOKEN` | `TELEGRAM_API_ID` + `TELEGRAM_API_HASH` + `TAG_MTPROTO=1` (MTProto tagging presence — needs a one-time authorized session; gracefully disabled otherwise) |
+   | `BOT_TOKEN` | `TELEGRAM_API_ID` + `TELEGRAM_API_HASH` + `TAG_MTPROTO=1` + `TELETHON_SESSION` (one-time session via `python scripts/mtproto_login.py` — survives redeploys; without it MTProto gracefully disables) |
    | `OWNER_ID` | `FFMPEG_PATH`, `LOCAL_BOT_API_URL`, `IG_TEMP_DIR` |
    | `MONGO_URI` | |
    | `BOT_USERNAME` | |
 
 3. Deploy. Startup posts a confirmation card to the log channel;
-   `/restart` (owner) re-execs the process in place via `os.execvp`.
+   `/restart` (owner) flushes write-behind buffers and re-execs the
+   process in place via `os.execvp`.
+
+One-time MTProto login (online presence + sticker tools): run
+`python scripts/mtproto_login.py`, then put the printed
+`TELETHON_SESSION` value in `.env` locally and in Railway Service
+Variables.
 
 Notes: video/GIF kangs use the bundled `imageio-ffmpeg` binary — no
 system ffmpeg needed. Runtime state writes to `LOCALAPPDATA` when set,
@@ -95,7 +102,7 @@ required for group message features.
 python -m unittest discover -s tests
 ```
 
-648 tests, no network access, no real MongoDB required (tests run
+660 tests, no network access, no real MongoDB required (tests run
 against an in-memory mongomock backend).
 
 ## Layout

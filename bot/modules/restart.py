@@ -10,6 +10,11 @@ Works wherever the bot is deployed:
   current process (``_P_OVERLAY``), so the new run continues in the
   same console with its logs visible.
 
+Write-behind buffers (message counters, analytics, tagging activity)
+are flushed right before exec — ``os.execvp`` replaces the process
+without running ``post_shutdown`` or atexit hooks, so anything still
+buffered would be lost.
+
 A failed re-exec must NEVER take the bot down: if execvp raises, the
 current process stays alive and the owner gets an error card saying so.
 """
@@ -69,6 +74,26 @@ def _exec_self() -> Optional[str]:
     return "exec returned without replacing the process"
 
 
+async def _flush_write_behinds() -> None:
+    """Persist buffered writes before exec (best effort, never blocks).
+
+    Lazy imports: keeps module import order untouched and pulls each
+    subsystem in only when a restart actually happens.
+    """
+    try:
+        from bot.database import db
+
+        await asyncio.to_thread(db.flush_buffers)
+    except Exception as e:  # noqa: BLE001 — restart must not be blocked
+        logger.warning(f"restart: db buffer flush failed: {e}")
+    try:
+        from bot.modules.tagging import activity_tracker
+
+        await asyncio.to_thread(activity_tracker.flush_now)
+    except Exception as e:  # noqa: BLE001 — restart must not be blocked
+        logger.warning(f"restart: activity buffer flush failed: {e}")
+
+
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if msg is None:
@@ -88,6 +113,7 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     prog = await msg.reply_text(card, parse_mode=ParseMode.HTML)
     await asyncio.sleep(_NOTICE_WAIT)
+    await _flush_write_behinds()
 
     err = _exec_self()
     # Only reached when re-exec failed — stay up and explain why.

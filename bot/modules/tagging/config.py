@@ -47,6 +47,9 @@ MTPROTO_SYNC_INTERVAL = 600.0  # background member/presence refresh (s)
 ENV_API_ID = "TELEGRAM_API_ID"
 ENV_API_HASH = "TELEGRAM_API_HASH"
 ENV_MTPROTO_ENABLED = "TAG_MTPROTO"  # "1" to enable when creds present
+# Authorized StringSession (from scripts/mtproto_login.py) — preferred
+# over the sqlite session file, which is wiped on Railway redeploys.
+ENV_SESSION_STRING = "TELETHON_SESSION"
 
 # ── Boa-style tagall (ported from Yumeko/modules/tagall.py) ───────
 TAGALL_BATCH_SIZE = 5        # mentions per message (boabot: 5)

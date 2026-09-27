@@ -195,6 +195,70 @@ class TestOwnerRestart(unittest.IsolatedAsyncioTestCase):
 
 
 # ═════════════════════════════════════════════════════════════════
+# Write-behind flush before exec
+# ═════════════════════════════════════════════════════════════════
+
+class TestFlushBeforeExec(unittest.IsolatedAsyncioTestCase):
+    """os.execvp skips post_shutdown/atexit — buffers must flush first."""
+
+    async def test_owner_flushes_both_buffers_then_execs(self):
+        import bot.database as bdb
+        from bot.modules.tagging import activity_tracker as at
+
+        events: list = []
+        msg = _Msg()
+
+        def _exec(cmd, argv):
+            events.append("exec")
+            raise RuntimeError("stop here")
+
+        fake_db = SimpleNamespace(flush_buffers=lambda: events.append("db"))
+        fake_at = SimpleNamespace(flush_now=lambda: events.append("activity"))
+        with mock.patch.object(rm, "settings",
+                               SimpleNamespace(owner_id=OWNER_ID)), \
+                mock.patch.object(rm, "_NOTICE_WAIT", 0), \
+                mock.patch.object(rm, "logger"), \
+                mock.patch.object(bdb, "db", fake_db), \
+                mock.patch.object(at, "flush_now", fake_at.flush_now), \
+                mock.patch.object(rm.os, "execvp", side_effect=_exec):
+            await rm.restart_command(_update(msg, user_id=OWNER_ID), _ctx())
+
+        self.assertEqual(events, ["db", "activity", "exec"])
+        self.assertIn("Restart failed", msg.prog.last["text"])
+
+    async def test_flush_failure_does_not_block_restart(self):
+        import bot.database as bdb
+        from bot.modules.tagging import activity_tracker as at
+
+        events: list = []
+        msg = _Msg()
+
+        def _boom():
+            events.append("db")
+            raise RuntimeError("flush boom")
+
+        def _exec(cmd, argv):
+            events.append("exec")
+            raise RuntimeError("nope")
+
+        with mock.patch.object(rm, "settings",
+                               SimpleNamespace(owner_id=OWNER_ID)), \
+                mock.patch.object(rm, "_NOTICE_WAIT", 0), \
+                mock.patch.object(rm, "logger"), \
+                mock.patch.object(bdb, "db",
+                                  SimpleNamespace(flush_buffers=_boom)), \
+                mock.patch.object(at, "flush_now",
+                                  lambda: events.append("activity")), \
+                mock.patch.object(rm.os, "execvp", side_effect=_exec):
+            await rm.restart_command(_update(msg, user_id=OWNER_ID), _ctx())
+
+        # db flush blew up, activity flush + exec still ran
+        self.assertEqual(events, ["db", "activity", "exec"])
+        self.assertIn("Restart failed", msg.prog.last["text"])
+        self.assertIn("still running", msg.prog.last["text"])
+
+
+# ═════════════════════════════════════════════════════════════════
 # Wiring + help
 # ═════════════════════════════════════════════════════════════════
 
