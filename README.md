@@ -102,7 +102,7 @@ required for group message features.
 python -m unittest discover -s tests
 ```
 
-660 tests, no network access, no real MongoDB required (tests run
+666 tests, no network access, no real MongoDB required (tests run
 against an in-memory mongomock backend).
 
 ## Layout

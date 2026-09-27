@@ -56,10 +56,18 @@ _SEQ_LOCK = threading.Lock()
 _CACHE_TTL = 60.0
 _MEMO_TTL = 60.0            # aggregate memo safety net (day totals, …)
 _FLUSH_INTERVAL = 5.0       # background counter flush cadence (seconds)
+_SKIP_TTL = 60.0            # identity/activity fast-skip window (seconds)
 _BUFFERED = frozenset({     # collections with write-behind counters
     "daily_messages", "chat_daily_stats", "chat_hourly_stats", "groups",
 })
 _MISSING = object()
+
+# Collection ops that REMOVE rows: these clear the fast-skip maps too
+# (tests rebuild collections with delete_many — a cached "already
+# registered" would otherwise skip the re-insert and strand the test).
+_DELETE_OPS = frozenset({
+    "delete_one", "delete_many", "drop", "find_one_and_delete",
+})
 
 _TEST_BACKENDS = ("unittest", "pytest")
 
@@ -125,7 +133,7 @@ class _CollProxy:
                 if self._name in _BUFFERED:
                     self._owner.flush_buffers()
                 result = target(*args, **kwargs)
-                self._owner._invalidate(self._name)
+                self._owner._invalidate(self._name, op=attr)
                 return result
             return _write
         return target
@@ -195,6 +203,13 @@ class Database:
         self._buf_hourly: Dict[Tuple[int, str, int], int] = {}
         self._buf_msg: Dict[Tuple[int, int, str], int] = {}
         self._buf_groups: Dict[int, Dict[str, Any]] = {}
+        # Fast-skip maps: per-message upserts that re-write identical
+        # identity/activity rows (and no-op membership touches) on every
+        # message are skipped for _SKIP_TTL seconds. Keyed by the exact
+        # write arguments; deletes clear them (see _invalidate).
+        self._skip_reg: Dict[Any, float] = {}
+        self._skip_act: Dict[Any, float] = {}
+        self._skip_member: Dict[Any, float] = {}
         self._flusher: Optional[threading.Thread] = None
         self._flusher_stop = threading.Event()
         self._real_mongo = self._mongo
@@ -304,9 +319,23 @@ class Database:
                 self._read_cache[(method, key)] = (now + ttl, value)
         return self._copy_cached(value)
 
-    def _invalidate(self, coll: str) -> None:
-        """Drop cache entries + aggregate memos fed by `coll`."""
+    def _invalidate(self, coll: str, op: str = "") -> None:
+        """Drop cache entries + aggregate memos fed by `coll`.
+
+        ``op`` is the collection operation name: deletes (and drops)
+        also clear the identity fast-skip maps for that collection —
+        tests rebuild rows with ``delete_many``, and a cached "already
+        registered" would otherwise skip the re-insert. Plain
+        updates/inserts keep their skip window (that is its purpose).
+        """
         with self._lock:
+            if op in _DELETE_OPS:
+                if coll == "users":
+                    self._skip_reg.clear()
+                if coll in ("users", "user_activity"):
+                    self._skip_act.clear()
+                if coll == "group_members":
+                    self._skip_member.clear()
             self._cache_gen += 1
             stale = {
                 m for m, srcs in self._CACHE_SOURCES.items() if coll in srcs
@@ -345,8 +374,17 @@ class Database:
         while not self._flusher_stop.wait(_FLUSH_INTERVAL):
             try:
                 self.flush_buffers()
+                self._prune_skips()
             except Exception as e:  # pragma: no cover — defensive
                 logger.warning(f"background flush failed: {e}")
+
+    def _prune_skips(self) -> None:
+        """Drop expired fast-skip keys (runs on the flush cadence)."""
+        now = time.monotonic()
+        with self._lock:
+            for bucket in (self._skip_reg, self._skip_act, self._skip_member):
+                for k in [k for k, exp in bucket.items() if exp <= now]:
+                    del bucket[k]
 
     def _atexit_flush(self) -> None:
         self._flusher_stop.set()
@@ -979,40 +1017,94 @@ class Database:
             return []
 
     # ── Users / groups / activity ────────────────────────
+    @staticmethod
+    def _identity_key(user_id: int, username: Optional[str],
+                      first_name: Optional[str], last_name: Optional[str],
+                      is_bot: bool) -> Tuple[Any, ...]:
+        return (user_id, username, first_name, last_name, bool(is_bot))
+
+    def _skip_hit(self, bucket: Dict[Any, float], key: Tuple[Any, ...]) -> bool:
+        with self._lock:
+            return bucket.get(key, 0.0) > time.monotonic()
+
+    def _skip_mark(self, bucket: Dict[Any, float], key: Tuple[Any, ...]) -> None:
+        with self._lock:
+            bucket[key] = time.monotonic() + _SKIP_TTL
+
+    def _upsert_user_row(self, user_id: int, username: Optional[str],
+                         first_name: Optional[str], last_name: Optional[str],
+                         is_bot: bool, now: str) -> bool:
+        """One update+maybe-insert pass. Returns True when a row was created."""
+        sets: Dict[str, Any] = {"last_seen": now}
+        if username is not None:
+            sets["username"] = username
+        if first_name is not None:
+            sets["first_name"] = first_name
+        if last_name is not None:
+            sets["last_name"] = last_name
+        res = self._mongo["users"].update_one(
+            {"user_id": user_id}, {"$set": sets}
+        )
+        if res.matched_count == 0:
+            self._mongo["users"].insert_one(
+                {
+                    "user_id": user_id,
+                    "username": username,
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    "is_bot": 1 if is_bot else 0,
+                    "first_seen": now,
+                    "last_seen": now,
+                    "total_messages": 0,
+                    "warnings": 0,
+                    "is_banned": 0,
+                    "is_muted": 0,
+                }
+            )
+            return True
+        return False
+
     def add_user(self, user_id: int, username: str = None, first_name: str = None,
                  last_name: str = None, is_bot: bool = False) -> bool:
-        """Add or update a user in the database."""
+        """Add or update a user in the database.
+
+        Same-identity writes within _SKIP_TTL seconds are skipped —
+        every group message used to re-$set identical fields (2 round
+        trips) for a row that already exists.
+        """
+        key = self._identity_key(user_id, username, first_name, last_name, is_bot)
+        if self._skip_hit(self._skip_reg, key):
+            return True
         try:
-            now = self._now()
-            sets: Dict[str, Any] = {"last_seen": now}
-            if username is not None:
-                sets["username"] = username
-            if first_name is not None:
-                sets["first_name"] = first_name
-            if last_name is not None:
-                sets["last_name"] = last_name
-            res = self._mongo["users"].update_one(
-                {"user_id": user_id}, {"$set": sets}
+            self._upsert_user_row(
+                user_id, username, first_name, last_name, is_bot, self._now()
             )
-            if res.matched_count == 0:
-                self._mongo["users"].insert_one(
-                    {
-                        "user_id": user_id,
-                        "username": username,
-                        "first_name": first_name,
-                        "last_name": last_name,
-                        "is_bot": 1 if is_bot else 0,
-                        "first_seen": now,
-                        "last_seen": now,
-                        "total_messages": 0,
-                        "warnings": 0,
-                        "is_banned": 0,
-                        "is_muted": 0,
-                    }
-                )
+            self._skip_mark(self._skip_reg, key)
             return True
         except Exception as e:
             logger.error(f"Error adding user {user_id}: {e}")
+            return False
+
+    def register_user(self, user_id: int, username: str = None,
+                      first_name: str = None, last_name: str = None,
+                      is_bot: bool = False) -> bool:
+        """Add-or-update a user in ONE round trip (chatstats first contact).
+
+        Replaces the ``get_user``-then-``add_user`` pair: returns True
+        only when the users row was actually created — the same value
+        ``get_user(uid) is None`` produced, without the extra read.
+        """
+        key = self._identity_key(user_id, username, first_name, last_name, is_bot)
+        if self._skip_hit(self._skip_reg, key):
+            return False  # registered moments ago — row exists, not new
+        try:
+            created = self._upsert_user_row(
+                user_id, username, first_name, last_name, is_bot, self._now()
+            )
+            self._skip_mark(self._skip_reg, key)
+            return created
+        except Exception as e:
+            logger.error(f"Error registering user {user_id}: {e}")
             return False
 
     def get_user(self, user_id: int) -> Optional[Dict[str, Any]]:
@@ -1032,8 +1124,19 @@ class Database:
             return None
 
     def update_user_activity(self, user_id: int, action: str, chat_id: int = None,
-                             chat_title: str = None, details: str = None):
-        """Log user activity."""
+                             chat_title: str = None, details: str = None,
+                             dedupe: bool = False):
+        """Log user activity.
+
+        ``dedupe=True`` (the per-message path) skips an identical
+        user/action/chat log within _SKIP_TTL seconds — one row per
+        minute instead of one per message, with last_seen fresh at the
+        same cadence. Event logs (start/join) keep writing every row.
+        """
+        if dedupe:
+            key = (user_id, action, chat_id)
+            if self._skip_hit(self._skip_act, key):
+                return
         try:
             now = self._now()
             # Update last_seen (no upsert — mirrors SQL UPDATE).
@@ -1051,6 +1154,8 @@ class Database:
                     "details": details,
                 }
             )
+            if dedupe:
+                self._skip_mark(self._skip_act, key)
         except Exception as e:
             logger.error(f"Error updating user activity: {e}")
 
@@ -1099,14 +1204,20 @@ class Database:
         """Group-members cache touch (chatstats first-contact path).
 
         INSERT OR IGNORE — keeps the original joined_at; safe to call
-        on every message. Returns True when the row is new.
+        on every message. Returns True when the row is new. Repeated
+        touches within _SKIP_TTL seconds are skipped (a skip returns
+        False — the row exists, so the real call would not insert).
         """
+        key = (chat_id, user_id, role)
+        if self._skip_hit(self._skip_member, key):
+            return False
         try:
             res = self._mongo["group_members"].update_one(
                 {"chat_id": chat_id, "user_id": user_id},
                 {"$setOnInsert": {"role": role, "joined_at": self._ts()}},
                 upsert=True,
             )
+            self._skip_mark(self._skip_member, key)
             return res.upserted_id is not None
         except Exception as e:
             logger.error(f"Error caching group member: {e}")
@@ -2009,14 +2120,40 @@ class Database:
         return pos
 
     def _totals_by_user(self, extra: Optional[Dict[str, Any]] = None) -> List[Tuple[int, int]]:
-        flt = dict(extra or {})
-        totals: Dict[int, int] = {}
-        for d in self._mongo["daily_messages"].find(
-            flt, {"user_id": 1, "messages": 1, "_id": 0}
-        ):
-            uid = int(d.get("user_id"))
-            totals[uid] = totals.get(uid, 0) + int(d.get("messages") or 0)
-        return list(totals.items())
+        """Every user's total (global, or one chat when ``extra`` says so).
+
+        Server-side ``$group`` on daily_messages — 1 round trip instead
+        of streaming every row into Python (the /rank position calc
+        calls this twice per card; all-time global = every row ever).
+        """
+        return self._totals_rows(dict(extra or {}))
+
+    def _totals_rows(self, match: Dict[str, Any],
+                     by: str = "user_id") -> List[Tuple[int, int]]:
+        """Server-side ``$group`` on daily_messages — 1 round trip.
+
+        ``by`` names the grouping key (``user_id``/``chat_id``).
+        """
+        rows = list(self._mongo["daily_messages"].aggregate([
+            {"$match": match},
+            {"$group": {"_id": f"${by}", "total": {"$sum": "$messages"}}},
+        ]))
+        return [(int(r["_id"]), int(r.get("total") or 0)) for r in rows]
+
+    def _totals_sorted(self, match: Dict[str, Any], limit: int,
+                       by: str = "user_id") -> List[Tuple[int, int]]:
+        """``_totals_rows`` + server-side sort/limit.
+
+        Order matches the old Python ``sorted(-total, key)`` exactly:
+        totals descending, ties by the grouped key ascending.
+        """
+        rows = list(self._mongo["daily_messages"].aggregate([
+            {"$match": match},
+            {"$group": {"_id": f"${by}", "total": {"$sum": "$messages"}}},
+            {"$sort": {"total": -1, "_id": 1}},
+            {"$limit": int(limit)},
+        ]))
+        return [(int(r["_id"]), int(r.get("total") or 0)) for r in rows]
 
     def get_user_messages(self, user_id: int) -> int:
         """A user's message total across all groups — daily_messages sum.
@@ -2159,14 +2296,9 @@ class Database:
     def get_period_top(self, chat_id: int, since: str, limit: int = 10) -> List[Dict[str, Any]]:
         """Top senders since an inclusive date (IST windows: week/month)."""
         try:
-            totals: Dict[int, int] = {}
-            for d in self._mongo["daily_messages"].find(
-                {"chat_id": chat_id, "date": {"$gte": since}},
-                {"user_id": 1, "messages": 1, "_id": 0},
-            ):
-                uid = int(d.get("user_id"))
-                totals[uid] = totals.get(uid, 0) + int(d.get("messages") or 0)
-            top = sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+            top = self._totals_sorted(
+                {"chat_id": chat_id, "date": {"$gte": since}}, limit
+            )
             uids = [u for u, _ in top]
             users: Dict[int, Dict[str, Any]] = {}
             if uids:
@@ -2226,13 +2358,8 @@ class Database:
             flt: Dict[str, Any] = {"chat_id": chat_id}
             if since is not None:
                 flt["date"] = {"$gte": since}
-            totals: Dict[int, int] = {}
-            for d in self._mongo["daily_messages"].find(
-                flt, {"user_id": 1, "messages": 1, "_id": 0}
-            ):
-                uid = int(d.get("user_id"))
-                totals[uid] = totals.get(uid, 0) + int(d.get("messages") or 0)
-            top = sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+            # Totals grouped/sorted/limited on the server (1 round trip).
+            top = self._totals_sorted(flt, limit)
             uids = [u for u, _ in top]
             users: Dict[int, Dict[str, Any]] = {}
             if uids:
@@ -2269,12 +2396,11 @@ class Database:
             flt: Dict[str, Any] = {"chat_id": chat_id}
             if since is not None:
                 flt["date"] = {"$gte": since}
-            return sum(
-                int(d.get("messages") or 0)
-                for d in self._mongo["daily_messages"].find(
-                    flt, {"messages": 1, "_id": 0}
-                )
-            )
+            rows = list(self._mongo["daily_messages"].aggregate([
+                {"$match": flt},
+                {"$group": {"_id": None, "total": {"$sum": "$messages"}}},
+            ]))
+            return int(rows[0].get("total") or 0) if rows else 0
         except Exception as e:
             logger.error(f"Error totalling chat: {e}")
             return 0
@@ -2315,13 +2441,8 @@ class Database:
             flt: Dict[str, Any] = {"user_id": user_id}
             if since is not None:
                 flt["date"] = {"$gte": since}
-            totals: Dict[int, int] = {}
-            for d in self._mongo["daily_messages"].find(
-                flt, {"chat_id": 1, "messages": 1, "_id": 0}
-            ):
-                cid = int(d.get("chat_id"))
-                totals[cid] = totals.get(cid, 0) + int(d.get("messages") or 0)
-            top = sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+            # Group by chat_id server-side (1 round trip), same tie order.
+            top = self._totals_sorted(flt, limit, by="chat_id")
             cids = [c for c, _ in top]
             groups: Dict[int, Dict[str, Any]] = {}
             if cids:

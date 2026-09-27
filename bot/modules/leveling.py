@@ -9,6 +9,7 @@ import asyncio
 import logging
 import os
 import tempfile
+import time
 from html import escape
 
 from telegram import Update
@@ -34,6 +35,13 @@ logger = logging.getLogger(__name__)
 
 # Cooldown tracking (user_id -> last_message_timestamp)
 _cooldowns = {}
+
+# Avatar download cache (user_id -> (monotonic expiry, path or "")).
+# /rank used to pay 3 Telegram round trips (profile_photos + get_file +
+# download) per card; profile pictures rarely change, so remember them.
+_AVATAR_TTL = 600.0
+_AVATAR_DIR = os.path.join(tempfile.gettempdir(), "pi_avatars")
+_avatars = {}
 
 
 def _next_in_rank(messages: int, step: int) -> int:
@@ -194,16 +202,31 @@ async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     position = info["chat_position"]
     total_members = info["chat_members"]
 
-    # Download avatar
+    # Avatar — memory-cached for _AVATAR_TTL (a fresh fetch costs 3
+    # Telegram round trips: profile_photos + get_file + download).
     avatar_path = None
-    try:
-        photos = await context.bot.get_user_profile_photos(user_id, limit=1)
-        if photos.photos:
-            f = await context.bot.get_file(photos.photos[0][-1].file_id)
-            avatar_path = os.path.join(tempfile.gettempdir(), f"avatar_{user_id}.jpg")
-            await f.download_to_drive(avatar_path)
-    except Exception as e:
-        logger.warning(f"Avatar download failed: {e}")
+    now = time.monotonic()
+    cached = _avatars.get(user_id)
+    if (
+        cached is not None
+        and cached[0] > now
+        and (not cached[1] or os.path.exists(cached[1]))
+    ):
+        avatar_path = cached[1] or None
+    else:
+        try:
+            photos = await context.bot.get_user_profile_photos(user_id, limit=1)
+            if photos.photos:
+                f = await context.bot.get_file(photos.photos[0][-1].file_id)
+                os.makedirs(_AVATAR_DIR, exist_ok=True)
+                avatar_path = os.path.join(_AVATAR_DIR, f"{user_id}.jpg")
+                await f.download_to_drive(avatar_path)
+                _avatars[user_id] = (now + _AVATAR_TTL, avatar_path)
+            else:
+                # No photos — cache the negative so repeats are free too.
+                _avatars[user_id] = (now + _AVATAR_TTL, "")
+        except Exception as e:
+            logger.warning(f"Avatar download failed: {e}")
 
     # Generate rank card using smash-style renderer (PIL — keep it off
     # the event loop so other chats' replies stay instant).
@@ -238,9 +261,10 @@ async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Error generating rank card: {e}")
     finally:
-        # Cleanup temp files
+        # Cleanup temp files — the avatar stays (it is the cache).
+        keep = _avatars.get(user_id, (0.0, ""))[1]
         for path in (output_path, avatar_path):
-            if path and os.path.exists(path):
+            if path and path != keep and os.path.exists(path):
                 try:
                     os.remove(path)
                 except Exception:

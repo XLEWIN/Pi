@@ -265,17 +265,17 @@ async def count_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         """
         is_new = False
         try:
-            # First contact → register the sender (no /start required),
+            # First contact — register the sender (no /start required),
             # cache membership for this group, and (afterwards) post the
-            # #Newuser log. Best-effort: a registration hiccup must never
-            # stop the counting itself.
-            was_new = db.get_user(user_id) is None
+            # #Newuser log. One round trip each, and repeats within the
+            # fast-skip window cost zero. Best-effort: a registration
+            # hiccup must never stop the counting itself.
             try:
-                registered = db.add_user(
+                was_new = db.register_user(
                     user_id, user.username, user.first_name, user.last_name
                 )
                 db.cache_group_member(chat_id, user_id)
-                is_new = was_new and registered
+                is_new = was_new
             except Exception as e:  # noqa: BLE001
                 logger.warning("chatstats register failed: %s", e)
             # Spam-blocked messages aren't counted (see bot/modules/antispam.py).

@@ -296,6 +296,7 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 action="sent message",
                 chat_id=chat.id,
                 chat_title=chat.title or chat.first_name,
+                dedupe=True,
             )
         except Exception as e:
             logger.warning(f"track_message DB failed: {e}")
@@ -311,8 +312,10 @@ async def userstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML)
         return
 
-    user_count = db.get_user_count()
-    group_count = db.get_group_count()
+    # Counts are Mongo round trips — keep them off the event loop so
+    # other chats' replies stay instant while /userstats loads.
+    user_count = await asyncio.to_thread(db.get_user_count)
+    group_count = await asyncio.to_thread(db.get_group_count)
 
     stats_text = f"""{E.CHART} Bot Statistics
 

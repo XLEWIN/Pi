@@ -13,6 +13,9 @@ The perf layer keeps group messages off the hot path:
     land in Mongo on the next read (flush-on-read) or the background
     cadence, never on the message handler's critical path.
   * aggregate memos — day/user totals merge pending counts in memory.
+  * identity fast-skip — repeated per-message upserts (users rows,
+    activity logs, membership touches) are skipped for _SKIP_TTL;
+    raw delete_many clears the skip so re-inserts still happen.
   * security admin cache — get_chat_member runs once per (chat, user)
     instead of once per message.
 
@@ -60,6 +63,7 @@ class _PerfBase(unittest.TestCase):
         "filters", "blocklist", "blocklist_exemptions", "watch_words",
         "spam_protection", "sudo_users", "shield_settings",
         "welcome_settings", "welcome_messages",
+        "users", "user_activity", "group_members",
     )
 
     def setUp(self):
@@ -302,6 +306,75 @@ class TestSecurityAdminCache(unittest.IsolatedAsyncioTestCase):
         await self.security._member_is_admin(bot, CHAT, USER)
         await self.security._member_is_admin(bot, CHAT, USER + 1)
         self.assertEqual(bot.calls, 2)
+
+
+class TestIdentityFastSkip(_PerfBase):
+    """Per-message identity/activity upserts skip within _SKIP_TTL.
+
+    Every group message used to re-write identical users rows (2 round
+    trips), insert one user_activity row, and touch group_members — the
+    fast-skip makes repeat messages free while delete_many (tests,
+    moderation wipes) still forces a real re-insert.
+    """
+
+    def test_register_user_reports_new_then_existing(self):
+        self.assertTrue(db.register_user(USER, "u1", "U", None))
+        self.assertFalse(db.register_user(USER, "u1", "U", None))
+        # Row exists exactly once.
+        self.assertEqual(
+            db.collection("users").count_documents({"user_id": USER}), 1
+        )
+
+    def test_add_user_returns_true_and_keeps_row(self):
+        self.assertTrue(db.add_user(USER, "u1", "U", None))
+        self.assertTrue(db.add_user(USER, "u1", "U", None))
+        self.assertEqual(
+            db.collection("users").count_documents({"user_id": USER}), 1
+        )
+
+    def test_raw_delete_clears_skip_so_reinsert_happens(self):
+        self.assertTrue(db.register_user(USER, "u1", "U", None))
+        db.collection("users").delete_many({})
+        # Skip was cleared by the delete — the row must come back.
+        self.assertTrue(db.register_user(USER, "u1", "U", None))
+        self.assertEqual(
+            db.collection("users").count_documents({"user_id": USER}), 1
+        )
+
+    def test_activity_dedupe_inserts_once(self):
+        db.update_user_activity(USER, "sent message", CHAT, "T", dedupe=True)
+        db.update_user_activity(USER, "sent message", CHAT, "T", dedupe=True)
+        self.assertEqual(
+            db.collection("user_activity").count_documents(
+                {"user_id": USER, "action": "sent message"}
+            ),
+            1,
+        )
+        # Event logs (dedupe off) keep writing every row.
+        db.update_user_activity(USER, "started the bot (DM)", CHAT, "T")
+        db.update_user_activity(USER, "started the bot (DM)", CHAT, "T")
+        self.assertEqual(
+            db.collection("user_activity").count_documents(
+                {"user_id": USER, "action": "started the bot (DM)"}
+            ),
+            2,
+        )
+
+    def test_cache_group_member_new_once_then_skip(self):
+        self.assertTrue(db.cache_group_member(CHAT, USER))
+        self.assertFalse(db.cache_group_member(CHAT, USER))
+        db.collection("group_members").delete_many({})
+        self.assertTrue(db.cache_group_member(CHAT, USER))
+
+    def test_prune_skips_drops_expired_keys(self):
+        with db._lock:
+            db._skip_reg[("stale",)] = 0.0  # already expired
+            db._skip_reg[("fresh",)] = float("inf")
+        db._prune_skips()
+        with db._lock:
+            self.assertNotIn(("stale",), db._skip_reg)
+            self.assertIn(("fresh",), db._skip_reg)
+            db._skip_reg.pop(("fresh",), None)
 
 
 if __name__ == "__main__":

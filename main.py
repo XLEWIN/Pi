@@ -6,6 +6,7 @@ No Telethon dependency.
 
 import asyncio
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from telegram import Update
@@ -71,6 +72,15 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def post_init(app: Application) -> None:
     """Fetch bot identity; never block polling on the startup log."""
+    # asyncio.to_thread / run_in_executor(None, ...) all share ONE pool.
+    # The default is min(32, cpu+4) ≈ 5 workers on a 1-CPU container, so
+    # a couple of slow PIL rank renders would queue message-count jobs
+    # behind them and lag replies. One pool sized for bursty handlers.
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(
+        ThreadPoolExecutor(max_workers=32, thread_name_prefix="pi-worker")
+    )
+
     me = await app.bot.get_me()
     app.bot_data["username"] = me.username
     app.bot_data["name"] = me.full_name
