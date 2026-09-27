@@ -333,7 +333,7 @@ async def rankings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             parse_mode=ParseMode.HTML,
         )
         return
-    text, markup = _rank_board(chat.id, "overall")
+    text, markup = await asyncio.to_thread(_rank_board, chat.id, "overall")
     await msg.reply_text(
         text, parse_mode=ParseMode.HTML, reply_markup=markup
     )
@@ -344,7 +344,7 @@ async def mytop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user = update.effective_user
     if msg is None or user is None:
         return
-    text, markup = _mytop_board(user, "overall")
+    text, markup = await asyncio.to_thread(_mytop_board, user, "overall")
     await msg.reply_text(
         text, parse_mode=ParseMode.HTML, reply_markup=markup
     )
@@ -394,9 +394,11 @@ async def board_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         chat = board_msg.chat
         if chat is None or getattr(chat, "type", None) == "private":
             return
-        text, markup = _rank_board(chat.id, scope)
+        text, markup = await asyncio.to_thread(_rank_board, chat.id, scope)
     else:
-        text, markup = _mytop_board(query.from_user, scope)
+        text, markup = await asyncio.to_thread(
+            _mytop_board, query.from_user, scope
+        )
 
     try:
         await query.answer()

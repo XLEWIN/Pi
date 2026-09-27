@@ -5,8 +5,9 @@ in bot/constants.py (CHAT_RANK_MESSAGES / GLOBAL_RANK_MESSAGES) — the
 same source /rankings displays. XP and streaks are cosmetic extras.
 """
 
-import os
+import asyncio
 import logging
+import os
 import tempfile
 from html import escape
 
@@ -180,7 +181,7 @@ async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = target_user.id
 
     # Unified rank info — daily_messages is the source of truth.
-    info = db.get_user_rank_info(user_id, chat_id)
+    info = await asyncio.to_thread(db.get_user_rank_info, user_id, chat_id)
 
     name = target_user.first_name or "User"
     username = target_user.username or ""
@@ -204,10 +205,12 @@ async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.warning(f"Avatar download failed: {e}")
 
-    # Generate rank card using smash-style renderer
+    # Generate rank card using smash-style renderer (PIL — keep it off
+    # the event loop so other chats' replies stay instant).
     output_path = os.path.join(tempfile.gettempdir(), f"rank_{user_id}.png")
     try:
-        result = create_rank_card(
+        result = await asyncio.to_thread(
+            create_rank_card,
             name=name,
             username=f"@{username}" if username else "",
             level=level,
@@ -282,7 +285,10 @@ async def nextlevel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /nextlevel — messages needed for the next chat/global rank."""
     user_id = update.effective_user.id
     is_group = update.effective_chat.type != "private"
-    info = db.get_user_rank_info(user_id, update.effective_chat.id if is_group else None)
+    info = await asyncio.to_thread(
+        db.get_user_rank_info, user_id,
+        update.effective_chat.id if is_group else None,
+    )
 
     await update.message.reply_text(
         _progress_text(info, is_group),
@@ -300,8 +306,9 @@ async def nextlevel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     chat = query.message.chat
     is_group = getattr(chat, "type", "private") != "private"
-    info = db.get_user_rank_info(
-        query.from_user.id, chat.id if is_group else None
+    info = await asyncio.to_thread(
+        db.get_user_rank_info, query.from_user.id,
+        chat.id if is_group else None,
     )
     await query.message.reply_text(
         _progress_text(info, is_group),
@@ -332,7 +339,7 @@ async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     chat_id = update.effective_chat.id
-    lb = db.get_leaderboard(chat_id, limit=10)
+    lb = await asyncio.to_thread(db.get_leaderboard, chat_id, limit=10)
 
     if not lb:
         await update.message.reply_text(f"{E.INFO} No leaderboard data yet. Start chatting!",
@@ -360,7 +367,7 @@ async def daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
-    top = db.get_daily_top(chat_id, limit=10)
+    top = await asyncio.to_thread(db.get_daily_top, chat_id, limit=10)
 
     if not top:
         await update.message.reply_text(f"{E.INFO} No messages today yet. Be the first!",
@@ -385,7 +392,9 @@ async def weekly_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
-    top = db.get_period_top(chat_id, since=ist_monday(), limit=10)
+    top = await asyncio.to_thread(
+        db.get_period_top, chat_id, since=ist_monday(), limit=10
+    )
 
     if not top:
         await update.message.reply_text(f"{E.INFO} No messages this week yet!",
@@ -410,7 +419,9 @@ async def monthly_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
-    top = db.get_period_top(chat_id, since=ist_month_start(), limit=10)
+    top = await asyncio.to_thread(
+        db.get_period_top, chat_id, since=ist_month_start(), limit=10
+    )
 
     if not top:
         await update.message.reply_text(f"{E.INFO} No messages this month yet!",

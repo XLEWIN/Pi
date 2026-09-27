@@ -121,6 +121,13 @@ async def post_init(app: Application) -> None:
 
 async def post_shutdown(app: Application) -> None:
     """Cleanup on shutdown."""
+    try:
+        from bot.database import db
+
+        # Write-behind counters (counts, analytics) — persist on exit.
+        await asyncio.to_thread(db.flush_buffers)
+    except Exception as e:
+        logger.warning(f"final buffer flush failed: {e}")
     logger.info("Shutdown complete")
 
 
@@ -130,6 +137,11 @@ def main() -> None:
     app = (
         Application.builder()
         .token(settings.bot_token)
+        # Handlers are mostly async + the DB layer is cached/buffered, so
+        # processing updates concurrently keeps one slow handler (rank
+        # renders, network retries) from queueing every other chat's
+        # replies behind it.
+        .concurrent_updates(True)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         # Regular Bot API HTTP timeouts (sendMessage, etc.) — PTB defaults

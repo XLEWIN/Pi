@@ -8,6 +8,7 @@ Commands (groups):
 Tracking hooks (message hour + join/leave counters) run in low-priority groups.
 """
 
+import asyncio
 import logging
 from datetime import date, timedelta
 from html import escape
@@ -217,7 +218,9 @@ async def topactive_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "month": ist_month_start(),
     }.get(period, ist_monday())
 
-    top = db.get_period_top(chat_id, since=since, limit=10)
+    top = await asyncio.to_thread(
+        db.get_period_top, chat_id, since=since, limit=10
+    )
     if not top:
         await update.message.reply_text(
             f"{E.INFO} No activity recorded yet.", parse_mode=ParseMode.HTML

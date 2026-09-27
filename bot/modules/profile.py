@@ -6,6 +6,7 @@ positives/warnings/restrictions. Ranks derive from daily_messages —
 the same counts /rankings and /rank display.
 """
 
+import asyncio
 import logging
 from datetime import datetime
 from html import escape
@@ -86,7 +87,7 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = None
     if chat is not None and getattr(chat, "type", None) not in (None, "private"):
         chat_id = chat.id
-    info = db.get_user_rank_info(uid, chat_id)
+    info = await asyncio.to_thread(db.get_user_rank_info, uid, chat_id)
 
     # Prefer display name; fall back to DB if Telegram user is sparse.
     display_user = target

@@ -4,6 +4,8 @@ Lists the rank card templates in the house text style with numbered
 colored buttons; tapping one (or sending /template <number>) applies it.
 """
 
+import asyncio
+
 from telegram import Update
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 from telegram.constants import ParseMode
@@ -59,7 +61,9 @@ async def template_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Current selection — same source as /rank (user_level.template).
-    info = db.get_user_rank_info(update.effective_user.id)
+    info = await asyncio.to_thread(
+        db.get_user_rank_info, update.effective_user.id
+    )
     active_id = info["template"]
     active_name = THEMES.get(active_id, THEMES[1])["name"]
 

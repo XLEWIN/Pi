@@ -44,20 +44,41 @@ ALERT_COOLDOWN_SEC = 30
 # Cap tracked users so memory stays bounded.
 _MAX_MSG_KEYS = 2000
 
+# ── Cached admin check ──────────────────────────────────
+# get_chat_member is a Telegram API round-trip; the message-burst handler
+# used to make it on EVERY group message. 30s cache → first message pays
+# the API call, the rest are a dict lookup. Errors are never cached.
+_admin_cache: Dict[Tuple[int, int], Tuple[float, bool]] = {}
+_ADMIN_CACHE_TTL = 30.0
+_ADMIN_CACHE_MAX = 10000
+
+
+async def _member_is_admin(bot, chat_id: int, user_id: int) -> Optional[bool]:
+    """True/False = known admin status, None = unknown (API error)."""
+    now = time.time()
+    hit = _admin_cache.get((chat_id, user_id))
+    if hit is not None and hit[0] > now:
+        return hit[1]
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+    except Exception:
+        return None  # callers keep the old bare-except semantics
+    ok = member.status in (
+        ChatMember.ADMINISTRATOR,
+        ChatMember.OWNER,
+        "administrator",
+        "creator",
+    )
+    if len(_admin_cache) >= _ADMIN_CACHE_MAX:
+        _admin_cache.clear()
+    _admin_cache[(chat_id, user_id)] = (now + _ADMIN_CACHE_TTL, ok)
+    return ok
+
 
 async def _is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    try:
-        member = await context.bot.get_chat_member(
-            update.effective_chat.id, update.effective_user.id
-        )
-        return member.status in (
-            ChatMember.ADMINISTRATOR,
-            ChatMember.OWNER,
-            "administrator",
-            "creator",
-        )
-    except Exception:
-        return False
+    return await _member_is_admin(
+        context.bot, update.effective_chat.id, update.effective_user.id
+    ) is True
 
 
 def _on_cooldown(chat_id: int) -> bool:
@@ -132,16 +153,8 @@ async def enforce_lockdown(
     user = update.effective_user
     if not user or user.is_bot or user.id == context.bot.id:
         return
-    try:
-        member = await context.bot.get_chat_member(chat_id, user.id)
-        if member.status in (
-            ChatMember.ADMINISTRATOR,
-            ChatMember.OWNER,
-            "administrator",
-            "creator",
-        ):
-            return
-    except Exception:
+    # None (API error) and True (admin) both keep the old early-return.
+    if await _member_is_admin(context.bot, chat_id, user.id) is not False:
         return
     try:
         await update.message.delete()
@@ -230,18 +243,9 @@ async def detect_message_burst(
     if not settings.get("shield_enabled", 1):
         return
 
-    # Admins are never flood-punished.
-    try:
-        member = await context.bot.get_chat_member(chat_id, user.id)
-        if member.status in (
-            ChatMember.ADMINISTRATOR,
-            ChatMember.OWNER,
-            "administrator",
-            "creator",
-        ):
-            return
-    except Exception:
-        pass
+    # Admins are never flood-punished (cached — was a TG API call per message).
+    if await _member_is_admin(context.bot, chat_id, user.id) is True:
+        return
 
     window = int(settings.get("msg_window") or 5)
     limit = int(settings.get("msg_limit") or 10)

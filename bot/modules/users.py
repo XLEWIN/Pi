@@ -377,7 +377,7 @@ async def _build_info_text(bot, target, chat_id: Optional[int] = None) -> str:
     bar = "▰" * filled + "▱" * (10 - filled)
 
     # Unified rank info — same source as /rank, /rankings and /profile.
-    rank_info = db.get_user_rank_info(uid, chat_id)
+    rank_info = await asyncio.to_thread(db.get_user_rank_info, uid, chat_id)
 
     fields = [
         field_extra(custom_emoji("💭", EID.INFO), "ID", f"<code>{uid}</code>"),

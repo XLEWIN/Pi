@@ -19,10 +19,12 @@ thread-safe and pools connections process-wide.
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import sys
 import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -48,6 +50,17 @@ except OSError:
 # Single-process id generator lock (the bot is one process; tests too).
 _SEQ_LOCK = threading.Lock()
 
+# ── Perf layer (Database: read cache / write-behind buffers) ─────────
+# Read-cache entries live at most _CACHE_TTL seconds; writes invalidate
+# them exactly via the collection proxy, the TTL is only a safety net.
+_CACHE_TTL = 60.0
+_MEMO_TTL = 60.0            # aggregate memo safety net (day totals, …)
+_FLUSH_INTERVAL = 5.0       # background counter flush cadence (seconds)
+_BUFFERED = frozenset({     # collections with write-behind counters
+    "daily_messages", "chat_daily_stats", "chat_hourly_stats", "groups",
+})
+_MISSING = object()
+
 _TEST_BACKENDS = ("unittest", "pytest")
 
 
@@ -69,6 +82,67 @@ def _resolve_uri() -> Optional[str]:
             pass
         uri = os.getenv("MONGO_URI", "").strip()
     return uri or None
+
+
+class _CollProxy:
+    """Collection wrapper that keeps the perf layer honest.
+
+    * Reads on a buffered collection flush pending write-behind counters
+      first, so every reader (db methods, raw ``db.collection(...)`` in
+      tests) sees an exact, fully-written view.
+    * Writes invalidate the read cache and aggregate memos for that
+      collection — again for both internal writes and raw test writes.
+
+    Flusher writes go to the raw handle, so this never re-enters itself.
+    """
+
+    _READS = frozenset({
+        "find", "find_one", "count_documents", "distinct", "aggregate",
+        "estimated_document_count",
+    })
+    _WRITES = frozenset({
+        "insert_one", "insert_many", "update_one", "update_many",
+        "replace_one", "delete_one", "delete_many", "bulk_write",
+        "find_one_and_update", "find_one_and_delete",
+        "find_one_and_replace", "drop",
+    })
+
+    def __init__(self, owner: "Database", name: str, real) -> None:
+        self._owner = owner
+        self._name = name
+        self._real = real
+
+    def __getattr__(self, attr: str):
+        target = getattr(self._real, attr)
+        if attr in self._READS:
+            def _read(*args, **kwargs):
+                if self._name in _BUFFERED:
+                    self._owner.flush_buffers()
+                return target(*args, **kwargs)
+            return _read
+        if attr in self._WRITES:
+            def _write(*args, **kwargs):
+                if self._name in _BUFFERED:
+                    self._owner.flush_buffers()
+                result = target(*args, **kwargs)
+                self._owner._invalidate(self._name)
+                return result
+            return _write
+        return target
+
+
+class _MongoProxy:
+    """Database object whose ``[name]`` access hands back a _CollProxy."""
+
+    def __init__(self, owner: "Database", real) -> None:
+        self._owner = owner
+        self._real = real
+
+    def __getitem__(self, name: str) -> _CollProxy:
+        return _CollProxy(self._owner, name, self._real[name])
+
+    def __getattr__(self, attr: str):
+        return getattr(self._real, attr)
 
 
 class Database:
@@ -108,6 +182,25 @@ class Database:
             # Fail fast on a bad URI / unreachable cluster.
             self._client.admin.command("ping")
             self.backend = f"mongodb ({self._mongo.name})"
+
+        # ── Perf layer: read cache + aggregate memos + write-behind ──
+        # ONE re-entrant lock guards all of it (flush-on-read re-enters
+        # from inside memoized readers). _real_mongo is the raw handle
+        # used only by the flusher so its writes never re-enter the proxy.
+        self._lock = threading.RLock()
+        self._read_cache: Dict[Tuple[str, tuple], Tuple[float, Any]] = {}
+        self._cache_gen = 0
+        self._memos: Dict[str, Tuple[float, Any]] = {}
+        self._buf_daily: Dict[Tuple[int, str, str], int] = {}
+        self._buf_hourly: Dict[Tuple[int, str, int], int] = {}
+        self._buf_msg: Dict[Tuple[int, int, str], int] = {}
+        self._buf_groups: Dict[int, Dict[str, Any]] = {}
+        self._flusher: Optional[threading.Thread] = None
+        self._flusher_stop = threading.Event()
+        self._real_mongo = self._mongo
+        self._mongo = _MongoProxy(self, self._mongo)
+        atexit.register(self._atexit_flush)
+
         self._ensure_indexes()
         logger.info(f"Connected to database: {self.backend}")
 
@@ -164,6 +257,223 @@ class Database:
     def _ts() -> str:
         """SQLite CURRENT_TIMESTAMP equivalent (UTC, 'YYYY-MM-DD HH:MM:SS')."""
         return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    # ── Perf layer: read cache ─────────────────────────────
+
+    # Cached method → collections it reads. A proxy write to any of
+    # those collections drops the method's cache entries.
+    _CACHE_SOURCES: Dict[str, Tuple[str, ...]] = {
+        "get_filters": ("filters",),
+        "get_blocklist": ("blocklist",),
+        "is_blocklist_exempt": ("blocklist_exemptions",),
+        "get_watch_words": ("watch_words",),
+        "get_all_watch_words": ("watch_words",),
+        "get_watch_mode": ("watch_words",),
+        "is_spam_blocked": ("spam_protection",),
+        "get_shield_settings": ("shield_settings",),
+        "get_sudo_users": ("sudo_users",),
+        "get_welcome_settings": ("welcome_settings",),
+        "get_welcome_message": ("welcome_messages",),
+    }
+
+    @staticmethod
+    def _copy_cached(value: Any) -> Any:
+        """Hand callers a shallow copy so shared cache entries stay clean."""
+        if isinstance(value, dict):
+            return dict(value)
+        if isinstance(value, list):
+            return list(value)
+        return value
+
+    def _cached_read(self, method: str, key: tuple, loader,
+                     ttl: float = _CACHE_TTL) -> Any:
+        """Read-through cache: loader runs at most once per TTL window.
+
+        The cache generation counter closes the load-vs-invalidate race:
+        if any write lands while the loader runs, the entry is not stored.
+        """
+        now = time.monotonic()
+        with self._lock:
+            hit = self._read_cache.get((method, key))
+            if hit is not None and hit[0] > now:
+                return self._copy_cached(hit[1])
+            gen = self._cache_gen
+        value = loader()
+        with self._lock:
+            if self._cache_gen == gen:
+                self._read_cache[(method, key)] = (now + ttl, value)
+        return self._copy_cached(value)
+
+    def _invalidate(self, coll: str) -> None:
+        """Drop cache entries + aggregate memos fed by `coll`."""
+        with self._lock:
+            self._cache_gen += 1
+            stale = {
+                m for m, srcs in self._CACHE_SOURCES.items() if coll in srcs
+            }
+            if stale:
+                for k in [k for k in self._read_cache if k[0] in stale]:
+                    del self._read_cache[k]
+            if coll == "daily_messages":
+                self._memos.clear()
+
+    def _memo_get(self, key: str) -> Tuple[bool, Any]:
+        with self._lock:
+            hit = self._memos.get(key, _MISSING)
+            if hit is not _MISSING and hit[0] > time.monotonic():
+                return True, hit[1]
+        return False, None
+
+    def _memo_set(self, key: str, value: Any) -> None:
+        with self._lock:
+            self._memos[key] = (time.monotonic() + _MEMO_TTL, value)
+
+    # ── Perf layer: write-behind buffers ───────────────────
+
+    def _ensure_flusher(self) -> None:
+        with self._lock:
+            if self._flusher_stop.is_set():
+                return
+            if self._flusher is not None and self._flusher.is_alive():
+                return
+            self._flusher = threading.Thread(
+                target=self._flush_loop, name="db-buffer-flush", daemon=True
+            )
+            self._flusher.start()
+
+    def _flush_loop(self) -> None:
+        while not self._flusher_stop.wait(_FLUSH_INTERVAL):
+            try:
+                self.flush_buffers()
+            except Exception as e:  # pragma: no cover — defensive
+                logger.warning(f"background flush failed: {e}")
+
+    def _atexit_flush(self) -> None:
+        self._flusher_stop.set()
+        try:
+            self.flush_buffers()
+        except Exception:  # pragma: no cover — process is exiting
+            pass
+
+    def _enqueue_daily(self, chat_id: int, date_str: str,
+                       cols: Dict[str, int]) -> None:
+        with self._lock:
+            for field, n in cols.items():
+                k = (chat_id, date_str, field)
+                self._buf_daily[k] = self._buf_daily.get(k, 0) + int(n)
+        self._ensure_flusher()
+
+    def _enqueue_hourly(self, chat_id: int, date_str: str,
+                        hour: int, n: int) -> None:
+        with self._lock:
+            k = (chat_id, date_str, int(hour))
+            self._buf_hourly[k] = self._buf_hourly.get(k, 0) + int(n)
+        self._ensure_flusher()
+
+    def _enqueue_msg(self, chat_id: int, user_id: int,
+                     date_str: str, n: int) -> None:
+        with self._lock:
+            k = (chat_id, user_id, date_str)
+            self._buf_msg[k] = self._buf_msg.get(k, 0) + int(n)
+        self._ensure_flusher()
+
+    def _pending_msg_sum(self, chat_id: Optional[int] = None,
+                         user_id: Optional[int] = None,
+                         date_str: Optional[str] = None) -> int:
+        """Unflushed message counts (call with self._lock held)."""
+        total = 0
+        for (c, u, d), n in self._buf_msg.items():
+            if chat_id is not None and c != chat_id:
+                continue
+            if user_id is not None and u != user_id:
+                continue
+            if date_str is not None and d != date_str:
+                continue
+            total += n
+        return total
+
+    @staticmethod
+    def _apply_ops(coll, pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]]) -> None:
+        """$inc upserts: one bulk round-trip when possible."""
+        try:
+            from pymongo import UpdateOne
+            coll.bulk_write(
+                [UpdateOne(f, u, upsert=True) for f, u in pairs], ordered=False
+            )
+        except Exception:
+            for f, u in pairs:
+                coll.update_one(f, u, upsert=True)
+
+    def flush_buffers(self) -> None:
+        """Write pending counters/groups to Mongo.
+
+        Holds the perf lock for the whole write: any reader that gets
+        past this call sees an exact, fully-flushed view (this is how
+        tests and /stats-style commands keep read-your-writes).
+        """
+        with self._lock:
+            daily = dict(self._buf_daily)
+            self._buf_daily.clear()
+            hourly = dict(self._buf_hourly)
+            self._buf_hourly.clear()
+            msgs = dict(self._buf_msg)
+            self._buf_msg.clear()
+            groups = dict(self._buf_groups)
+            self._buf_groups.clear()
+            if not (daily or hourly or msgs or groups):
+                return
+            if msgs:
+                # daily_messages aggregates must refetch their bases.
+                self._memos.clear()
+            real = self._real_mongo
+            try:
+                if msgs:
+                    self._apply_ops(real["daily_messages"], [
+                        ({"chat_id": c, "user_id": u, "date": d},
+                         {"$inc": {"messages": n}})
+                        for (c, u, d), n in msgs.items()
+                    ])
+                if daily:
+                    merged: Dict[Tuple[int, str], Dict[str, int]] = {}
+                    for (c, d, field), n in daily.items():
+                        inc = merged.setdefault((c, d), {})
+                        inc[field] = inc.get(field, 0) + n
+                    for (c, d), inc in merged.items():
+                        real["chat_daily_stats"].update_one(
+                            {"chat_id": c, "date": d},
+                            {"$inc": inc}, upsert=True,
+                        )
+                if hourly:
+                    self._apply_ops(real["chat_hourly_stats"], [
+                        ({"chat_id": c, "date": d, "hour": h},
+                         {"$inc": {"messages": n}})
+                        for (c, d, h), n in hourly.items()
+                    ])
+                for cid, doc in groups.items():
+                    res = real["groups"].update_one(
+                        {"chat_id": cid}, {"$set": doc}
+                    )
+                    if res.matched_count == 0:
+                        now = doc.get("last_active")
+                        real["groups"].insert_one({
+                            "chat_id": cid,
+                            "chat_title": doc.get("chat_title"),
+                            "member_count": 0,
+                            "first_seen": now,
+                            "last_active": now,
+                            "is_active": 1,
+                        })
+            except Exception as e:
+                # Nothing is lost — re-queue and retry on the next flush.
+                for k, v in daily.items():
+                    self._buf_daily[k] = self._buf_daily.get(k, 0) + v
+                for k, v in hourly.items():
+                    self._buf_hourly[k] = self._buf_hourly.get(k, 0) + v
+                for k, v in msgs.items():
+                    self._buf_msg[k] = self._buf_msg.get(k, 0) + v
+                for k, v in groups.items():
+                    self._buf_groups[k] = v
+                logger.warning(f"flush_buffers failed: {e}")
 
     def _ensure_indexes(self) -> None:
         """Create the indexes backing the old PRIMARY KEYs/UNIQUEs."""
@@ -389,15 +699,10 @@ class Database:
 
     # ── Analytics counters ───────────────────────────────
     def _bump_daily(self, chat_id: int, **cols: int) -> None:
-        """Increment per-chat daily counters (atomic $inc upsert)."""
-        today = date.today().isoformat()
+        """Increment per-chat daily counters (write-behind, flushed in background)."""
         inc = {k: int(v) for k, v in cols.items()}
         if inc:
-            self._mongo["chat_daily_stats"].update_one(
-                {"chat_id": chat_id, "date": today},
-                {"$inc": inc},
-                upsert=True,
-            )
+            self._enqueue_daily(chat_id, date.today().isoformat(), inc)
 
     def bump_messages(self, chat_id: int, n: int = 1) -> None:
         try:
@@ -438,11 +743,7 @@ class Database:
     def bump_hourly(self, chat_id: int, hour: int, n: int = 1) -> None:
         today = date.today().isoformat()
         try:
-            self._mongo["chat_hourly_stats"].update_one(
-                {"chat_id": chat_id, "date": today, "hour": int(hour)},
-                {"$inc": {"messages": int(n)}},
-                upsert=True,
-            )
+            self._enqueue_hourly(chat_id, today, hour, n)
         except Exception as e:
             logger.error(f"bump_hourly: {e}")
 
@@ -599,20 +900,25 @@ class Database:
     # ── Shield / anti-raid ───────────────────────────────
     def get_shield_settings(self, chat_id: int) -> Dict[str, Any]:
         try:
-            doc = self._find_one("shield_settings", {"chat_id": chat_id})
-            if doc:
-                return doc
-            return {
-                "chat_id": chat_id,
-                "shield_enabled": 1,
-                "join_limit": 8,
-                "join_window": 15,
-                "msg_limit": 10,
-                "msg_window": 5,
-                "action": "alert",
-                "lockdown": 0,
-                "updated_at": None,
-            }
+            def _load() -> Dict[str, Any]:
+                doc = self._find_one("shield_settings", {"chat_id": chat_id})
+                if doc:
+                    return doc
+                return {
+                    "chat_id": chat_id,
+                    "shield_enabled": 1,
+                    "join_limit": 8,
+                    "join_window": 15,
+                    "msg_limit": 10,
+                    "msg_window": 5,
+                    "action": "alert",
+                    "lockdown": 0,
+                    "updated_at": None,
+                }
+
+            return self._cached_read(
+                "get_shield_settings", (chat_id,), _load
+            )
         except Exception as e:
             logger.error(f"get_shield_settings: {e}")
             return {}
@@ -978,7 +1284,11 @@ class Database:
 
     def get_filters(self, chat_id: int) -> List[Dict[str, Any]]:
         try:
-            return self._find("filters", {"chat_id": chat_id}, sort=[("id", 1)])
+            return self._cached_read(
+                "get_filters", (chat_id,),
+                lambda: self._find("filters", {"chat_id": chat_id},
+                                   sort=[("id", 1)]),
+            )
         except Exception as e:
             logger.error(f"Error getting filters: {e}")
             return []
@@ -1023,7 +1333,11 @@ class Database:
 
     def get_blocklist(self, chat_id: int) -> List[Dict[str, Any]]:
         try:
-            return self._find("blocklist", {"chat_id": chat_id}, sort=[("id", 1)])
+            return self._cached_read(
+                "get_blocklist", (chat_id,),
+                lambda: self._find("blocklist", {"chat_id": chat_id},
+                                   sort=[("id", 1)]),
+            )
         except Exception as e:
             logger.error(f"Error getting blocklist: {e}")
             return []
@@ -1074,12 +1388,12 @@ class Database:
 
     def is_blocklist_exempt(self, chat_id: int, user_id: int) -> bool:
         try:
-            return (
-                self._mongo["blocklist_exemptions"].count_documents(
+            return bool(self._cached_read(
+                "is_blocklist_exempt", (chat_id, user_id),
+                lambda: self._mongo["blocklist_exemptions"].count_documents(
                     {"chat_id": chat_id, "user_id": user_id}, limit=1
-                )
-                > 0
-            )
+                ) > 0,
+            ))
         except Exception:
             return False
 
@@ -1106,24 +1420,23 @@ class Database:
 
     def get_sudo_users(self) -> List[int]:
         try:
-            return [
-                d["user_id"]
-                for d in self._mongo["sudo_users"].find(
-                    {}, {"user_id": 1, "_id": 0}
-                )
-            ]
+            return self._cached_read(
+                "get_sudo_users", (),
+                lambda: [
+                    d["user_id"]
+                    for d in self._mongo["sudo_users"].find(
+                        {}, {"user_id": 1, "_id": 0}
+                    )
+                ],
+            )
         except Exception as e:
             logger.error(f"Error getting sudo users: {e}")
             return []
 
     def is_sudo_user(self, user_id: int) -> bool:
         try:
-            return (
-                self._mongo["sudo_users"].count_documents(
-                    {"user_id": user_id}, limit=1
-                )
-                > 0
-            )
+            # Same result as the old count_documents — backed by the cache.
+            return user_id in self.get_sudo_users()
         except Exception:
             return False
 
@@ -1182,12 +1495,20 @@ class Database:
             return False
 
     def is_spam_blocked(self, user_id: int) -> bool:
-        """True while the user's block is still active (UTC compare)."""
+        """True while the user's block is still active (UTC compare).
+
+        The cached row is the raw ``blocked_until`` value — the expiry
+        comparison always uses a fresh clock, and ``spam_set_block`` /
+        ``spam_clear`` invalidate the entry immediately.
+        """
         try:
-            row = self._find_one(
-                "spam_protection",
-                {"user_id": user_id},
-                projection={"blocked_until": 1, "_id": 0},
+            row = self._cached_read(
+                "is_spam_blocked", (user_id,),
+                lambda: self._find_one(
+                    "spam_protection",
+                    {"user_id": user_id},
+                    projection={"blocked_until": 1, "_id": 0},
+                ),
             )
             if row is None or not row.get("blocked_until"):
                 return False
@@ -1304,13 +1625,16 @@ class Database:
 
     def get_watch_words(self, chat_id: int, admin_id: int) -> List[str]:
         try:
-            return [
-                d["word"]
-                for d in self._mongo["watch_words"].find(
-                    {"chat_id": chat_id, "admin_id": admin_id},
-                    {"word": 1, "_id": 0},
-                )
-            ]
+            return self._cached_read(
+                "get_watch_words", (chat_id, admin_id),
+                lambda: [
+                    d["word"]
+                    for d in self._mongo["watch_words"].find(
+                        {"chat_id": chat_id, "admin_id": admin_id},
+                        {"word": 1, "_id": 0},
+                    )
+                ],
+            )
         except Exception as e:
             logger.error(f"Error getting watch words: {e}")
             return []
@@ -1318,28 +1642,38 @@ class Database:
     def get_all_watch_words(self, chat_id: int) -> Dict[int, List[str]]:
         """Get all watch words for a chat, grouped by admin_id."""
         try:
-            result: Dict[int, List[str]] = {}
-            for d in self._mongo["watch_words"].find(
-                {"chat_id": chat_id},
-                {"admin_id": 1, "word": 1, "id": 1, "_id": 0},
-            ):
-                result.setdefault(d["admin_id"], []).append(d["word"])
-            for words in result.values():
-                words.sort()
-            return result
+            def _load() -> Dict[int, List[str]]:
+                result: Dict[int, List[str]] = {}
+                for d in self._mongo["watch_words"].find(
+                    {"chat_id": chat_id},
+                    {"admin_id": 1, "word": 1, "id": 1, "_id": 0},
+                ):
+                    result.setdefault(d["admin_id"], []).append(d["word"])
+                for words in result.values():
+                    words.sort()
+                return result
+
+            return self._cached_read(
+                "get_all_watch_words", (chat_id,), _load
+            )
         except Exception as e:
             logger.error(f"Error getting all watch words: {e}")
             return {}
 
     def get_watch_mode(self, chat_id: int, admin_id: int) -> str:
         try:
-            doc = self._find_one(
-                "watch_words",
-                {"chat_id": chat_id, "admin_id": admin_id},
-                projection={"mode": 1, "_id": 0},
-                sort=[("id", 1)],
+            def _load() -> str:
+                doc = self._find_one(
+                    "watch_words",
+                    {"chat_id": chat_id, "admin_id": admin_id},
+                    projection={"mode": 1, "_id": 0},
+                    sort=[("id", 1)],
+                )
+                return doc["mode"] if doc else "copy"
+
+            return self._cached_read(
+                "get_watch_mode", (chat_id, admin_id), _load
             )
-            return doc["mode"] if doc else "copy"
         except Exception:
             return "copy"
 
@@ -1355,12 +1689,19 @@ class Database:
     # ── Welcome/Goodbye ──────────────────────────────────
     def get_welcome_settings(self, chat_id: int) -> Dict[str, Any]:
         try:
-            doc = self._find_one("welcome_settings", {"chat_id": chat_id})
-            if doc:
-                return doc
-            return {"chat_id": chat_id, "welcome_enabled": 1, "goodbye_enabled": 1,
-                    "clean_welcome": 0, "clean_goodbye": 0, "clean_service": 0,
-                    "last_welcome_msg_id": None, "last_goodbye_msg_id": None}
+            def _load() -> Dict[str, Any]:
+                doc = self._find_one("welcome_settings", {"chat_id": chat_id})
+                if doc:
+                    return doc
+                return {"chat_id": chat_id, "welcome_enabled": 1,
+                        "goodbye_enabled": 1, "clean_welcome": 0,
+                        "clean_goodbye": 0, "clean_service": 0,
+                        "last_welcome_msg_id": None,
+                        "last_goodbye_msg_id": None}
+
+            return self._cached_read(
+                "get_welcome_settings", (chat_id,), _load
+            )
         except Exception as e:
             logger.error(f"Error getting welcome settings: {e}")
             return {}
@@ -1461,14 +1802,21 @@ class Database:
 
     def get_welcome_message(self, chat_id: int) -> Dict[str, Any]:
         try:
-            doc = self._find_one("welcome_messages", {"chat_id": chat_id})
-            if doc:
-                return doc
-            return {"chat_id": chat_id,
-                    "welcome_text": "Hey {first}, welcome to {chatname}! 👋",
-                    "welcome_buttons": None, "welcome_media": None, "welcome_media_type": None,
-                    "goodbye_text": "Sad to see you leaving {first}. Take Care! 👋",
-                    "goodbye_buttons": None, "goodbye_media": None, "goodbye_media_type": None}
+            def _load() -> Dict[str, Any]:
+                doc = self._find_one("welcome_messages", {"chat_id": chat_id})
+                if doc:
+                    return doc
+                return {"chat_id": chat_id,
+                        "welcome_text": "Hey {first}, welcome to {chatname}! 👋",
+                        "welcome_buttons": None, "welcome_media": None,
+                        "welcome_media_type": None,
+                        "goodbye_text": "Sad to see you leaving {first}. Take Care! 👋",
+                        "goodbye_buttons": None, "goodbye_media": None,
+                        "goodbye_media_type": None}
+
+            return self._cached_read(
+                "get_welcome_message", (chat_id,), _load
+            )
         except Exception as e:
             logger.error(f"Error getting welcome message: {e}")
             return {}
@@ -1671,14 +2019,26 @@ class Database:
         return list(totals.items())
 
     def get_user_messages(self, user_id: int) -> int:
-        """A user's message total across all groups — daily_messages sum."""
+        """A user's message total across all groups — daily_messages sum.
+
+        Memoized: the first call per window flushes + scans once, later
+        calls are base + unflushed pending (exact — no extra round-trip).
+        """
         try:
-            return sum(
-                int(d.get("messages") or 0)
-                for d in self._mongo["daily_messages"].find(
-                    {"user_id": user_id}, {"messages": 1, "_id": 0}
+            key = f"gu:{user_id}"
+            with self._lock:
+                fresh, base = self._memo_get(key)
+                if fresh:
+                    return base + self._pending_msg_sum(user_id=user_id)
+                self.flush_buffers()
+                base = sum(
+                    int(d.get("messages") or 0)
+                    for d in self._mongo["daily_messages"].find(
+                        {"user_id": user_id}, {"messages": 1, "_id": 0}
+                    )
                 )
-            )
+                self._memo_set(key, base)
+                return base + self._pending_msg_sum(user_id=user_id)
         except Exception as e:
             logger.error(f"Error totalling user messages: {e}")
             return 0
@@ -1687,14 +2047,23 @@ class Database:
                                 user_id: int) -> Tuple[int, int]:
         """(chat, global) message totals — same rows /rankings counts."""
         try:
-            chat_msgs = sum(
-                int(d.get("messages") or 0)
-                for d in self._mongo["daily_messages"].find(
-                    {"chat_id": chat_id, "user_id": user_id},
-                    {"messages": 1, "_id": 0},
+            ckey = f"ct:{chat_id}:{user_id}"
+            with self._lock:
+                fresh, chat_msgs = self._memo_get(ckey)
+                if not fresh:
+                    self.flush_buffers()
+                    chat_msgs = sum(
+                        int(d.get("messages") or 0)
+                        for d in self._mongo["daily_messages"].find(
+                            {"chat_id": chat_id, "user_id": user_id},
+                            {"messages": 1, "_id": 0},
+                        )
+                    )
+                    self._memo_set(ckey, chat_msgs)
+                return (
+                    chat_msgs + self._pending_msg_sum(chat_id, user_id, None),
+                    self.get_user_messages(user_id),
                 )
-            )
-            return chat_msgs, self.get_user_messages(user_id)
         except Exception as e:
             logger.error(f"Error totalling user messages: {e}")
             return 0, 0
@@ -1826,30 +2195,25 @@ class Database:
 
     def count_message(self, chat_id: int, user_id: int, date: str,
                       chat_title: Optional[str] = None) -> bool:
-        """Count one text message into daily_messages (+ refresh group title)."""
+        """Count one text message into daily_messages (+ refresh group title).
+
+        Both writes are write-behind: the $inc and the title/last_active
+        $set reach Mongo on the next read or within the flush cadence.
+        """
         try:
-            self._mongo["daily_messages"].update_one(
-                {"chat_id": chat_id, "user_id": user_id, "date": date},
-                {"$inc": {"messages": 1}},
-                upsert=True,
-            )
+            self._enqueue_msg(chat_id, user_id, date, 1)
             if chat_title:
                 now = self._now()
-                res = self._mongo["groups"].update_one(
-                    {"chat_id": chat_id},
-                    {"$set": {"chat_title": chat_title, "last_active": now}},
-                )
-                if res.matched_count == 0:
-                    self._mongo["groups"].insert_one(
-                        {
-                            "chat_id": chat_id,
-                            "chat_title": chat_title,
-                            "member_count": 0,
-                            "first_seen": now,
-                            "last_active": now,
-                            "is_active": 1,
+                with self._lock:
+                    prev = self._buf_groups.get(chat_id)
+                    if prev is None:
+                        self._buf_groups[chat_id] = {
+                            "chat_title": chat_title, "last_active": now,
                         }
-                    )
+                    else:
+                        prev["chat_title"] = chat_title
+                        prev["last_active"] = now
+                self._ensure_flusher()
             return True
         except Exception as e:
             logger.error(f"Error counting message: {e}")
@@ -1916,15 +2280,30 @@ class Database:
             return 0
 
     def get_chat_day_total(self, chat_id: int, date: str) -> int:
-        """One chat's total on one date — milestone threshold checks."""
+        """One chat's total on one date — milestone threshold checks.
+
+        Memoized with pending-merge (same exactness as get_user_messages).
+        """
         try:
-            return sum(
-                int(d.get("messages") or 0)
-                for d in self._mongo["daily_messages"].find(
-                    {"chat_id": chat_id, "date": date},
-                    {"messages": 1, "_id": 0},
+            key = f"day:{chat_id}:{date}"
+            with self._lock:
+                fresh, base = self._memo_get(key)
+                if fresh:
+                    return base + self._pending_msg_sum(
+                        chat_id=chat_id, date_str=date
+                    )
+                self.flush_buffers()
+                base = sum(
+                    int(d.get("messages") or 0)
+                    for d in self._mongo["daily_messages"].find(
+                        {"chat_id": chat_id, "date": date},
+                        {"messages": 1, "_id": 0},
+                    )
                 )
-            )
+                self._memo_set(key, base)
+                return base + self._pending_msg_sum(
+                    chat_id=chat_id, date_str=date
+                )
         except Exception as e:
             logger.error(f"Error totalling chat day: {e}")
             return 0
