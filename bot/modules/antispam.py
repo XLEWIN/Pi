@@ -22,6 +22,7 @@ counter sees the triggering message.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections import deque
@@ -98,16 +99,18 @@ async def flood_watch(message: Message) -> None:
         return
 
     # Already blocked: ignore (no new offence while the block runs).
-    if db.is_spam_blocked(user.id):
+    if await asyncio.to_thread(db.is_spam_blocked, user.id):
         return
 
     if not _track(chat.id, user.id):
         return
 
-    offence = db.spam_bump_offence(user.id, ist_date())
+    offence = await asyncio.to_thread(db.spam_bump_offence, user.id, ist_date())
     minutes = block_minutes(offence)
     until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
-    db.spam_set_block(user.id, until.isoformat(timespec="seconds"))
+    await asyncio.to_thread(
+        db.spam_set_block, user.id, until.isoformat(timespec="seconds")
+    )
 
     try:
         await reply_text(message,
@@ -158,13 +161,13 @@ async def free_command(message: Message, args: list) -> None:
     if msg is None:
         return
     sender = message.from_user
-    if sender is None or not is_sudo(sender.id):
+    if sender is None or not await asyncio.to_thread(is_sudo, sender.id):
         await reply_text(msg,
             f"{E.ERROR} Only sudo/owner users can use /free.",
             parse_mode=ParseMode.HTML,
         )
         return
-    target = _resolve_target(message, args)
+    target = await asyncio.to_thread(_resolve_target, message, args)
     if target is None:
         await reply_text(msg,
             plain_error("Usage: reply to a user, or /free @username | /free USER_ID"),
@@ -172,7 +175,7 @@ async def free_command(message: Message, args: list) -> None:
         )
         return
     user_id, label = target
-    if db.spam_clear(user_id):
+    if await asyncio.to_thread(db.spam_clear, user_id):
         await reply_text(msg,
             plain_ok(f"<b>{label}</b> is free — warnings and block cleared."),
             parse_mode=ParseMode.HTML,

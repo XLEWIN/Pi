@@ -103,7 +103,7 @@ async def template_callback(callback_query: CallbackQuery):
         return
 
     # Save template choice
-    db.set_template(query.from_user.id, template_id)
+    await asyncio.to_thread(db.set_template, query.from_user.id, template_id)
     theme_name = THEMES[template_id]["name"]
 
     await query.answer(f"Template set to {theme_name}!", show_alert=False)

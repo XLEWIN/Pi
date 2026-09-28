@@ -3,6 +3,7 @@
 Uses SQLite database for storage.
 """
 
+import asyncio
 import logging
 
 from aiogram import Bot, F
@@ -129,7 +130,7 @@ async def add_blocklist(message: Message, bot: Bot, args: list):
     words = {w.lower() for w in args}
     added = []
     for word in words:
-        if db.add_blocklist_word(chat_id, word, action, reason):
+        if await asyncio.to_thread(db.add_blocklist_word, chat_id, word, action, reason):
             added.append(word)
 
     if added:
@@ -160,7 +161,7 @@ async def remove_blocklist(message: Message, bot: Bot, args: list):
     words = {w.lower() for w in args}
     removed = []
     for word in words:
-        if db.remove_blocklist_word(chat_id, word):
+        if await asyncio.to_thread(db.remove_blocklist_word, chat_id, word):
             removed.append(word)
 
     if removed:
@@ -174,7 +175,7 @@ async def remove_blocklist(message: Message, bot: Bot, args: list):
 async def view_blocklist(message: Message):
     """Handle /blocklistview — view blocked words."""
     chat_id = message.chat.id
-    blocklist = db.get_blocklist(chat_id)
+    blocklist = await asyncio.to_thread(db.get_blocklist, chat_id)
 
     if not blocklist:
         await reply_text(message, f"{E.INFO} No blocked words in this chat.",
@@ -201,7 +202,7 @@ async def clear_blocklist(message: Message, bot: Bot):
         return
 
     chat_id = message.chat.id
-    count = db.clear_blocklist(chat_id)
+    count = await asyncio.to_thread(db.clear_blocklist, chat_id)
     if count > 0:
         await reply_text(message, f"{E.CHECK} Cleared {count} blocked words.",
             parse_mode=ParseMode.HTML)
@@ -230,7 +231,7 @@ async def set_blocklist_action(message: Message, bot: Bot, args: list):
         return
 
     chat_id = message.chat.id
-    db.set_blocklist_action(chat_id, args[0].lower())
+    await asyncio.to_thread(db.set_blocklist_action, chat_id, args[0].lower())
     await reply_text(message, f"{E.CHECK} Blocklist action set to: <b>{args[0].lower()}</b>", parse_mode=ParseMode.HTML)
 
 
@@ -252,7 +253,7 @@ async def set_blocklist_reason(message: Message, bot: Bot, args: list):
 
     chat_id = message.chat.id
     reason = " ".join(args)
-    db.set_blocklist_reason(chat_id, reason)
+    await asyncio.to_thread(db.set_blocklist_reason, chat_id, reason)
     await reply_text(message, f"{E.CHECK} Blocklist reason set to: <b>{reason}</b>", parse_mode=ParseMode.HTML)
 
 
@@ -265,10 +266,10 @@ async def blocklist_check(message: Message, bot: Bot):
     user_id = message.from_user.id
 
     # Check exemptions
-    if db.is_blocklist_exempt(chat_id, user_id):
+    if await asyncio.to_thread(db.is_blocklist_exempt, chat_id, user_id):
         return
 
-    blocklist = db.get_blocklist(chat_id)
+    blocklist = await asyncio.to_thread(db.get_blocklist, chat_id)
     if not blocklist:
         return
 

@@ -22,6 +22,7 @@ the other (see tests/test_dispatch_groups.py for the group map).
 
 from __future__ import annotations
 
+import asyncio
 import random
 import re
 from datetime import datetime
@@ -176,7 +177,7 @@ def _resolve_afk_target(message: Message) -> Optional[dict]:
 
 async def _welcome_back(message: Message, user, doc: dict) -> None:  # noqa: ANN001
     """Clear the AFK row and reply with the shared welcome-back card."""
-    db.clear_afk(user.id)
+    await asyncio.to_thread(db.clear_afk, user.id)
     fields = [
         (E.USER, "User", _sender_mention(user)),
         (E.TIME, "Away", _duration_since(doc.get("afk_start_time"))),
@@ -194,7 +195,7 @@ async def afk_command(message: Message) -> None:
     if user is None or user.is_bot:
         return
 
-    existing = db.get_afk(user.id)
+    existing = await asyncio.to_thread(db.get_afk, user.id)
     if existing:
         await _welcome_back(message, user, existing)
         return
@@ -208,7 +209,8 @@ async def afk_command(message: Message) -> None:
         reason = parts[1].strip()
 
     media_id, media_type = _replied_media(message)
-    db.set_afk(
+    await asyncio.to_thread(
+        db.set_afk,
         user.id, user.first_name, user.username, reason,
         datetime.now().isoformat(), media_id, media_type,
     )
@@ -229,7 +231,7 @@ async def afk_mention_handler(message: Message, bot: Bot) -> None:
     if sender is None or sender.is_bot:
         return
 
-    doc = _resolve_afk_target(message)
+    doc = await asyncio.to_thread(_resolve_afk_target, message)
     if not doc or doc.get("user_id") == sender.id:
         return  # nobody AFK, or the sender pinging their own AFK row
 
@@ -271,7 +273,7 @@ async def afk_return_handler(message: Message) -> None:
     user = message.from_user
     if user is None or user.is_bot:
         return
-    doc = db.get_afk(user.id)
+    doc = await asyncio.to_thread(db.get_afk, user.id)
     if not doc:
         return
     await _welcome_back(message, user, doc)

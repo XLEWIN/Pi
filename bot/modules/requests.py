@@ -15,6 +15,7 @@ Callback data:
 
 from __future__ import annotations
 
+import asyncio
 import re
 from html import escape
 
@@ -125,7 +126,7 @@ async def request_command(message: Message, bot: Bot, args: list) -> None:
         return
 
     if not args or args[0].lower() not in ("on", "off"):
-        enabled = db.get_join_requests(message.chat.id)
+        enabled = await asyncio.to_thread(db.get_join_requests, message.chat.id)
         await reply_card(
             message,
             action_card(
@@ -142,7 +143,7 @@ async def request_command(message: Message, bot: Bot, args: list) -> None:
         return
 
     enable = args[0].lower() == "on"
-    db.set_join_requests(message.chat.id, enable)
+    await asyncio.to_thread(db.set_join_requests, message.chat.id, enable)
     await reply_card(
         message,
         action_card(
@@ -171,15 +172,17 @@ async def on_join_request(chat_join_request: ChatJoinRequest, bot: Bot) -> None:
         return
 
     chat = request.chat
-    if not db.get_join_requests(chat.id):
+    if not await asyncio.to_thread(db.get_join_requests, chat.id):
         return
 
     _PENDING[(chat.id, request.from_user.id)] = _mention(request.from_user)
 
     try:
+        # request_card reads db.is_gbanned via _scan_flag — off-loop.
+        card = await asyncio.to_thread(request_card, request.from_user)
         await bot.send_message(
             chat.id,
-            request_card(request.from_user),
+            card,
             parse_mode=ParseMode.HTML,
             reply_markup=request_keyboard(chat.id, request.from_user.id),
         )

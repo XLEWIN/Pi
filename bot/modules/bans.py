@@ -3,6 +3,7 @@
 Uses SQLite database for storage. Success replies use bot.responses cards.
 """
 
+import asyncio
 import logging
 from html import escape
 
@@ -67,7 +68,7 @@ async def addsudo_command(message: Message, bot: Bot, args: list):
         await reply_text(message, f"{E.ERROR} Specify a user: /addsudo @user or /addsudo USER_ID",
             parse_mode=ParseMode.HTML)
         return
-    db.add_sudo_user(target.id, message.from_user.id)
+    await asyncio.to_thread(db.add_sudo_user, target.id, message.from_user.id)
     await reply_card(
         message,
         action_card(
@@ -93,7 +94,7 @@ async def rmsudo_command(message: Message, bot: Bot, args: list):
         await reply_text(message, f"{E.ERROR} Specify a user: /rmsudo @user or /rmsudo USER_ID",
             parse_mode=ParseMode.HTML)
         return
-    if db.remove_sudo_user(target.id):
+    if await asyncio.to_thread(db.remove_sudo_user, target.id):
         await reply_card(
             message,
             action_card(
@@ -116,7 +117,7 @@ async def sudolist_command(message: Message, bot: Bot):
         await reply_text(message, f"{E.CROWN} Only the bot owner can view sudo users.",
             parse_mode=ParseMode.HTML)
         return
-    sudo_ids = db.get_sudo_users()
+    sudo_ids = await asyncio.to_thread(db.get_sudo_users)
     if not sudo_ids:
         await reply_text(message, f"{E.INFO} No sudo users configured.",
             parse_mode=ParseMode.HTML)
@@ -149,7 +150,7 @@ async def sudolist_command(message: Message, bot: Bot):
 
 
 async def gban_command(message: Message, bot: Bot, args: list):
-    if not is_sudo(message.from_user.id):
+    if not await asyncio.to_thread(is_sudo, message.from_user.id):
         await reply_text(message, f"{E.ERROR} Only sudo/owner users can use gban.",
             parse_mode=ParseMode.HTML)
         return
@@ -174,12 +175,12 @@ async def gban_command(message: Message, bot: Bot, args: list):
     else:
         reason_args = list(args or [])[1:]
     reason = " ".join(reason_args).strip() or "No reason provided"
-    db.add_gban(target.id, reason, message.from_user.id)
+    await asyncio.to_thread(db.add_gban, target.id, reason, message.from_user.id)
     try:
         await bot.ban_chat_member(message.chat.id, target.id)
     except Exception:
         pass
-    total = len(db.get_gbanned_users())
+    total = len(await asyncio.to_thread(db.get_gbanned_users))
     await reply_card(
         message,
         action_card(
@@ -197,7 +198,7 @@ async def gban_command(message: Message, bot: Bot, args: list):
 
 
 async def ungban_command(message: Message, bot: Bot, args: list):
-    if not is_sudo(message.from_user.id):
+    if not await asyncio.to_thread(is_sudo, message.from_user.id):
         await reply_text(message, f"{E.ERROR} Only sudo/owner users can use ungban.",
             parse_mode=ParseMode.HTML)
         return
@@ -206,7 +207,7 @@ async def ungban_command(message: Message, bot: Bot, args: list):
         await reply_text(message, f"{E.ERROR} Specify a user: /ungban @user",
             parse_mode=ParseMode.HTML)
         return
-    if db.remove_gban(target.id):
+    if await asyncio.to_thread(db.remove_gban, target.id):
         try:
             await bot.unban_chat_member(message.chat.id, target.id)
         except Exception:
@@ -229,11 +230,11 @@ async def ungban_command(message: Message, bot: Bot, args: list):
 
 
 async def gbanlist_command(message: Message):
-    if not is_sudo(message.from_user.id):
+    if not await asyncio.to_thread(is_sudo, message.from_user.id):
         await reply_text(message, f"{E.ERROR} Only sudo/owner users can view gbans.",
             parse_mode=ParseMode.HTML)
         return
-    gbanned = db.get_gbanned_users()
+    gbanned = await asyncio.to_thread(db.get_gbanned_users)
     if not gbanned:
         await reply_text(message, f"{E.INFO} No gbanned users.",
             parse_mode=ParseMode.HTML)
@@ -260,7 +261,7 @@ async def massban_command(message: Message, bot: Bot, args: list):
         try:
             user_id = int(arg)
             await bot.ban_chat_member(message.chat.id, user_id)
-            db.add_gban(user_id, "Mass ban", message.from_user.id)
+            await asyncio.to_thread(db.add_gban, user_id, "Mass ban", message.from_user.id)
             banned += 1
         except (ValueError, Exception):
             failed += 1
@@ -279,7 +280,7 @@ async def massban_command(message: Message, bot: Bot, args: list):
 
 
 async def sudopromote_command(message: Message, bot: Bot, args: list):
-    if not is_sudo(message.from_user.id):
+    if not await asyncio.to_thread(is_sudo, message.from_user.id):
         await reply_text(message, f"{E.ERROR} Only sudo/owner users can use this.",
             parse_mode=ParseMode.HTML)
         return

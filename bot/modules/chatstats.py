@@ -316,7 +316,8 @@ async def count_message(message: Message, bot: Bot) -> None:
 
     # Rank-ups first, then the day milestone — ONE combined reply so a
     # double threshold (e.g. 100 msgs) doesn't spam two messages.
-    lines = _rank_up_lines(
+    lines = await asyncio.to_thread(
+        _rank_up_lines,
         chat_msgs, global_msgs,
         _mention_id(user_id, user.first_name or "User"),
     )

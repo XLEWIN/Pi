@@ -370,7 +370,7 @@ async def _build_info_text(bot, target, chat_id: Optional[int] = None) -> str:
         else f"{photos} photo{'s' if photos != '1' else ''}"
     )
 
-    user_row = db.get_user(uid) or {}
+    user_row = (await asyncio.to_thread(db.get_user, uid)) or {}
     warnings = int(user_row.get("warnings") or 0)
     health = max(0, 100 - 25 * min(warnings, 4))
     filled = health // 10
@@ -406,8 +406,8 @@ async def _build_info_text(bot, target, chat_id: Optional[int] = None) -> str:
                        rank_info["global_members"], rank_info["global_messages"]),
         ),
         field_extra(E.TIME, "AFK Status", "No"),
-        field_extra(E.FOLDER, "Common Groups", str(db.count_user_groups(uid))),
-        field_extra(E.CROSS, "Globally Banned", "Yes" if db.is_gbanned(uid) else "No"),
+        field_extra(E.FOLDER, "Common Groups", str(await asyncio.to_thread(db.count_user_groups, uid))),
+        field_extra(E.CROSS, "Globally Banned", "Yes" if await asyncio.to_thread(db.is_gbanned, uid) else "No"),
         field_extra(E.MUTE, "Globally Muted", "Yes" if user_row.get("is_muted") else "No"),
     ])
 
@@ -607,7 +607,7 @@ async def recentactivity_command(message: Message, bot: Bot):
             parse_mode=ParseMode.HTML)
         return
 
-    activity = db.get_recent_activity(limit=5)
+    activity = await asyncio.to_thread(db.get_recent_activity, limit=5)
 
     if not activity:
         await reply_text(message, f"{E.INFO} No recent activity.",

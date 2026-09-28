@@ -150,7 +150,7 @@ async def _send_cached(
             await bot.send_document(
                 chat_id, document=file_id, caption=cap, parse_mode=parse, reply_to_message_id=rid
             )
-        db.ig_touch_file_id(key)
+        await asyncio.to_thread(db.ig_touch_file_id, key)
         metrics.bump("uploads")
     return True
 
@@ -218,7 +218,8 @@ async def process_url(
                     bot, chat_id, post, cached, caption, reply_to_message_id
                 )
                 elapsed = int((time.perf_counter() - t0) * 1000)
-                db.ig_log_download(
+                await asyncio.to_thread(
+                    db.ig_log_download,
                     chat_id, requester_id, "cache", post.post_type.value,
                     len(post.assets), elapsed, None,
                 )
@@ -258,7 +259,8 @@ async def process_url(
 
             if sent_any:
                 elapsed = int((time.perf_counter() - t0) * 1000)
-                db.ig_log_download(
+                await asyncio.to_thread(
+                    db.ig_log_download,
                     chat_id, requester_id, "ok", post.post_type.value,
                     len(files), elapsed, None,
                 )
@@ -275,7 +277,9 @@ async def process_url(
         ig_log(f"job error: {e}")
         metrics.bump("resolved_fail", error=str(e)[:200])
         try:
-            db.ig_log_download(chat_id, requester_id, "error", "unknown", 0, 0, str(e)[:200])
+            await asyncio.to_thread(
+                db.ig_log_download, chat_id, requester_id, "error", "unknown", 0, 0, str(e)[:200]
+            )
         except Exception:
             pass
         raise IGError("Something went wrong processing that link.") from e
@@ -297,7 +301,7 @@ async def auto_download_handler(message: Message, bot: Bot) -> None:
     if not raw_urls:
         return
 
-    st = _ig_settings(chat.id)
+    st = await asyncio.to_thread(_ig_settings, chat.id)
     if not st.get("auto_download"):
         return
 
@@ -464,15 +468,17 @@ async def igsettings_command(message: Message, bot: Bot, args: list) -> None:
     if args:
         if args[0] in {"auto", "autodl"} and len(args) >= 2:
             on = args[1] in {"on", "1", "true", "yes"}
-            db.ig_set_settings(chat_id, auto_download=1 if on else 0)
+            await asyncio.to_thread(
+                db.ig_set_settings, chat_id, auto_download=1 if on else 0
+            )
         elif args[0] == "max" and len(args) >= 2:
             try:
                 n = max(1, min(int(args[1]), 50))
             except ValueError:
                 n = ig_config.max_items
-            db.ig_set_settings(chat_id, max_items=n)
+            await asyncio.to_thread(db.ig_set_settings, chat_id, max_items=n)
 
-    st = _ig_settings(chat_id)
+    st = await asyncio.to_thread(_ig_settings, chat_id)
     auto = bool(st.get("auto_download"))
     mx = int(st.get("max_items") or ig_config.max_items)
     await reply_text(
@@ -634,17 +640,17 @@ async def ig_callback(callback_query: CallbackQuery, bot: Bot) -> None:
             await query.answer("Admins only.", show_alert=True)
             return
 
-        st = _ig_settings(chat_id)
+        st = await asyncio.to_thread(_ig_settings, chat_id)
         if data == "ig:set:auto":
             new = 0 if st.get("auto_download") else 1
-            db.ig_set_settings(chat_id, auto_download=new)
+            await asyncio.to_thread(db.ig_set_settings, chat_id, auto_download=new)
         else:
             cur = int(st.get("max_items") or ig_config.max_items)
             order = [1, 5, 10, 20]
             nxt = order[(order.index(cur) + 1) % len(order)] if cur in order else 5
-            db.ig_set_settings(chat_id, max_items=nxt)
+            await asyncio.to_thread(db.ig_set_settings, chat_id, max_items=nxt)
 
-        st = _ig_settings(chat_id)
+        st = await asyncio.to_thread(_ig_settings, chat_id)
         auto = bool(st.get("auto_download"))
         mx = int(st.get("max_items") or ig_config.max_items)
         try:

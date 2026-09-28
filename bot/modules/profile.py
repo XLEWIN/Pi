@@ -52,7 +52,7 @@ async def _resolve_target(
                     is_bot = False
                     full_name = None
                 u = _U()
-                row = db.get_user(uid)
+                row = await asyncio.to_thread(db.get_user, uid)
                 if row:
                     u.first_name = row.get("first_name")
                     u.last_name = row.get("last_name")
@@ -79,9 +79,9 @@ async def profile_command(message: Message, bot: Bot, args: list):
 
     uid = target.id
     # Ensure row exists for reputation math.
-    db._ensure_reputation(uid)
-    rep = db.get_reputation(uid)
-    active_days = db.get_active_days(uid)
+    await asyncio.to_thread(db._ensure_reputation, uid)
+    rep = await asyncio.to_thread(db.get_reputation, uid)
+    active_days = await asyncio.to_thread(db.get_active_days, uid)
 
     # Chat context only in groups — ranks are derived from daily_messages.
     chat = message.chat
@@ -93,7 +93,7 @@ async def profile_command(message: Message, bot: Bot, args: list):
     # Prefer display name; fall back to DB if Telegram user is sparse.
     display_user = target
     if not getattr(target, "first_name", None) and not getattr(target, "username", None):
-        row = db.get_user(uid)
+        row = await asyncio.to_thread(db.get_user, uid)
         if row:
             class _U:
                 id = uid

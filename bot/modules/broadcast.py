@@ -194,9 +194,9 @@ async def broadcast_command(message: Message,
     groups: List[int] = []
     users: List[int] = []
     if target in ("all", "chat"):
-        groups = db.get_all_chat_ids()
+        groups = await asyncio.to_thread(db.get_all_chat_ids)
     if target in ("all", "user"):
-        users = db.get_all_user_ids()
+        users = await asyncio.to_thread(db.get_all_user_ids)
     if not groups and not users:
         await reply_text(
             msg,

@@ -135,7 +135,7 @@ async def track_message(message: Message):
         return
 
     # Spam-blocked users earn no XP either (bot/modules/antispam.py).
-    if db.is_spam_blocked(user.id):
+    if await asyncio.to_thread(db.is_spam_blocked, user.id):
         return
 
     chat_id = message.chat.id
@@ -297,7 +297,7 @@ async def ranktemplate_command(message: Message, args: list):
             parse_mode=ParseMode.HTML)
         return
 
-    db.set_template(message.from_user.id, template)
+    await asyncio.to_thread(db.set_template, message.from_user.id, template)
     theme_name = THEMES[template]["name"]
     await reply_text(message, f"{E.CHECK} Template set to {theme_name}!",
             parse_mode=ParseMode.HTML)
@@ -342,7 +342,7 @@ async def nextlevel_callback(callback_query: CallbackQuery):
 async def streak_command(message: Message):
     """Handle /streak — show message streak."""
     user_id = message.from_user.id
-    user_data = db.get_user_level(user_id)
+    user_data = await asyncio.to_thread(db.get_user_level, user_id)
     current = user_data.get("streak_current", 0)
     best = user_data.get("streak_best", 0)
 

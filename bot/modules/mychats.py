@@ -151,7 +151,7 @@ def _info_card(chat, members: str, link: str) -> str:
 
 async def _scan_admin_chats(bot: Bot) -> List[Dict[str, Any]]:
     """Tracked groups where THIS bot is currently admin/creator."""
-    rows = db.get_all_groups()
+    rows = await asyncio.to_thread(db.get_all_groups)
     if not rows:
         return []
 

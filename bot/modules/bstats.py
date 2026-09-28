@@ -13,6 +13,7 @@ Total Rules — rules live in ``moderation.rules_db`` (in-memory).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -172,7 +173,7 @@ async def bstats_command(message: Message) -> None:
         return
     await reply_text(
         msg,
-        bstats_text(_counts()),
+        bstats_text(await asyncio.to_thread(_counts)),
         parse_mode=ParseMode.HTML,
         reply_markup=_bstats_kb(),
     )
@@ -217,7 +218,9 @@ async def stats_callback(callback_query: CallbackQuery,
         action = data.split(":")[1] if ":" in data else ""
         if action == "refresh":
             await _answer(query)
-            await _safe_edit(query, bstats_text(_counts()), _bstats_kb())
+            await _safe_edit(
+                query, bstats_text(await asyncio.to_thread(_counts)), _bstats_kb()
+            )
             return
         if action == "close":
             await _answer(query)

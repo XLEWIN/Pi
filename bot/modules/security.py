@@ -10,6 +10,7 @@ Commands (groups, admin):
   /raidlog [n]               — recent raid events
 """
 
+import asyncio
 import logging
 import time
 from collections import defaultdict, deque
@@ -114,8 +115,8 @@ async def _take_action(
             await bot.ban_chat_member(chat_id, user_id)
         else:
             return False
-        db.bump_mod_actions(chat_id, 1)
-        db.record_reputation_event(user_id, "restriction", 1)
+        await asyncio.to_thread(db.bump_mod_actions, chat_id, 1)
+        await asyncio.to_thread(db.record_reputation_event, user_id, "restriction", 1)
         return True
     except Exception as e:
         logger.warning(f"shield action failed: {e}")
@@ -131,7 +132,9 @@ async def _set_lockdown(
     while lockdown=1, enforce_lockdown() deletes non-admin messages.
     """
     try:
-        db.set_shield_settings(chat_id, lockdown=1 if enabled else 0)
+        await asyncio.to_thread(
+            db.set_shield_settings, chat_id, lockdown=1 if enabled else 0
+        )
         return True
     except Exception as e:
         logger.warning(f"lockdown toggle failed: {e}")
@@ -145,7 +148,7 @@ async def enforce_lockdown(
     if not message or message.chat.type == "private":
         return
     chat_id = message.chat.id
-    settings = db.get_shield_settings(chat_id)
+    settings = await asyncio.to_thread(db.get_shield_settings, chat_id)
     if not settings.get("lockdown"):
         return
     user = message.from_user
@@ -172,7 +175,7 @@ async def detect_join_burst(
         return
 
     chat_id = message.chat.id
-    settings = db.get_shield_settings(chat_id)
+    settings = await asyncio.to_thread(db.get_shield_settings, chat_id)
     if not settings.get("shield_enabled", 1):
         return
 
@@ -193,7 +196,7 @@ async def detect_join_burst(
     dq.clear()
     count = limit
     detail = f"{count} joins in {window}s"
-    db.log_raid_event(chat_id, "join_burst", detail, count)
+    await asyncio.to_thread(db.log_raid_event, chat_id, "join_burst", detail, count)
 
     names = ", ".join(
         (m.first_name or m.username or str(m.id))
@@ -238,7 +241,7 @@ async def detect_message_burst(
         return
 
     chat_id = message.chat.id
-    settings = db.get_shield_settings(chat_id)
+    settings = await asyncio.to_thread(db.get_shield_settings, chat_id)
     if not settings.get("shield_enabled", 1):
         return
 
@@ -262,7 +265,7 @@ async def detect_message_burst(
 
     dq.clear()
     detail = f"{limit} msgs in {window}s by {user.id}"
-    db.log_raid_event(chat_id, "message_burst", detail, limit)
+    await asyncio.to_thread(db.log_raid_event, chat_id, "message_burst", detail, limit)
     action = str(settings.get("action") or "alert").lower()
 
     text = action_card(
@@ -300,19 +303,19 @@ async def shield_command(message: Message, bot: Bot, args: list):
         return
 
     chat_id = message.chat.id
-    settings = db.get_shield_settings(chat_id)
+    settings = await asyncio.to_thread(db.get_shield_settings, chat_id)
 
     if args:
         arg = args[0].lower()
         if arg in ("on", "enable"):
-            db.set_shield_settings(chat_id, shield_enabled=1)
+            await asyncio.to_thread(db.set_shield_settings, chat_id, shield_enabled=1)
             await reply_text(
                 message,
                 f"{E.CHECK} Shield <b>ON</b>.", parse_mode=ParseMode.HTML
             )
             return
         if arg in ("off", "disable"):
-            db.set_shield_settings(chat_id, shield_enabled=0)
+            await asyncio.to_thread(db.set_shield_settings, chat_id, shield_enabled=0)
             await reply_text(
                 message,
                 f"{E.CROSS} Shield <b>OFF</b>.", parse_mode=ParseMode.HTML
@@ -374,7 +377,7 @@ async def shieldcfg_command(message: Message, bot: Bot, args: list):
                 parse_mode=ParseMode.HTML,
             )
             return
-        db.set_shield_settings(chat_id, join_limit=n, join_window=sec)
+        await asyncio.to_thread(db.set_shield_settings, chat_id, join_limit=n, join_window=sec)
         await reply_text(
             message,
             f"{E.CHECK} Join burst: <b>{n}</b> joins / <b>{sec}s</b>.",
@@ -394,7 +397,7 @@ async def shieldcfg_command(message: Message, bot: Bot, args: list):
                 parse_mode=ParseMode.HTML,
             )
             return
-        db.set_shield_settings(chat_id, msg_limit=n, msg_window=sec)
+        await asyncio.to_thread(db.set_shield_settings, chat_id, msg_limit=n, msg_window=sec)
         await reply_text(
             message,
             f"{E.CHECK} Message burst: <b>{n}</b> msgs / <b>{sec}s</b>.",
@@ -411,7 +414,7 @@ async def shieldcfg_command(message: Message, bot: Bot, args: list):
                 parse_mode=ParseMode.HTML,
             )
             return
-        db.set_shield_settings(chat_id, action=action)
+        await asyncio.to_thread(db.set_shield_settings, chat_id, action=action)
         await reply_text(
             message,
             f"{E.CHECK} Shield action: <b>{action.capitalize()}</b>.",
@@ -437,7 +440,7 @@ async def lockdown_command(message: Message, bot: Bot, args: list):
         return
 
     chat_id = message.chat.id
-    settings = db.get_shield_settings(chat_id)
+    settings = await asyncio.to_thread(db.get_shield_settings, chat_id)
     enable: Optional[bool] = None
     if args:
         arg = args[0].lower()
@@ -450,8 +453,10 @@ async def lockdown_command(message: Message, bot: Bot, args: list):
         enable = not bool(settings.get("lockdown"))
 
     if enable:
-        db.set_shield_settings(chat_id, lockdown=1)
-        db.log_raid_event(chat_id, "lockdown", "Lockdown enabled by admin", 1)
+        await asyncio.to_thread(db.set_shield_settings, chat_id, lockdown=1)
+        await asyncio.to_thread(
+            db.log_raid_event, chat_id, "lockdown", "Lockdown enabled by admin", 1
+        )
         await _set_lockdown(chat_id, True)
         await reply_text(
             message,
@@ -460,8 +465,10 @@ async def lockdown_command(message: Message, bot: Bot, args: list):
             parse_mode=ParseMode.HTML,
         )
     else:
-        db.set_shield_settings(chat_id, lockdown=0)
-        db.log_raid_event(chat_id, "lockdown", "Lockdown disabled by admin", 1)
+        await asyncio.to_thread(db.set_shield_settings, chat_id, lockdown=0)
+        await asyncio.to_thread(
+            db.log_raid_event, chat_id, "lockdown", "Lockdown disabled by admin", 1
+        )
         await _set_lockdown(chat_id, False)
         await reply_text(
             message,
@@ -490,7 +497,7 @@ async def raidlog_command(message: Message, bot: Bot, args: list):
         except ValueError:
             pass
 
-    events = db.get_raid_events(message.chat.id, limit=limit)
+    events = await asyncio.to_thread(db.get_raid_events, message.chat.id, limit=limit)
     if not events:
         await reply_text(
             message,

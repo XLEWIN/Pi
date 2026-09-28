@@ -61,7 +61,8 @@ async def _instant_sleep(seconds):
 def _owner():
     with mock.patch.object(bm, "settings", SimpleNamespace(owner_id=OWNER_ID)), \
             mock.patch.object(bm, "asyncio",
-                              SimpleNamespace(sleep=_instant_sleep)), \
+                              SimpleNamespace(sleep=_instant_sleep,
+                                              to_thread=asyncio.to_thread)), \
             mock.patch.object(bm, "_SEND_DELAY", 0):
         yield
 

@@ -147,16 +147,16 @@ async def stats_command(message: Message, bot: Bot, args: list):
         period = args[0].lower()
     days = _PERIOD_DAYS.get(period, 1)
 
-    stats = db.get_daily_stats(chat_id, days=days)
+    stats = await asyncio.to_thread(db.get_daily_stats, chat_id, days=days)
     # Prefer daily_messages for message volume (leveling already tracks it).
     from datetime import date, timedelta as td
     start = (date.today() - td(days=days - 1)).isoformat()
     try:
-        msg_sum = db.sum_daily_messages(chat_id, start)
+        msg_sum = await asyncio.to_thread(db.sum_daily_messages, chat_id, start)
     except Exception:
         msg_sum = stats.get("messages", 0)
 
-    active = db.get_active_member_count(chat_id, days=days)
+    active = await asyncio.to_thread(db.get_active_member_count, chat_id, days=days)
     label = period.capitalize()
 
     # Trend: compare to previous equal window when we have history.
@@ -164,7 +164,7 @@ async def stats_command(message: Message, bot: Bot, args: list):
     if days >= 1:
         prev_start = (date.today() - td(days=days * 2 - 1)).isoformat()
         try:
-            prev = db.sum_daily_messages(chat_id, prev_start, start)
+            prev = await asyncio.to_thread(db.sum_daily_messages, chat_id, prev_start, start)
             if prev > 0:
                 delta = msg_sum - prev
                 pct = int(abs(delta) / prev * 100)
@@ -253,7 +253,7 @@ async def peakhours_command(message: Message, bot: Bot, args: list):
         except ValueError:
             pass
 
-    peaks = db.get_peak_hours(chat_id, days=days, limit=5)
+    peaks = await asyncio.to_thread(db.get_peak_hours, chat_id, days=days, limit=5)
     if not peaks:
         await reply_text(message,
             f"{E.INFO} No hourly data yet.", parse_mode=ParseMode.HTML
