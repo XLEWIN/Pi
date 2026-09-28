@@ -16,7 +16,7 @@ from html import escape
 from aiogram import Bot, F
 from aiogram.enums import ParseMode
 from aiogram.filters.logic import and_f
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, FSInputFile, Message
 
 from bot.command_handler import COMMAND
 from bot.pipeline import cmd, on
@@ -247,13 +247,13 @@ async def rank_command(message: Message, bot: Bot, args: list, bot_data: dict):
 
         if result and os.path.exists(output_path):
             caption = _rank_caption(name)
-            with open(output_path, "rb") as f:
-                await reply_photo(message, 
-                    photo=f,
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=_see_rank_keyboard(bot, bot_data),
-                )
+            # aiogram pydantic rejects a raw file handle — pass FSInputFile.
+            await reply_photo(message,
+                photo=FSInputFile(output_path),
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=_see_rank_keyboard(bot, bot_data),
+            )
         else:
             await reply_text(message, "Error generating rank card.")
     except Exception as e:

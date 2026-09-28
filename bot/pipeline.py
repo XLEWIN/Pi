@@ -141,13 +141,18 @@ def _wrap(fn: Callable) -> Callable:
     @functools.wraps(fn)
     async def _inner(*args: Any, **kwargs: Any):
         try:
-            return await fn(*args, **kwargs)
+            await fn(*args, **kwargs)
         except SkipHandler:
             raise
-        except Exception as err:  # noqa: BLE001 â€” PTB process_error parity
+        except Exception as err:  # noqa: BLE001 — PTB process_error parity
             from bot.errors import report_handler_error
             report_handler_error(args[0] if args else None, err)
             raise SkipHandler from None
+        # Success also skips: aiogram must keep walking the chain so the
+        # NEXT matching group runs (PTB "all groups run for one update").
+        # Returning normally here would stop the observer after the first
+        # match and silently starve every later group (counting, trackers).
+        raise SkipHandler
     return _inner
 
 

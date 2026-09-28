@@ -179,5 +179,154 @@ def asyncio_run(coro):
     return asyncio.run(coro)
 
 
+# ── _wrap contract + real-Dispatcher chain ─────────────────────────
+class TestWrapChain(unittest.TestCase):
+    """_wrap must ALWAYS raise SkipHandler.
+
+    aiogram's observer stops at the first handler that returns normally
+    and only continues on SkipHandler. If _wrap returned after a
+    successful run, the first matching observer (a no-filter hook like
+    adminbox_message) would starve every later group — counting, flood
+    watch, trackers — while commands kept working. Both success and
+    error paths must therefore skip, PTB "all groups run" style.
+    """
+
+    def test_wrap_success_still_skips(self):
+        from aiogram.dispatcher.event.bases import SkipHandler
+
+        from bot.pipeline import _wrap
+
+        ran = []
+
+        async def ok_handler():
+            ran.append("ran")
+
+        w = _wrap(ok_handler)
+        with self.assertRaises(SkipHandler):
+            asyncio_run(w())
+        self.assertEqual(ran, ["ran"], "handler body must execute first")
+
+    def test_wrap_error_reports_and_skips(self):
+        from aiogram.dispatcher.event.bases import SkipHandler
+
+        from bot.pipeline import _wrap
+
+        async def boom(_event=None):
+            raise RuntimeError("explodes")
+
+        w = _wrap(boom)
+        with self.assertRaises(SkipHandler):
+            asyncio_run(w(make_message("x")))
+
+    def test_wrap_preserves_signature(self):
+        import inspect
+
+        from bot.pipeline import _wrap
+
+        async def handler(message, bot, args):
+            """doc"""
+
+        w = _wrap(handler)
+        self.assertEqual(
+            set(inspect.signature(w).parameters), {"message", "bot", "args"},
+        )
+        self.assertEqual(w.__doc__, "doc")
+
+
+class TestRealDispatcherChain(unittest.TestCase):
+    """Feed a real Update through the real Dispatcher.
+
+    Earlier observers (no-filter adminbox hook, analytics, antispam …)
+    match a plain group text BEFORE chatstats in dispatch order; the
+    chain must still reach count_message and write to the DB.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from aiogram import Dispatcher
+
+        pipeline.clear()
+        load_modules()
+        cls.dp = Dispatcher()
+        pipeline.install(cls.dp)
+        cls.matched = None  # filled lazily per test to keep imports local
+
+    def _update(self, text, *, chat_id=-1005550001112, chat_type="supergroup",
+                update_id=1, message_id=501):
+        from datetime import datetime, timezone
+
+        from aiogram.types import Chat, Message, Update, User
+
+        chat_kw = {"id": chat_id, "type": chat_type}
+        if chat_type != "private":
+            chat_kw["title"] = "Count Test"
+        return Update(
+            update_id=update_id,
+            message=Message(
+                message_id=message_id,
+                date=datetime.now(timezone.utc),
+                chat=Chat(**chat_kw),
+                from_user=User(id=424242, is_bot=False, first_name="Tester"),
+                text=text,
+            ),
+        )
+
+    def test_plain_text_reaches_count_message(self):
+        from bot import database as D
+
+        calls = []
+        orig = D.db.count_message
+
+        def spy(*a, **k):
+            calls.append(a)
+            return orig(*a, **k)
+
+        D.db.count_message = spy
+        try:
+            class Bot:
+                id = 777000111
+            asyncio_run(self.dp.feed_update(
+                bot=Bot(), update=self._update("hello counting world"),
+            ))
+        finally:
+            D.db.count_message = orig
+        self.assertGreaterEqual(
+            len(calls), 1,
+            "count_message never ran — chain stopped at an earlier observer",
+        )
+        chat_id, user_id, date, title = calls[0][:4]
+        self.assertEqual(chat_id, -1005550001112)
+        self.assertEqual(user_id, 424242)
+
+    def test_command_and_private_not_counted(self):
+        from bot import database as D
+
+        calls = []
+        orig = D.db.count_message
+
+        def spy(*a, **k):
+            calls.append(a)
+            return orig(*a, **k)
+
+        D.db.count_message = spy
+        try:
+            class Bot:
+                id = 777000111
+            asyncio_run(self.dp.feed_update(
+                bot=Bot(),
+                update=self._update("/rankings", update_id=2, message_id=502),
+            ))
+            asyncio_run(self.dp.feed_update(
+                bot=Bot(),
+                update=self._update(
+                    "private hello", chat_id=42, chat_type="private",
+                    update_id=3, message_id=503,
+                ),
+            ))
+        finally:
+            D.db.count_message = orig
+        self.assertEqual(calls, [], "commands/private must not be counted")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
