@@ -10,7 +10,7 @@ Two eras of the fix are accepted:
 * **Thread hop** (pymongo era) — ``await asyncio.to_thread(db.method,
   ...)``.  Correct but costs a thread-pool slot per call, which is what
   made bursts queue up behind the bounded executor.
-* **Await** (Motor era) — ``await db.method(...)`` or
+* **Await** (async driver) — ``await db.method(...)`` or
   ``await adb(db.method(...))``.  The call returns a lazy box and the
   driver multiplexes it on the loop; no thread is touched.
 
@@ -165,9 +165,9 @@ def _under_thread(node, parent_map, stop, *, allow_await: bool = False) -> bool:
 
     ``to_thread`` / ``run_in_executor`` always count — they are the
     pymongo-era fix.  ``await`` counts only when ``allow_await``: awaiting
-    a db coroutine drives it on the loop through Motor without blocking,
-    but awaiting a *sync* helper does not help, because the helper already
-    ran the moment it was called.
+    a db coroutine drives it on the loop through the async client
+    without blocking, but awaiting a *sync* helper does not help,
+    because the helper already ran the moment it was called.
     """
     cur = parent_map.get(node)
     while cur is not None and cur is not stop:

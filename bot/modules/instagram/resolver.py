@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
@@ -173,7 +174,6 @@ class YtDlpResolver(BaseResolver):
         }
 
     async def resolve(self, url: str) -> ResolvedPost:
-        import asyncio
 
         return await asyncio.to_thread(self._resolve_sync, url)
 
@@ -259,7 +259,6 @@ class FallbackResolver(BaseResolver):
         self._primary = primary
 
     async def resolve(self, url: str) -> ResolvedPost:
-        import asyncio
 
         def _alt() -> ResolvedPost:
             import yt_dlp

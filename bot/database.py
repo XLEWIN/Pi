@@ -232,10 +232,10 @@ class Database:
         uri = _resolve_uri()
         self._is_test = uri is None
         # Construction is synchronous and non-blocking on both backends:
-        # Motor opens its sockets on the first `await`, so the client can
-        # be built here, before any event loop exists. The ping, the
-        # index build and the boot snapshot all moved to startup() so
-        # they run on the bot's own loop (Motor is loop-bound).
+        # the async client opens its sockets on the first `await`, so the
+        # client can be built here, before any event loop exists. The ping,
+        # the index build and the boot snapshot all moved to startup() so
+        # they run on the bot's own loop (the driver is loop-bound).
         self._client, mongo, self.backend = open_backend(uri)
         self._mongo = mongo
 
@@ -280,7 +280,7 @@ class Database:
         if self._is_test:
             # mongomock is in-memory and loop-agnostic, so the test
             # process can build its indexes right here — there is no
-            # Motor loop to be bound to yet.
+            # driver loop to be bound to yet.
             run_sync(self._ensure_indexes())
 
     async def startup(self) -> None:
@@ -290,7 +290,8 @@ class Database:
         before polling starts.  ``bind_loop`` is what lets synchronous
         call sites (the flusher thread, ``atexit``, the module databases)
         submit their coroutines to *this* loop instead of the private
-        executor loop — Motor can only run where it is bound.
+        executor loop — the async client can only run where it is bound,
+        and it binds to whichever loop first awaits it (this ping).
         """
         bind_loop(asyncio.get_running_loop())
         if not self._is_test:
@@ -318,7 +319,7 @@ class Database:
             counts = {}
             for name in ("users", "groups", "daily_messages"):
                 n = self._real_mongo[name].estimated_document_count()
-                # Motor/mongomock-shim hand back a coroutine; a test's
+                # The async client hands back a coroutine; a test's
                 # fake collection may hand back an int.
                 counts[name] = await n if inspect.isawaitable(n) else n
             line = ", ".join(f"{name}={n}" for name, n in counts.items())
@@ -354,8 +355,8 @@ class Database:
             cur = cur.sort(sort)
         if limit:
             cur = cur.limit(limit)
-        # Cursors are async-iterable on both backends (Motor natively,
-        # AsyncCursor over mongomock), so this must be an async comp.
+        # Cursors are async-iterable on both backends (the async driver
+        # natively, AsyncCursor over mongomock), so this is an async comp.
         return [self._clean(d) async for d in cur]
 
     async def _find_one(self, name: str, flt: Optional[Dict[str, Any]] = None,

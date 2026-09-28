@@ -2,13 +2,19 @@
 
 Two interchangeable backends behind one coroutine surface:
 
-* **Production** — ``motor.motor_asyncio.AsyncIOMotorClient``.  Every
-  driver call is a real coroutine, so a message handler never burns a
-  thread-pool slot to talk to Mongo.  The event loop multiplexes as many
-  concurrent operations as the connection pool allows, which is exactly
-  what the old ``asyncio.to_thread(db.foo, ...)`` pattern could not do:
-  under a burst it queued work behind a bounded executor and the whole
-  bot went unresponsive.
+* **Production** — ``pymongo.AsyncMongoClient`` (PyMongo's native async
+  API, "PyMongo Async").  Every driver call is a real coroutine, so a
+  message handler never burns a thread-pool slot to talk to Mongo.  The
+  event loop multiplexes as many concurrent operations as the connection
+  pool allows, which is exactly what the old
+  ``asyncio.to_thread(db.foo, ...)`` pattern could not do: under a burst
+  it queued work behind a bounded executor and the whole bot went
+  unresponsive.
+
+  This used to be Motor, which shipped every call through a thread pool
+  on top of the driver.  PyMongo's own async API drops that hop, and
+  Motor itself was deprecated 14 May 2025 / EOL 14 May 2026 — so this is
+  both faster and the supported path.
 
 * **Tests** — an async shim over ``mongomock``, which is synchronous and
   in-memory.  The shim exposes the same coroutine surface so
@@ -27,7 +33,8 @@ sync object.
 Cursors come back as :class:`AsyncCursor`, which is ``async for``-able
 *and* iterable: the module databases (``bind``, ``tagging``) still use
 plain ``for d in coll.find(...)``, so ``__iter__`` blocks on the inner
-cursor (direct iteration for the mongomock shim, ``run_sync`` for Motor).
+cursor (direct iteration for the mongomock shim, ``run_sync`` for the
+async driver).
 One cursor type therefore serves both styles without touching those
 modules.
 """
@@ -45,11 +52,11 @@ __all__ = ["open_backend", "AsyncCursor", "MONGO_ASYNC_OPS"]
 # ── cursor ─────────────────────────────────────────────────────────
 
 class AsyncCursor:
-    """``async for``-able cursor over either a Motor or a sync cursor.
+    """``async for``-able cursor over either a live-async or a sync cursor.
 
     ``sort``/``limit``/``skip`` are chainable and return ``self``, which is
-    how both Motor and pymongo behave, so ``_find`` reads the same either
-    way::
+    how both PyMongo Async and pymongo behave, so ``_find`` reads the same
+    either way::
 
         cur = await coll.find(flt, projection)
         cur = cur.sort(sort).limit(limit)
@@ -86,8 +93,9 @@ class AsyncCursor:
 
         * mongomock / pymongo inner cursor, or a plain list from
           ``aggregate`` — iterate it directly, it is already in memory.
-        * Motor inner cursor — drain it on the loop that owns it, via
-          the bridge, so the caller's thread just blocks briefly.
+        * async inner cursor (PyMongo Async) — drain it on the loop that
+          owns it, via the bridge, so the caller's thread just blocks
+          briefly.
         """
         inner = self._inner
         if hasattr(inner, "__anext__"):
@@ -101,12 +109,12 @@ class AsyncCursor:
 
     async def __anext__(self) -> Any:
         inner = self._inner
-        # Motor's command cursor is natively async-iterable.
+        # A live driver cursor is natively async-iterable.
         if hasattr(inner, "__anext__"):
             return await inner.__anext__()
         # mongomock/pymongo cursors are plain sync iterators.  Blocking
         # here is fine: mongomock is in-memory and returns instantly, and
-        # this class is never used for Motor.
+        # this class never wraps a real client's cursor.
         try:
             return next(inner)
         except StopIteration:
@@ -138,8 +146,9 @@ class _resolved:
     """Awaitable box so ``await x`` works on a value that is already final.
 
     Lets one call site — ``async def _read`` in ``_CollProxy`` — stay
-    uniform across Motor (real coroutine) and the mongomock shim (already
-    computed), instead of branching on the backend everywhere.
+    uniform across the live async driver (a real coroutine) and the
+    mongomock shim (already computed), instead of branching on the
+    backend everywhere.
     """
 
     __slots__ = ("_value",)
@@ -242,17 +251,59 @@ class _AsyncMongoClient:
         self._inner.close()
 
 
+def _patch_mongomock_bulk() -> None:
+    """Drop keyword arguments mongomock 4.3.0 does not declare.
+
+    PyMongo >= 4.10 passes ``sort=`` from ``UpdateOne._add_to_bulk``
+    into ``BulkOperationBuilder.add_update``; mongomock predates that
+    keyword, so any test exercising ``bulk_write`` failed with
+    ``add_update() got an unexpected keyword argument 'sort'``.
+    Filtering each ``add_*`` call through its own signature keeps mongomock
+    working without pinning pymongo below the async API.  The dropped
+    keywords are no-ops for an in-memory single-document update.
+    """
+    from mongomock.collection import BulkOperationBuilder
+
+    for name in ("add_insert", "add_update", "add_replace", "add_delete"):
+        orig = getattr(BulkOperationBuilder, name)
+        if getattr(orig, "_pi_kwarg_filtered", False):
+            continue
+        keep = set(inspect.signature(orig).parameters)
+
+        def _wrap(fn, allowed):
+            def patched(self, *args, **kwargs):
+                if kwargs:
+                    kwargs = {k: v for k, v in kwargs.items() if k in allowed}
+                return fn(self, *args, **kwargs)
+
+            patched._pi_kwarg_filtered = True
+            patched.__name__ = fn.__name__
+            return patched
+
+        setattr(BulkOperationBuilder, name, _wrap(orig, keep))
+
+
 def _open_mongomock() -> Tuple[Any, Any, str]:
     import mongomock
 
+    _patch_mongomock_bulk()
     client = _AsyncMongoClient(mongomock.MongoClient())
     return client, client["pi_bot_test"], "mongomock (tests)"
 
 
-def _open_motor(uri: str) -> Tuple[Any, Any, str]:
-    from motor.motor_asyncio import AsyncIOMotorClient
+def _open_pymongo_async(uri: str) -> Tuple[Any, Any, str]:
+    """Build the production client.
 
-    client = AsyncIOMotorClient(uri, appname="pi-bot")
+    Construction is synchronous and does no I/O — the first awaited
+    operation connects and binds the client to *that* event loop
+    (``pymongo.asynchronous.mongo_client`` raises if a later call comes
+    from another loop).  ``Database.startup``'s ping is that first
+    operation, and it runs on the loop ``bind_loop`` already routes every
+    other database call to, so the binding can never diverge.
+    """
+    from pymongo import AsyncMongoClient
+
+    client = AsyncMongoClient(uri, appname="pi-bot")
     try:
         mongo = client.get_default_database()
     except Exception:
@@ -266,11 +317,11 @@ def open_backend(uri: Optional[str] = None) -> Tuple[Any, Any, str]:
     """Return ``(client, mongo, backend_label)``.
 
     ``uri is None`` selects the in-memory test backend.  Construction is
-    synchronous and non-blocking for both backends — Motor opens its
-    sockets lazily on the first ``await``, so building the client inside
+    synchronous and non-blocking for both backends — the async client
+    opens its sockets lazily on the first ``await``, so building it inside
     ``Database.__init__`` is safe before the event loop exists.  The
     liveness ``ping`` is a separate coroutine (``Database.ping``).
     """
     if uri is None:
         return _open_mongomock()
-    return _open_motor(uri)
+    return _open_pymongo_async(uri)

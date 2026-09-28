@@ -8,11 +8,13 @@ moviepy>=2.0.0
 # moviepy ships this; sticker video kangs call it directly as the
 # portable ffmpeg binary (Railway/containers have no system ffmpeg).
 imageio-ffmpeg>=0.5.0
-# <4.10: pymongo 4.10+ passes sort= from UpdateOne._add_to_bulk, but
-# mongomock 4.3.0 (latest, test backend) has no sort kwarg on
-# BulkOperationBuilder.add_update → every bulk_write through mongomock
-# raises TypeError. Tests exercise this path (test_tagging flush).
-pymongo>=4.9.0,<4.10
+# Async Mongo driver. >=4.13 is required for AsyncMongoClient, the
+# native asyncio client bot/mongo_async.py opens in production (it falls
+# back to a mongomock shim in tests).  mongomock 4.3.0 does not declare
+# the sort= keyword pymongo passes from UpdateOne._add_to_bulk — that one
+# mismatch is filtered at open time by _patch_mongomock_bulk() rather
+# than by pinning pymongo below the async API.
+pymongo>=4.13,<5
 dnspython>=2.8.0
 
 # Speed: orjson (Rust) feeds aiogram's json_loads/json_dumps session
@@ -24,9 +26,3 @@ uvloop>=0.21; sys_platform != "win32"
 
 # Test-only
 mongomock>=4.3.0
-
-# Async Mongo driver (pinned to the same minor as pymongo so the two
-# never disagree on wire protocol / BSON behaviour).  bot/mongo_async.py
-# opens an AsyncIOMotorClient in production and falls back to a
-# mongomock shim in tests, so this is required on the Railway worker.
-motor>=3.7.1,<3.8

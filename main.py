@@ -205,11 +205,11 @@ def main() -> None:
                 on_stop=lambda: sigterm.__setitem__("hit", True),
             )
 
-            # Bind Motor to THIS loop and build the indexes before any
-            # handler can run.  Startup is deliberately not boxed (see
-            # async_bridge._Facade._UNBOXED): boxing it would hand it to
-            # the private executor loop and Motor would be bound there
-            # for the life of the process.
+            # Bind the async driver to THIS loop and build the indexes
+            # before any handler can run.  Startup is deliberately not
+            # boxed (see async_bridge._Facade._UNBOXED): boxing it would
+            # hand it to the private executor loop and the driver would
+            # bind there for the life of the process.
             await db.startup()
 
             me = await bot.get_me()

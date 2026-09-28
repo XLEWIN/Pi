@@ -3,11 +3,11 @@
 Why this exists
 ---------------
 ``bot/database.py`` is being converted to ``async def`` so production can
-use Motor (no thread-pool hop per Mongo round trip, real concurrency under
-bursts).  But ~440 call sites across the test-suite — plus ``setUp``/
-``setUpModule`` hooks and a handful of genuine ``threading.Thread``
-workers — call ``db.some_method(...)`` with no ``await`` and cannot be
-made to await without restructuring them.
+use the async Mongo client (no thread-pool hop per round trip, real
+concurrency under bursts).  But ~440 call sites across the test-suite —
+plus ``setUp``/``setUpModule`` hooks and a handful of genuine
+``threading.Thread`` workers — call ``db.some_method(...)`` with no
+``await`` and cannot be made to await without restructuring them.
 
 This module makes one call site work in all three worlds:
 
@@ -19,9 +19,9 @@ context                   behaviour
                           executor loop, or an inline thread-local loop —
                           ``box`` returns a lazy :class:`Hybrid` instead of
                           a value, so the coroutine runs on *that* loop and
-                          Motor stays bound where it was opened.  Callers
-                          written for production read ``await adb(db.foo())``
-                          and get this branch.
+                          the client stays bound where it was opened.
+                          Callers written for production read
+                          ``await adb(db.foo())`` and get this branch.
 ``db.foo()`` on some       resolves the coroutine to completion and hands
 else's loop (an async      back the plain result.  A sync call inside an
 test's own loop)           async test must not return an unawaitable, so
@@ -43,7 +43,8 @@ production and test processes.  The facade only differs in what it does
 with a coroutine it was handed: in production the caller awaits it (lazy
 ``Hybrid``), in a synchronous test it is resolved to a value.  Methods in
 ``_Facade._UNBOXED`` (currently just ``startup``) are never boxed —
-boxing them would bind Motor to whichever loop first touched them.
+boxing them would bind the async client to whichever loop first touched
+them.
 """
 
 from __future__ import annotations
@@ -91,7 +92,7 @@ def _is_executor(loop: Optional[asyncio.AbstractEventLoop]) -> bool:
 
 
 def bind_loop(loop: asyncio.AbstractEventLoop) -> None:
-    """Declare `loop` the loop Motor is bound to (called from startup)."""
+    """Declare `loop` the loop the async client is bound to (startup)."""
     global _bound_loop, _bound_thread_id
     _bound_loop = _mark_executor(loop)
     _bound_thread_id = threading.get_ident()
@@ -489,8 +490,8 @@ class _Facade:
 
     #: Coroutine methods that must run on the *caller's* loop and are
     #: never boxed.  ``startup`` is the one that calls ``bind_loop`` —
-    #: routing it to a private loop would bind Motor to the wrong loop
-    #: for the rest of the process' life.
+    #: routing it to a private loop would bind the async client to the
+    #: wrong loop for the rest of the process' life.
     _UNBOXED = frozenset({"startup"})
 
     def __init__(self, target: Any) -> None:

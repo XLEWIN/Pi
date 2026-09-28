@@ -6,7 +6,7 @@
 context                                 result of ``box(coro)``
 ======================================  ================================
 on an executor loop (private, inline,   a lazy :class:`Hybrid` — the
-or the Motor-bound bot loop): we are    caller must ``await``; blocking
+or the bound bot loop): we are    caller must ``await``; blocking
 running database code                   that loop would deadlock it
 --------------------------------------  -------------------------------
 no loop running (sync test,             the **plain value**: ``is None``,
@@ -284,7 +284,7 @@ class TestFacade(unittest.IsolatedAsyncioTestCase):
 
 class TestBoundLoopRouting(unittest.IsolatedAsyncioTestCase):
     async def test_off_loop_call_blocks_on_the_bot_loop(self):
-        """Production worker threads must run on the Motor-bound loop."""
+        """Production worker threads must run on the bound bot loop."""
         loop = asyncio.get_running_loop()
         ran_on = {}
 
