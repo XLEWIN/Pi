@@ -82,8 +82,36 @@ polls, so use a **worker** service with no port/healthcheck.
    | `BOT_USERNAME` | |
 
 3. Deploy. Startup posts a confirmation card to the log channel;
-   `/restart` (owner) flushes write-behind buffers and re-execs the
+   `/restart` (owner) flushes write-behind buffers and re-executes the
    process in place via `os.execvp`.
+
+### Restarting vs. deploying (updates)
+
+* **Railway → Restart does NOT pick up new commits.** It re-runs the
+  image of the *last deployment*. After `git push`, get the new code
+  either by turning on **Auto Deploy** (project → GitHub repo → auto
+  deploy on push) or by clicking **Redeploy** on the latest deployment.
+* **Never delete the service to update code** — that also deletes its
+  Service Variables (`MONGO_URI`, `BOT_TOKEN`, …) and any managed
+  datastores attached to it. Push + Redeploy instead.
+* **Restarts are data-safe**: everything lives in MongoDB (Atlas),
+  which no restart/redeploy touches. The process flushes write-behind
+  buffers on SIGTERM, so at most the sub-second tail of counters is at
+  risk on a hard kill.
+* **Verify each deploy in the logs** — three lines prove both code and
+  database are the ones you expect:
+
+  ```
+  Loaded 33 module(s) — Phi π is ready (190 handlers — …)
+  Database backend: mongodb (pi_bot)
+  Database snapshot at boot: users=…, groups=…, daily_messages=…
+  ```
+
+  Wrong/missing handler count → old code still running (deploy, don't
+  restart). `mongomock` or `MONGO_URI is not set` → the boot fails
+  fast on purpose (an in-memory database would silently wipe itself on
+  every restart). Empty snapshot on a bot that had data → `MONGO_URI`
+  points at the wrong cluster/database.
 
 One-time MTProto login (online presence + sticker tools): run
 `python scripts/mtproto_login.py`, then put the printed

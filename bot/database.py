@@ -232,8 +232,38 @@ class Database:
 
         self._ensure_indexes()
         logger.info(f"Connected to database: {self.backend}")
+        self._log_snapshot()
 
     # ── internals ────────────────────────────────────────
+
+    def _log_snapshot(self) -> None:
+        """Boot-time row counts — make the real store unmistakable.
+
+        A wrong-but-reachable ``MONGO_URI`` (valid cluster, empty or
+        other database) makes 'everything vanished' look like data
+        loss: the bot boots and serves an empty database. These counts
+        in the deploy log prove which store actually came up, and an
+        empty one is called out loudly (a brand-new bot's first boot is
+        the only acceptable empty).
+        """
+        if self.backend.startswith("mongomock"):
+            return  # tests: counts are meaningless noise
+        try:
+            counts = {
+                name: self._real_mongo[name].estimated_document_count()
+                for name in ("users", "groups", "daily_messages")
+            }
+            line = ", ".join(f"{name}={n}" for name, n in counts.items())
+            logger.info(f"Database snapshot at boot: {line}")
+            if not any(counts.values()):
+                logger.warning(
+                    "Database is EMPTY at boot — if this bot had data "
+                    "before, MONGO_URI points at the wrong cluster or "
+                    "database name. Check Railway → Variables → "
+                    "MONGO_URI (default database: pi_bot)."
+                )
+        except Exception as e:  # noqa: BLE001 — diagnostics must never crash boot
+            logger.warning(f"database boot snapshot failed: {e}")
 
     def collection(self, name: str):
         """The raw Collection for `name` (tests / module databases)."""

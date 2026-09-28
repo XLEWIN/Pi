@@ -77,5 +77,73 @@ class TestEnsureIndexes(unittest.TestCase):
         )
 
 
+class TestBootSnapshot(unittest.TestCase):
+    """_log_snapshot: the deploy log must prove which store booted.
+
+    A wrong-but-reachable MONGO_URI (valid cluster, empty/other
+    database) made "everything vanished" look like data loss — the bot
+    happily booted and served an empty database with no visible clue.
+    """
+
+    class _FakeColl:
+        def __init__(self, n: int) -> None:
+            self._n = n
+
+        def estimated_document_count(self) -> int:
+            return self._n
+
+    class _FakeMongo:
+        def __init__(self, counts) -> None:  # noqa: ANN001
+            self._counts = counts
+
+        def __getitem__(self, name):
+            return TestBootSnapshot._FakeColl(self._counts.get(name, 0))
+
+    def _prod_instance(self):
+        inst = bdb.Database()          # mongomock under tests …
+        inst.backend = "mongodb (pi_bot)"  # … pretend the production path
+        return inst
+
+    def test_mongomock_backend_skips_snapshot(self):
+        inst = bdb.Database()
+        self.assertIn("mongomock", inst.backend)
+        with self.assertNoLogs(logger="bot.database", level=logging.INFO):
+            inst._log_snapshot()
+
+    def test_snapshot_logs_counts(self):
+        inst = self._prod_instance()
+        inst._real_mongo = self._FakeMongo(
+            {"users": 5, "groups": 2, "daily_messages": 100}
+        )
+        with self.assertLogs("bot.database", logging.INFO) as cm:
+            inst._log_snapshot()
+        joined = "\n".join(cm.output)
+        self.assertIn("users=5", joined)
+        self.assertIn("groups=2", joined)
+        self.assertIn("daily_messages=100", joined)
+        self.assertNotIn("EMPTY", joined)
+
+    def test_empty_database_warns_loudly(self):
+        inst = self._prod_instance()
+        inst._real_mongo = self._FakeMongo({})
+        with self.assertLogs("bot.database", logging.WARNING) as cm:
+            inst._log_snapshot()
+        joined = "\n".join(cm.output)
+        self.assertIn("EMPTY", joined)
+        self.assertIn("MONGO_URI", joined)
+
+    def test_snapshot_failure_never_crashes_boot(self):
+        inst = self._prod_instance()
+
+        class _Boom:
+            def __getitem__(self, name):
+                raise RuntimeError("nope")
+
+        inst._real_mongo = _Boom()
+        with self.assertLogs("bot.database", logging.WARNING) as cm:
+            inst._log_snapshot()  # must not raise
+        self.assertIn("snapshot failed", "\n".join(cm.output))
+
+
 if __name__ == "__main__":
     unittest.main()

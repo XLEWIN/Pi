@@ -5,6 +5,7 @@ No Telethon dependency.
 """
 
 import asyncio
+import signal
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
@@ -67,6 +68,35 @@ async def _flush() -> None:
         logger.warning(f"final activity flush failed: {e}")
 
 
+def _install_signal_handlers(loop, task, on_stop=None) -> None:  # noqa: ANN001
+    """Make Railway's SIGTERM reach the shutdown flush.
+
+    Railway Restart/Redeploy stops the container with SIGTERM. The
+    default action kills the process instantly — no ``finally``, no
+    ``atexit`` — so the last ~5s of buffered message counters were lost
+    on every restart. Cancelling the main task instead lets
+    ``amain()``'s ``finally`` block flush before exit.
+
+    ``on_stop`` (if given) runs first so the cancellation can be
+    recognised as intentional (vs. an unrelated cancel).
+    """
+    def _stop() -> None:
+        if on_stop is not None:
+            on_stop()
+        if not task.done():
+            task.cancel()
+
+    try:
+        loop.add_signal_handler(signal.SIGTERM, _stop)
+    except (NotImplementedError, RuntimeError, ValueError):
+        # Windows event loop policy or non-main thread (tests): fall
+        # back to a plain handler where the platform allows it.
+        try:
+            signal.signal(signal.SIGTERM, lambda *_: _stop())
+        except (ValueError, OSError, RuntimeError):
+            pass
+
+
 def main() -> None:
     logger.info(f"Starting {BOT_NAME} (Pure Bot API Mode)...")
 
@@ -81,7 +111,11 @@ def main() -> None:
 
     count = load_modules()
     pipeline.install(dp)
-    logger.info(f"Loaded {count} module(s) — {BOT_NAME} is ready")
+    logger.info(
+        f"Loaded {count} module(s) — {BOT_NAME} is ready "
+        f"({len(pipeline.snapshot())} handlers — bump this number to "
+        "confirm a new deploy is actually live)"
+    )
 
     # Which database is this process actually using? (mongodb (pi_bot)
     # in production, mongomock only under tests — print it so a missing
@@ -91,6 +125,7 @@ def main() -> None:
     logger.info(f"Database backend: {db.backend}")
 
     async def amain() -> None:
+        sigterm = {"hit": False}
         try:
             # Handlers are mostly async + the DB layer is cached/buffered;
             # one sized pool keeps slow PIL rank renders from queueing
@@ -98,6 +133,11 @@ def main() -> None:
             loop = asyncio.get_running_loop()
             loop.set_default_executor(
                 ThreadPoolExecutor(max_workers=32, thread_name_prefix="pi-worker")
+            )
+            _install_signal_handlers(
+                loop,
+                asyncio.current_task(),
+                on_stop=lambda: sigterm.__setitem__("hit", True),
             )
 
             me = await bot.get_me()
@@ -127,6 +167,12 @@ def main() -> None:
                 allowed_updates=[t.value for t in UpdateType],
                 polling_timeout=30,
             )
+        except asyncio.CancelledError:
+            if not sigterm["hit"]:
+                raise
+            # Railway Restart/Redeploy: our own SIGTERM cancellation —
+            # fall through to finally so buffers flush, then exit 0.
+            logger.info("SIGTERM received — flushing before exit")
         finally:
             await _flush()
             try:
