@@ -73,7 +73,13 @@ _TEST_BACKENDS = ("unittest", "pytest")
 
 
 def _resolve_uri() -> Optional[str]:
-    """Mongo URI for this process — tests always get mongomock."""
+    """Mongo URI for this process — tests always get mongomock.
+
+    Outside tests, a missing URI is FATAL: the old silent mongomock
+    fallback made production run against an in-memory database, so
+    message counts/rankings vanished on every restart while the bot
+    kept pretending everything worked.
+    """
     if any(m in sys.modules for m in _TEST_BACKENDS):
         return None  # caller switches to mongomock
     uri = os.getenv("MONGO_URI", "").strip()
@@ -89,7 +95,15 @@ def _resolve_uri() -> Optional[str]:
         except ImportError:
             pass
         uri = os.getenv("MONGO_URI", "").strip()
-    return uri or None
+    if uri:
+        return uri
+    raise SystemExit(
+        "MONGO_URI is not set and no .env file was found at "
+        f"{env_file}. Refusing to run with an in-memory database — "
+        "chat rankings and message counts would silently vanish on "
+        "restart. Set MONGO_URI in the environment (e.g. Railway → "
+        "Variables) or create a .env file."
+    )
 
 
 class _CollProxy:
@@ -605,7 +619,13 @@ class Database:
         for name, entries in indexes.items():
             for keys, opts in entries:
                 try:
-                    self._mongo[name].create_index(keys, **opts)
+                    # mongomock's gen_index_name iterates dict KEYS when
+                    # given dict-form, then does '%s_%s' % 'user_id' →
+                    # TypeError. Both backends accept a proper pair list.
+                    key_list = (
+                        list(keys.items()) if isinstance(keys, dict) else list(keys)
+                    )
+                    self._mongo[name].create_index(key_list, **opts)
                 except Exception as e:  # pragma: no cover — index quirk
                     logger.warning(f"Index {name} {keys} skipped: {e}")
         logger.info("Database indexes created/verified")

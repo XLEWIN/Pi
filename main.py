@@ -23,6 +23,8 @@ from bot.logger import logger
 
 async def _startup_log(bot: Bot, me, privacy_on: bool) -> None:  # noqa: ANN001
     try:
+        from bot.database import db
+
         privacy_line = (
             "<b>Privacy:</b> ON — plain messages HIDDEN! "
             "BotFather /setprivacy → Disable"
@@ -35,7 +37,7 @@ async def _startup_log(bot: Bot, me, privacy_on: bool) -> None:  # noqa: ANN001
             f"<b>Bot ID:</b> <code>{me.id}</code>\n"
             f"<b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
             f"<b>Modules:</b> Loaded\n"
-            f"<b>Database:</b> Connected\n"
+            f"<b>Database:</b> {db.backend}\n"
             f"<b>Colored Buttons:</b> Active (aiogram)\n"
             f"<b>Logging:</b> Active\n"
             f"{privacy_line}\n\n"
@@ -80,6 +82,13 @@ def main() -> None:
     count = load_modules()
     pipeline.install(dp)
     logger.info(f"Loaded {count} module(s) — {BOT_NAME} is ready")
+
+    # Which database is this process actually using? (mongodb (pi_bot)
+    # in production, mongomock only under tests — print it so a missing
+    # MONGO_URI can never hide again.)
+    from bot.database import db
+
+    logger.info(f"Database backend: {db.backend}")
 
     async def amain() -> None:
         try:
