@@ -15,5 +15,12 @@ imageio-ffmpeg>=0.5.0
 pymongo>=4.9.0,<4.10
 dnspython>=2.8.0
 
+# Speed: orjson (Rust) feeds aiogram's json_loads/json_dumps session
+# hooks (every update parse + request build); uvloop swaps asyncio's
+# loop for libuv on Railway/Linux (no Windows wheels — the sys_platform
+# marker skips it on dev machines, which keep the default loop).
+orjson>=3.10
+uvloop>=0.21; sys_platform != "win32"
+
 # Test-only
 mongomock>=4.3.0

@@ -6,6 +6,7 @@ No Telethon dependency.
 
 import asyncio
 import signal
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
@@ -97,13 +98,55 @@ def _install_signal_handlers(loop, task, on_stop=None) -> None:  # noqa: ANN001
             pass
 
 
+def _json_hooks() -> dict:
+    """orjson (Rust) plugged into aiogram's session json hooks.
+
+    BaseSession exposes ``json_loads``/``json_dumps`` single-argument
+    callables used for every incoming update parse and outgoing request
+    build; orjson is roughly 2-5x faster than stdlib json there. Falls
+    back cleanly to stdlib json when orjson is not installed. orjson
+    returns bytes, so dumps is wrapped to honor the ``-> str`` contract.
+    """
+    try:
+        import orjson
+    except ImportError:
+        return {}
+
+    def _dumps(value):  # noqa: ANN001 — orjson returns bytes, session wants str
+        return orjson.dumps(value).decode("utf-8")
+
+    return {"json_loads": orjson.loads, "json_dumps": _dumps}
+
+
+def _install_uvloop() -> bool:
+    """Use libuv's event loop (uvloop) where wheels exist.
+
+    Railway runs Linux and gets the faster loop for polling and
+    handler scheduling; Windows dev machines have no uvloop wheels and
+    keep the default asyncio loop. Returns which loop is active so
+    startup can log it.
+    """
+    if sys.platform == "win32":
+        return False
+    try:
+        import uvloop
+    except ImportError:
+        return False
+    uvloop.install()
+    return True
+
+
 def main() -> None:
     logger.info(f"Starting {BOT_NAME} (Pure Bot API Mode)...")
+    loop_kind = "uvloop" if _install_uvloop() else "asyncio (default)"
+
+    hooks = _json_hooks()
+    json_kind = "orjson" if hooks else "json (stdlib)"
 
     # Regular Bot API HTTP timeouts (sendMessage, etc.).
     bot = Bot(
         token=settings.bot_token,
-        session=AiohttpSession(timeout=30.0, limit=20),
+        session=AiohttpSession(timeout=30.0, limit=20, **hooks),
         default=DefaultBotProperties(parse_mode=None),
     )
     dp = Dispatcher()
@@ -116,6 +159,7 @@ def main() -> None:
         f"({len(pipeline.snapshot())} handlers — bump this number to "
         "confirm a new deploy is actually live)"
     )
+    logger.info(f"Event loop: {loop_kind} · JSON: {json_kind}")
 
     # Which database is this process actually using? (mongodb (pi_bot)
     # in production, mongomock only under tests — print it so a missing

@@ -57,9 +57,12 @@ class TestResolveUri(unittest.TestCase):
         # `python main.py` boot — yet it must NOT count as a test run
         # (that false positive made Railway run on mongomock and wiped
         # all data on every restart despite MONGO_URI being set).
+        # Clear PI_TEST_BACKEND: other test modules may set it at import
+        # time (discovery loads every module before the first test runs).
         for argv in (["main.py"], [r"C:\app\main.py"], ["worker"]):
             with mock.patch.object(sys, "argv", argv), \
-                    mock.patch.object(sys, "orig_argv", ["python", argv[0]]):
+                    mock.patch.object(sys, "orig_argv", ["python", argv[0]]), \
+                    mock.patch.dict(os.environ, {"PI_TEST_BACKEND": ""}):
                 self.assertFalse(bdb._is_test_process(), argv)
 
     def test_this_very_suite_resolves_to_none(self):
