@@ -1,13 +1,17 @@
 """Bind module — force-join & message-type gates bound to a channel.
 
 Auto-discovered by bot.loader as package `bot.modules.bind`.
-setup(app) must live here so the top-level module exposes setup().
+setup() must live here so the top-level module exposes setup().
 """
 
-from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
+import re
 
-from bot.command_handler import COMMAND, CommandHandler
+from aiogram import F
+from aiogram.filters.logic import and_f
+
+from bot.command_handler import COMMAND, cmd
 from bot.logger import logger
+from bot.pipeline import GROUPS, SERVICE, on
 
 from . import database as bdb
 from .callbacks import bind_callback
@@ -21,46 +25,40 @@ from .handlers import (
 )
 
 
-def setup(app: Application) -> list[str]:
+def setup() -> list[str]:
     """Register Bind commands, callbacks, gate + join trackers."""
     try:
         bdb.ensure_tables()
     except Exception as e:
         logger.warning(f"Bind table init failed: {e}")
 
-    group_filter = filters.ChatType.GROUPS
-
     # Commands (default group 0 — same as other CommandHandlers).
-    app.add_handler(CommandHandler("bind", bind_command, filters=group_filter))
-    app.add_handler(CommandHandler("bindmenu", bindmenu_command, filters=group_filter))
+    on("message", bind_command, flt=and_f(cmd("bind"), GROUPS))
+    on("message", bindmenu_command, flt=and_f(cmd("bindmenu"), GROUPS))
 
     # Callbacks.
-    app.add_handler(CallbackQueryHandler(bind_callback, pattern=rf"^{CB_PREFIX}:"))
+    on("callback_query", bind_callback, flt=F.data.regexp(re.compile(rf"^{CB_PREFIX}:")))
 
     # Force-join / message gates — own group so we never collide with
     # filters(1)/blocklist(2)/watchwords(3). Do NOT exclude commands: when
     # force_join is on, non-member commands should be gated too (start.py
     # already ran in group 0 if it matched; we still delete the message).
     # StatusUpdate is a factory class — negate its ALL member, not the type.
-    app.add_handler(
-        MessageHandler(group_filter & ~filters.StatusUpdate.ALL, gate_message_handler),
-        group=HANDLER_GROUP,
-    )
+    on("message", gate_message_handler, group=HANDLER_GROUP, flt=GROUPS & ~SERVICE)
 
     # Waiting-for-input text (custom message / change channel) — own
     # group (20, NOT HANDLER_GROUP+1=5: that collides with leveling's
     # XP tracker and one-handler-per-group means the first registered
     # wins). Still created right after the gates (group 4), so it runs
     # after they've deleted non-member messages; admins only anyway.
-    app.add_handler(
-        MessageHandler(group_filter & filters.TEXT & ~COMMAND, waiting_text_handler),
-        group=WAITING_TEXT_GROUP,
-    )
+    on("message", waiting_text_handler, group=WAITING_TEXT_GROUP, flt=and_f(GROUPS, F.text, ~COMMAND))
 
     # Join timestamps for grace period (welcome uses group=10).
-    app.add_handler(
-        MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS | filters.StatusUpdate.LEFT_CHAT_MEMBER, join_tracker),
+    on(
+        "message",
+        join_tracker,
         group=JOIN_TRACKER_GROUP,
+        flt=F.new_chat_members | F.left_chat_member,
     )
 
     logger.info("Bind module registered")

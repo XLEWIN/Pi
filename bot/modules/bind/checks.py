@@ -4,7 +4,8 @@ import logging
 import time
 from typing import Any, Dict, Optional, Tuple
 
-from telegram import ChatMember, Message, User
+from aiogram.enums import ChatMemberStatus
+from aiogram.types import Message, User
 
 from .config import FAIL_STATUSES, MEMBERSHIP_CACHE_TTL, PASS_STATUSES
 
@@ -44,7 +45,12 @@ async def is_group_admin(bot, chat_id: int, user_id: int) -> bool:
     """True if user is admin/creator in the group."""
     try:
         member = await bot.get_chat_member(chat_id, user_id)
-        return member.status in ("administrator", "creator", ChatMember.ADMINISTRATOR, ChatMember.OWNER)
+        return member.status in (
+            "administrator",
+            "creator",
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.CREATOR,
+        )
     except Exception:
         return False
 

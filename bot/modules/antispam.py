@@ -29,11 +29,14 @@ from datetime import datetime, timedelta, timezone
 from html import escape
 from typing import Dict, List, Optional, Tuple
 
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import Application, ContextTypes, MessageHandler, filters
+from aiogram import F
+from aiogram.enums import ParseMode
+from aiogram.filters.logic import and_f
+from aiogram.types import Message
 
-from bot.command_handler import COMMAND, CommandHandler
+from bot.command_handler import COMMAND
+from bot.pipeline import GROUPS, cmd, on
+from bot.reply import reply_text
 from bot.database import db
 from bot.emojis import E
 from bot.modules.bans import is_sudo
@@ -86,11 +89,11 @@ def flood_text(user, minutes: int) -> str:
 # Flood watcher — same filter as the counter (group text messages)
 # ═════════════════════════════════════════════════════════════════
 
-async def flood_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.text:
+async def flood_watch(message: Message) -> None:
+    if not message or not message.text:
         return
-    chat = update.effective_chat
-    user = update.effective_user
+    chat = message.chat
+    user = message.from_user
     if chat is None or chat.type == "private" or user is None or user.is_bot:
         return
 
@@ -107,7 +110,7 @@ async def flood_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     db.spam_set_block(user.id, until.isoformat(timespec="seconds"))
 
     try:
-        await update.message.reply_text(
+        await reply_text(message,
             flood_text(user, minutes), parse_mode=ParseMode.HTML
         )
     except Exception as e:  # noqa: BLE001 — warning must never crash the handler
@@ -126,14 +129,14 @@ def _label_from_row(row: dict) -> str:
                   or str(row.get("user_id", "?")))
 
 
-def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def _resolve_target(message: Message, args: list):
     """(user_id, display_label) from reply / @username / USER_ID — or None."""
-    msg = update.message
+    msg = message
     if msg is not None and msg.reply_to_message and msg.reply_to_message.from_user:
         target = msg.reply_to_message.from_user
         return target.id, escape(target.username or target.first_name or str(target.id))
-    if context.args:
-        arg = context.args[0]
+    if args:
+        arg = args[0]
         if arg.startswith("@"):
             row = db.get_user_by_username(arg[1:])
             if row:
@@ -150,32 +153,32 @@ def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return None
 
 
-async def free_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
+async def free_command(message: Message, args: list) -> None:
+    msg = message
     if msg is None:
         return
-    sender = update.effective_user
+    sender = message.from_user
     if sender is None or not is_sudo(sender.id):
-        await msg.reply_text(
+        await reply_text(msg,
             f"{E.ERROR} Only sudo/owner users can use /free.",
             parse_mode=ParseMode.HTML,
         )
         return
-    target = _resolve_target(update, context)
+    target = _resolve_target(message, args)
     if target is None:
-        await msg.reply_text(
+        await reply_text(msg,
             plain_error("Usage: reply to a user, or /free @username | /free USER_ID"),
             parse_mode=ParseMode.HTML,
         )
         return
     user_id, label = target
     if db.spam_clear(user_id):
-        await msg.reply_text(
+        await reply_text(msg,
             plain_ok(f"<b>{label}</b> is free — warnings and block cleared."),
             parse_mode=ParseMode.HTML,
         )
     else:
-        await msg.reply_text(
+        await reply_text(msg,
             f"{E.INFO} {label} has no active warnings or block.",
             parse_mode=ParseMode.HTML,
         )
@@ -183,15 +186,14 @@ async def free_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 # ═════════════════════════════════════════════════════════════════
 
-def setup(app: Application) -> List[str]:
+def setup() -> List[str]:
     # Own group (9): one handler per group in PTB — must not shadow
     # chatstats(18)/users(19)/leveling(5) in group 0.
-    app.add_handler(
-        MessageHandler(
-            (filters.TEXT & ~COMMAND) & filters.ChatType.GROUPS,
-            flood_watch,
-        ),
+    on(
+        "message",
+        flood_watch,
         group=9,
+        flt=and_f(F.text, ~COMMAND, GROUPS),
     )
-    app.add_handler(CommandHandler("free", free_command))
+    on("message", free_command, flt=cmd("free"))
     return ["/free", "flood_watch"]

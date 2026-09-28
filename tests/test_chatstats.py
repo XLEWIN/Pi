@@ -16,13 +16,14 @@ runs its DB work on the in-process executor.
 
 from __future__ import annotations
 
+import asyncio
 import atexit
 import os
 import shutil
 import sys
 import tempfile
 import unittest
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -38,10 +39,11 @@ os.environ["LOCALAPPDATA"] = _TEST_DIR
 atexit.register(shutil.rmtree, _TEST_DIR, ignore_errors=True)
 
 # ── Imports (after env) ───────────────────────────────────────────
-from telegram import Chat, Message, Update  # noqa: E402
-from telegram.ext import CallbackQueryHandler as PTBCallbackQueryHandler  # noqa: E402
-from telegram.ext import MessageHandler as PTBMessageHandler  # noqa: E402
+from aiogram.dispatcher.event.handler import FilterObject, HandlerObject  # noqa: E402
 
+from aiofakes import FakeBot, call, command_filters, make_callback  # noqa: E402
+from aiofakes import make_message  # noqa: E402
+from bot import pipeline  # noqa: E402
 from bot.constants import HELP_MENU  # noqa: E402
 from bot.database import db  # noqa: E402
 from bot.modules import chatstats as cs  # noqa: E402
@@ -66,27 +68,41 @@ NEW_USER = 99555099     # never /start'ed — must auto-register on first messag
 # Fakes
 # ═════════════════════════════════════════════════════════════════
 
-class _Msg:
-    """Command message — records reply_text calls."""
+def _msg(
+    text: str | None = "/rankings",
+    *,
+    chat_id: int = CHAT_A,
+    chat_type: str = "supergroup",
+    title: str = "Test Group",
+    user_id: int = USER_1,
+    is_bot: bool = False,
+    first_name: str = "Lewin",
+    username: str | None = None,
+    **kw,
+):
+    """Command message — bot.reply helpers record into .calls as
+    ("reply", …) in group chats and ("answer", …) in private."""
+    msg = make_message(
+        text, chat_id=chat_id, chat_type=chat_type, title=title,
+        user_id=user_id, is_bot=is_bot, first_name=first_name,
+        username=username, **kw,
+    )
+    msg.from_user.last_name = None   # count_message registers the profile
+    return msg
 
-    def __init__(self, text: str = "/rankings") -> None:
-        self.text = text
-        self.reply_to_message = None
-        self.replies: list = []
 
-    async def reply_text(self, text, **kw):
-        self.replies.append({"text": text, **kw})
-        return SimpleNamespace(message_id=1)
+def _sent(msg):
+    """Text of the last reply/answer recorded on ``msg``."""
+    return msg.last[1] if msg.last else None
 
-    @property
-    def last(self):
-        return self.replies[-1] if self.replies else None
+
+def _kw(msg):
+    """Keyword args of the last reply/answer recorded on ``msg``."""
+    return msg.last[2] if msg.last else {}
 
 
 class _CBMsg:
-    """Mirrors real telegram.Message: it has chat/edit_text — NOT
-    edit_message_text (that lives on CallbackQuery), so calling the
-    wrong one fails loudly."""
+    """Board message: chat + edit_text (aiogram puts edits on Message)."""
 
     def __init__(self, chat_id: int, chat_type: str = "supergroup") -> None:
         self.chat = SimpleNamespace(id=chat_id, type=chat_type)
@@ -96,72 +112,6 @@ class _CBMsg:
     async def edit_text(self, text, **kw):
         self.edits.append({"text": text, **kw})
         return self
-
-
-class _CBQuery:
-    def __init__(self, data: str, from_user, msg: _CBMsg) -> None:
-        self.data = data
-        self.from_user = from_user
-        self.message = msg
-        self.answers: list = []
-
-    async def answer(self, text=None, show_alert=False):
-        self.answers.append({"text": text, "show_alert": show_alert})
-
-    async def edit_message_text(self, text, **kw):
-        # PTB puts the edit method on CallbackQuery, not on Message —
-        # mirror that here so a wrong call would fail loudly.
-        self.message.edits.append({"text": text, **kw})
-        return self.message
-
-
-def _update(
-    text: str = "hello",
-    *,
-    chat_id: int = CHAT_A,
-    chat_type: str = "supergroup",
-    title: str = "Test Group",
-    user_id: int = USER_1,
-    is_bot: bool = False,
-    first_name: str = "Lewin",
-    username: str | None = None,
-    last_name: str | None = None,
-    message=None,
-    chat=None,
-    user=None,
-):
-    msg = message if message is not None else SimpleNamespace(text=text)
-    chat = chat if chat is not None else SimpleNamespace(
-        id=chat_id, type=chat_type, title=title
-    )
-    user = user if user is not None else SimpleNamespace(
-        id=user_id, is_bot=is_bot, first_name=first_name,
-        username=username, last_name=last_name,
-    )
-    return SimpleNamespace(
-        message=msg, effective_message=msg, effective_chat=chat, effective_user=user
-    )
-
-
-def _cmd_update(text: str, *, chat_id=CHAT_A, chat_type="supergroup",
-                title="Test Group", user_id=USER_1):
-    return _update(
-        text, chat_id=chat_id, chat_type=chat_type, title=title,
-        user_id=user_id, message=_Msg(text),  # reply-capable message
-    )
-
-
-def _real_update(text: str, chat_id: int = CHAT_A,
-                 chat_type: str = "supergroup") -> Update:
-    """A real telegram.Update — used for filter (check_update) tests."""
-    msg = Message(
-        message_id=1,
-        date=datetime(2026, 1, 1, tzinfo=timezone.utc),
-        chat=Chat(id=chat_id, type=chat_type),
-        text=text,
-    )
-    msg._bot = SimpleNamespace(username="PiModulerBot")
-    return Update(update_id=1, message=msg)
 
 
 def _seed(chat_id: int, user_id: int, n: int, day: str = TODAY) -> None:
@@ -308,30 +258,28 @@ class TestCountHandler(unittest.IsolatedAsyncioTestCase):
         _cleanup()
 
     async def test_counts_group_text(self):
-        await cs.count_message(_update("hello"), None)
-        await cs.count_message(_update("again"), None)
+        await call(cs.count_message, _msg("hello"))
+        await call(cs.count_message, _msg("again"))
         rows = db.get_chat_top(CHAT_A)
         self.assertEqual(rows[0]["total_messages"], 2)
 
     async def test_skips_private(self):
-        await cs.count_message(
-            _update("hi", chat_type="private", chat_id=777), None
-        )
+        await call(cs.count_message, _msg("hi", chat_type="private", chat_id=777))
         self.assertEqual(db.get_chat_top(CHAT_A), [])
 
     async def test_skips_bots(self):
-        await cs.count_message(_update("bot says", is_bot=True), None)
+        await call(cs.count_message, _msg("bot says", is_bot=True))
         self.assertEqual(db.get_chat_top(CHAT_A), [])
 
     async def test_skips_non_text(self):
-        await cs.count_message(_update(None), None)
+        await call(cs.count_message, _msg(None))
         self.assertEqual(db.get_chat_top(CHAT_A), [])
 
     async def test_blocked_user_is_not_counted(self):
         """Spam-blocked messages must not reach the leaderboard."""
         db.spam_set_block(USER_1, "2999-12-31T00:00:00+00:00")
-        await cs.count_message(_update("hello"), None)
-        await cs.count_message(_update("again"), None)
+        await call(cs.count_message, _msg("hello"))
+        await call(cs.count_message, _msg("again"))
         self.assertEqual(db.get_chat_top(CHAT_A), [])
         # …but the sender is still auto-registered (registration ≠ counting)
         self.assertIsNotNone(db.get_user(USER_1))
@@ -340,20 +288,20 @@ class TestCountHandler(unittest.IsolatedAsyncioTestCase):
             {"user_id": USER_1},
             {"$set": {"blocked_until": "2000-01-01T00:00:00+00:00"}},
         )
-        await cs.count_message(_update("back"), None)
+        await call(cs.count_message, _msg("back"))
         self.assertEqual(db.get_chat_top(CHAT_A)[0]["total_messages"], 1)
 
     async def test_new_sender_auto_registers_without_start(self):
         """First group message registers the user — /start is not required."""
         self.assertIsNone(db.get_user(NEW_USER))
-        await cs.count_message(
-            _update(
+        await call(
+            cs.count_message,
+            _msg(
                 "hello everyone",
                 user_id=NEW_USER,
                 first_name="Newbie",
                 username="newbie99",
             ),
-            None,
         )
         row = db.get_user(NEW_USER)
         self.assertIsNotNone(row)
@@ -366,14 +314,14 @@ class TestCountHandler(unittest.IsolatedAsyncioTestCase):
 
     async def test_registration_refreshes_renamed_profile(self):
         db.add_user(NEW_USER, "oldname", "OldName", None)
-        await cs.count_message(
-            _update(
+        await call(
+            cs.count_message,
+            _msg(
                 "I renamed myself",
                 user_id=NEW_USER,
                 first_name="NewName",
                 username="newname",
             ),
-            None,
         )
         row = db.get_user(NEW_USER)
         self.assertEqual(row["first_name"], "NewName")
@@ -393,14 +341,14 @@ class TestNewUserRegistration(unittest.IsolatedAsyncioTestCase):
 
     async def test_first_message_registers_caches_and_logs(self):
         with mock.patch.object(cs, "send_newuser_log", new=mock.AsyncMock()) as log:
-            await cs.count_message(
-                _update(
+            await call(
+                cs.count_message,
+                _msg(
                     "hello everyone",
                     user_id=NEW_USER,
                     first_name="Newbie",
                     username="newbie99",
                 ),
-                None,
             )
         # registered + counted
         self.assertIsNotNone(db.get_user(NEW_USER))
@@ -418,19 +366,22 @@ class TestNewUserRegistration(unittest.IsolatedAsyncioTestCase):
 
     async def test_log_fires_only_once_ever(self):
         with mock.patch.object(cs, "send_newuser_log", new=mock.AsyncMock()) as log:
-            await cs.count_message(
-                _update("one", user_id=NEW_USER, first_name="Newbie"), None
+            await call(
+                cs.count_message,
+                _msg("one", user_id=NEW_USER, first_name="Newbie"),
             )
-            await cs.count_message(
-                _update("two", user_id=NEW_USER, first_name="Newbie"), None
+            await call(
+                cs.count_message,
+                _msg("two", user_id=NEW_USER, first_name="Newbie"),
             )
         self.assertEqual(log.call_count, 1)
 
     async def test_existing_user_gets_no_log(self):
         db.add_user(NEW_USER, "veteran", "Vet", None)
         with mock.patch.object(cs, "send_newuser_log", new=mock.AsyncMock()) as log:
-            await cs.count_message(
-                _update("hi again", user_id=NEW_USER, first_name="Vet"), None
+            await call(
+                cs.count_message,
+                _msg("hi again", user_id=NEW_USER, first_name="Vet"),
             )
         log.assert_not_called()
         self.assertEqual(db.get_chat_top(CHAT_A)[0]["total_messages"], 1)
@@ -438,17 +389,23 @@ class TestNewUserRegistration(unittest.IsolatedAsyncioTestCase):
     async def test_blocked_new_user_still_registers_and_logs(self):
         db.spam_set_block(NEW_USER, "2999-12-31T00:00:00+00:00")
         with mock.patch.object(cs, "send_newuser_log", new=mock.AsyncMock()) as log:
-            await cs.count_message(
-                _update("flooding already", user_id=NEW_USER, first_name="Newbie"),
-                None,
+            await call(
+                cs.count_message,
+                _msg("flooding already", user_id=NEW_USER, first_name="Newbie"),
             )
         log.assert_called_once()          # first contact still logs
         self.assertIsNotNone(db.get_user(NEW_USER))   # and registers
         self.assertEqual(db.get_chat_top(CHAT_A), [])  # but not counted
 
 
-class TestNewuserLogFormat(unittest.TestCase):
+class TestNewuserLogFormat(unittest.IsolatedAsyncioTestCase):
     """#Newuser text — Pi style, only the owner's emoji (rich + plain)."""
+
+    def setUp(self):
+        _cleanup()
+
+    def tearDown(self):
+        _cleanup()
 
     def _user(self, **kw):
         base = dict(id=NEW_USER, first_name="Z\u00eb\u0141\u03c3", username="hoxrr")
@@ -492,33 +449,33 @@ class TestNewuserLogFormat(unittest.TestCase):
 
     async def test_milestone_at_100(self):
         _seed(CHAT_A, USER_1, 99)
-        msg = _Msg("the hundredth")
-        await cs.count_message(_update(message=msg), None)
-        self.assertEqual(len(msg.replies), 1)
-        text = msg.last["text"]
+        msg = _msg("the hundredth")
+        await call(cs.count_message, msg)
+        self.assertEqual(len(msg.sent_texts), 1)
+        text = _sent(msg)
         self.assertIn("100 messages reached today!", text)
         self.assertIn("(", text)  # (HH:MM)
-        self.assertEqual(msg.last.get("parse_mode"), "HTML")
+        self.assertEqual(_kw(msg).get("parse_mode"), "HTML")
         self.assertIn("<tg-emoji", text)   # owner's custom 🔥 icon
 
     async def test_milestone_at_500_not_between(self):
         _seed(CHAT_A, USER_1, 498)
-        msg = _Msg("four ninety nine")
-        await cs.count_message(_update(message=msg), None)
-        self.assertEqual(msg.replies, [], "499 is not a milestone")
-        msg2 = _Msg("five hundred")
-        await cs.count_message(_update(message=msg2), None)
-        self.assertEqual(len(msg2.replies), 1)
-        self.assertIn("500 messages reached today!", msg2.last["text"])
+        msg = _msg("four ninety nine")
+        await call(cs.count_message, msg)
+        self.assertEqual(msg.sent_texts, [], "499 is not a milestone")
+        msg2 = _msg("five hundred")
+        await call(cs.count_message, msg2)
+        self.assertEqual(len(msg2.sent_texts), 1)
+        self.assertIn("500 messages reached today!", _sent(msg2))
 
     async def test_milestone_fires_once(self):
         _seed(CHAT_A, USER_1, 99)
-        msg1 = _Msg("m")
-        await cs.count_message(_update(message=msg1), None)
-        msg2 = _Msg("m")
-        await cs.count_message(_update(message=msg2), None)
-        self.assertEqual(len(msg1.replies), 1)
-        self.assertEqual(msg2.replies, [], "101 must not re-announce 100")
+        msg1 = _msg("m")
+        await call(cs.count_message, msg1)
+        msg2 = _msg("m")
+        await call(cs.count_message, msg2)
+        self.assertEqual(len(msg1.sent_texts), 1)
+        self.assertEqual(msg2.sent_texts, [], "101 must not re-announce 100")
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -537,31 +494,31 @@ class TestRankings(unittest.IsolatedAsyncioTestCase):
         _cleanup()
 
     async def test_board_format_and_total(self):
-        msg = _Msg("/rankings")
-        await cs.rankings_command(_update(message=msg), None)
-        text = msg.last["text"]
+        msg = _msg("/rankings")
+        await call(cs.rankings_command, msg)
+        text = _sent(msg)
         self.assertIn("Leaderboard", text)
         self.assertIn(f'href="tg://user?id={USER_1}"', text)
         self.assertIn("11,797", text)
         self.assertIn("2,019", text)
         self.assertIn("Total messages: 13,816", text)
-        self.assertEqual(msg.last.get("parse_mode"), "HTML")
+        self.assertEqual(_kw(msg).get("parse_mode"), "HTML")
         # every icon must be the owner's custom set — no plain glyphs
         self.assertIn("<tg-emoji", text)
         self.assertNotIn("\U0001f4ca", text)  # plain 📊
         self.assertNotIn("\U0001f4ac", text)  # plain 💬
 
     async def test_order_and_rank_numbers(self):
-        msg = _Msg("/rankings")
-        await cs.rankings_command(_update(message=msg), None)
-        text = msg.last["text"]
+        msg = _msg("/rankings")
+        await call(cs.rankings_command, msg)
+        text = _sent(msg)
         self.assertLess(text.index("1. "), text.index("2. "))
         self.assertLess(text.index("2. "), text.index("Total messages"))
 
     async def test_tab_buttons_layout(self):
-        msg = _Msg("/rankings")
-        await cs.rankings_command(_update(message=msg), None)
-        markup = msg.last.get("reply_markup")
+        msg = _msg("/rankings")
+        await call(cs.rankings_command, msg)
+        markup = _kw(msg).get("reply_markup")
         self.assertIsNotNone(markup)
         rows = markup.inline_keyboard
         self.assertEqual(len(rows), 2)
@@ -569,16 +526,16 @@ class TestRankings(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rows[1]), 2)  # Today, Weekly — no Monthly tab
         active = rows[0][0]
         self.assertEqual(active.text, "Overall \u2705")
-        self.assertEqual(active.api_kwargs.get("style"), "success")
+        self.assertEqual(active.style, "success")
         self.assertEqual(active.callback_data, "cs:r:overall")
         self.assertEqual(
-            active.api_kwargs.get("icon_custom_emoji_id"), cs.EID.WEB
+            active.icon_custom_emoji_id, cs.EID.WEB
         )
         self.assertEqual([b.text for b in rows[1]], ["Today", "Weekly"])
         for b in rows[1]:
-            self.assertEqual(b.api_kwargs.get("style"), "primary")
+            self.assertEqual(b.style, "primary")
         self.assertEqual(
-            [b.api_kwargs.get("icon_custom_emoji_id") for b in rows[1]],
+            [b.icon_custom_emoji_id for b in rows[1]],
             [cs.EID.TIME, cs.EID.FIRE],
         )
         self.assertEqual(
@@ -594,19 +551,17 @@ class TestRankings(unittest.IsolatedAsyncioTestCase):
             self.assertIn(f"<i>{label}</i>", text, scope)
 
     async def test_private_denied(self):
-        msg = _Msg("/rankings")
-        await cs.rankings_command(
-            _update(message=msg, chat_type="private", chat_id=42), None
-        )
-        self.assertIn("only works in groups", msg.last["text"])
-        self.assertIsNone(msg.last.get("reply_markup"))
+        msg = _msg("/rankings", chat_type="private", chat_id=42)
+        await call(cs.rankings_command, msg)
+        self.assertIn("only works in groups", _sent(msg))
+        self.assertIsNone(_kw(msg).get("reply_markup"))
 
     async def test_empty_state(self):
         _cleanup()
-        msg = _Msg("/rankings")
-        await cs.rankings_command(_update(message=msg), None)
-        self.assertIn("No messages counted yet", msg.last["text"])
-        self.assertIsNone(msg.last.get("reply_markup"))
+        msg = _msg("/rankings")
+        await call(cs.rankings_command, msg)
+        self.assertIn("No messages counted yet", _sent(msg))
+        self.assertIsNone(_kw(msg).get("reply_markup"))
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -627,29 +582,29 @@ class TestMytop(unittest.IsolatedAsyncioTestCase):
         _cleanup()
 
     async def test_groups_ranked_by_user_messages(self):
-        msg = _Msg("/mytop")
-        await cs.mytop_command(_update(message=msg), None)
-        text = msg.last["text"]
+        msg = _msg("/mytop")
+        await call(cs.mytop_command, msg)
+        text = _sent(msg)
         self.assertIn("Top Groups", text)
         self.assertIn(f'href="tg://user?id={USER_1}"', text)  # profile mention header
         self.assertIn("Smash Your Character", text)
         self.assertIn("7,107", text)
         self.assertIn("Alpha Chat", text)
         self.assertLess(text.index("1. "), text.index("2. "))
-        self.assertEqual(msg.last.get("parse_mode"), "HTML")
+        self.assertEqual(_kw(msg).get("parse_mode"), "HTML")
         self.assertIn("<tg-emoji", text)
         self.assertNotIn("\U0001f4ca", text)  # header must be a custom emoji
 
     async def test_buttons_carry_user_id(self):
-        msg = _Msg("/mytop")
-        await cs.mytop_command(_update(message=msg), None)
-        markup = msg.last.get("reply_markup")
+        msg = _msg("/mytop")
+        await call(cs.mytop_command, msg)
+        markup = _kw(msg).get("reply_markup")
         active = markup.inline_keyboard[0][0]
         self.assertEqual(active.callback_data, f"cs:m:{USER_1}:overall")
-        self.assertEqual(active.api_kwargs.get("style"), "success")
+        self.assertEqual(active.style, "success")
         self.assertEqual(active.text, "Overall \u2705")
         self.assertEqual(
-            active.api_kwargs.get("icon_custom_emoji_id"), cs.EID.WEB
+            active.icon_custom_emoji_id, cs.EID.WEB
         )
 
     async def test_mytop_scope_text_in_header(self):
@@ -659,25 +614,23 @@ class TestMytop(unittest.IsolatedAsyncioTestCase):
             self.assertIn(f"<i>{label}</i>", text, scope)
 
     async def test_works_in_private(self):
-        msg = _Msg("/mytop")
-        await cs.mytop_command(
-            _update(message=msg, chat_type="private", chat_id=USER_1), None
-        )
-        self.assertIn("Top Groups", msg.last["text"])
+        msg = _msg("/mytop", chat_type="private", chat_id=USER_1)
+        await call(cs.mytop_command, msg)
+        self.assertIn("Top Groups", _sent(msg))
 
     async def test_title_fallback_when_group_unknown(self):
         _cleanup()
         _seed(CHAT_A, USER_1, 5)
-        msg = _Msg("/mytop")
-        await cs.mytop_command(_update(message=msg), None)
-        self.assertIn(f"Chat {CHAT_A}", msg.last["text"])
+        msg = _msg("/mytop")
+        await call(cs.mytop_command, msg)
+        self.assertIn(f"Chat {CHAT_A}", _sent(msg))
 
     async def test_empty_state(self):
         _cleanup()
-        msg = _Msg("/mytop")
-        await cs.mytop_command(_update(message=msg), None)
-        self.assertIn("No messages found", msg.last["text"])
-        self.assertIsNone(msg.last.get("reply_markup"))
+        msg = _msg("/mytop")
+        await call(cs.mytop_command, msg)
+        self.assertIn("No messages found", _sent(msg))
+        self.assertIsNone(_kw(msg).get("reply_markup"))
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -696,8 +649,8 @@ class TestBoardCallback(unittest.IsolatedAsyncioTestCase):
 
     async def test_rank_scope_switch_edits_board(self):
         msg = _CBMsg(CHAT_A)
-        query = _CBQuery("cs:r:today", SimpleNamespace(id=USER_1), msg)
-        await cs.board_callback(SimpleNamespace(callback_query=query), None)
+        query = make_callback("cs:r:today", message=msg, user_id=USER_1)
+        await call(cs.board_callback, query)
         self.assertEqual(len(msg.edits), 1)
         text = msg.edits[0]["text"]
         self.assertIn("5", text)          # today-only count
@@ -707,7 +660,7 @@ class TestBoardCallback(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(markup.inline_keyboard[0][0].text, "Today \u2705")
         self.assertEqual(
             markup.inline_keyboard[0][0]
-            .api_kwargs.get("icon_custom_emoji_id"),
+            .icon_custom_emoji_id,
             cs.EID.TIME,
         )
         self.assertEqual(markup.inline_keyboard[0][0].callback_data, "cs:r:today")
@@ -715,19 +668,21 @@ class TestBoardCallback(unittest.IsolatedAsyncioTestCase):
 
     async def test_mytop_foreign_presser_gets_alert(self):
         msg = _CBMsg(CHAT_A)
-        other = _CBQuery(
-            f"cs:m:{USER_1}:week", SimpleNamespace(id=999999), msg
+        other = make_callback(
+            f"cs:m:{USER_1}:week", message=msg, user_id=999999
         )
-        await cs.board_callback(SimpleNamespace(callback_query=other), None)
+        await call(cs.board_callback, other)
         self.assertEqual(msg.edits, [], "board must not switch for a stranger")
         self.assertTrue(other.answers[0]["show_alert"])
         self.assertIn("original user", other.answers[0]["text"])
 
     async def test_owner_presser_switches(self):
         msg = _CBMsg(CHAT_A, chat_type="private")
-        owner = SimpleNamespace(id=USER_1, username="lewin", first_name="Lewin")
-        query = _CBQuery(f"cs:m:{USER_1}:week", owner, msg)
-        await cs.board_callback(SimpleNamespace(callback_query=query), None)
+        query = make_callback(
+            f"cs:m:{USER_1}:week", message=msg, user_id=USER_1,
+            username="lewin",
+        )
+        await call(cs.board_callback, query)
         self.assertEqual(len(msg.edits), 1)
         self.assertIn("Top Groups", msg.edits[0]["text"])
 
@@ -735,8 +690,8 @@ class TestBoardCallback(unittest.IsolatedAsyncioTestCase):
         msg = _CBMsg(CHAT_A)
         for data in ("cs:x:today", "cs:r:nope", "cs:r:month",
                      "cs:m:notanint:today", "other:cb"):
-            query = _CBQuery(data, SimpleNamespace(id=USER_1), msg)
-            await cs.board_callback(SimpleNamespace(callback_query=query), None)
+            query = make_callback(data, message=msg, user_id=USER_1)
+            await call(cs.board_callback, query)
         self.assertEqual(msg.edits, [])
 
 
@@ -746,51 +701,44 @@ class TestBoardCallback(unittest.IsolatedAsyncioTestCase):
 
 class TestWiring(unittest.TestCase):
     def test_setup_registers_everything(self):
-        from bot.command_handler import CommandHandler as PiCommandHandler
-
-        class _App:
-            def __init__(self):
-                self.handlers = []
-
-            def add_handler(self, handler, group=0):
-                self.handlers.append(handler)
-
-        app = _App()
-        routes = cs.setup(app)
+        pipeline.clear()
+        routes = cs.setup()
         self.assertIn("/rankings", routes)
         self.assertIn("/mytop", routes)
 
         cmd_names = set()
         n_msg = n_cb = 0
-        for h in app.handlers:
-            if isinstance(h, PiCommandHandler):
-                cmd_names.update(h.commands)
-            elif isinstance(h, PTBMessageHandler):
-                n_msg += 1
-            elif isinstance(h, PTBCallbackQueryHandler):
+        for entry in pipeline.snapshot():
+            if entry.event == "callback_query":
                 n_cb += 1
+                continue
+            cmd_filters = command_filters(entry.flt)
+            if cmd_filters:
+                for flt in cmd_filters:
+                    cmd_names.update(flt.commands)
+            elif entry.event == "message":
+                n_msg += 1
         self.assertEqual(cmd_names, {"rankings", "mytop"})
         self.assertEqual(n_msg, 1)
         self.assertEqual(n_cb, 1)
 
     def test_counting_filter_accepts_text_rejects_commands_and_private(self):
-        from bot.command_handler import CommandHandler as PiCommandHandler
+        pipeline.clear()
+        cs.setup()
+        entry = next(e for e in pipeline.snapshot() if e.fn is cs.count_message)
+        handler = HandlerObject(
+            callback=entry.fn, filters=[FilterObject(entry.flt)]
+        )
 
-        class _App:
-            def __init__(self):
-                self.handlers = []
+        def check(event):
+            ok, _ = asyncio.run(handler.check(event, bot=FakeBot()))
+            return ok
 
-            def add_handler(self, handler, group=0):
-                self.handlers.append(handler)
-
-        app = _App()
-        cs.setup(app)
-        mh = next(h for h in app.handlers if isinstance(h, PTBMessageHandler))
-        check = mh.filters.check_update
-        self.assertTrue(check(_real_update("hello there")))
-        self.assertFalse(check(_real_update("/rankings")), "commands must not count")
+        self.assertTrue(check(make_message("hello there")))
+        self.assertFalse(check(make_message("/rankings")), "commands must not count")
         self.assertFalse(
-            check(_real_update("hi", chat_type="private", chat_id=7)), "private must not count"
+            check(make_message("hi", chat_type="private", chat_id=7)),
+            "private must not count",
         )
 
     def test_help_documents_both_commands(self):

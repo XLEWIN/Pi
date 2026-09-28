@@ -1,16 +1,19 @@
 """Shared action-card callbacks — Close dismisses the card buttons."""
 
 import logging
+import re
 
-from telegram import Update
-from telegram.ext import Application, CallbackQueryHandler, ContextTypes
+from aiogram import F
+from aiogram.types import CallbackQuery
+
+from bot.pipeline import on
 
 logger = logging.getLogger(__name__)
 
 
-async def card_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def card_callback(callback_query: CallbackQuery) -> None:
     """Handle card:close — delete the card (or strip its buttons)."""
-    query = update.callback_query
+    query = callback_query
     data = query.data or ""
     if not data.startswith("card:"):
         return
@@ -25,7 +28,7 @@ async def card_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await query.message.delete()
         except Exception:
             try:
-                await query.edit_message_reply_markup(reply_markup=None)
+                await query.message.edit_reply_markup(reply_markup=None)
             except Exception as e:
                 logger.debug("card close failed: %s", e)
         return
@@ -36,6 +39,6 @@ async def card_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         pass
 
 
-def setup(app: Application) -> list:
-    app.add_handler(CallbackQueryHandler(card_callback, pattern=r"^card:"))
+def setup() -> list:
+    on("callback_query", card_callback, flt=F.data.regexp(re.compile(r"^card:")))
     return ["card:close"]

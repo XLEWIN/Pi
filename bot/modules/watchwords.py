@@ -5,30 +5,27 @@ Sends colored buttons via pure PTB.
 """
 
 import logging
-from datetime import datetime
 
-from telegram import Update
-from telegram.ext import (
-    Application,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
-from telegram.constants import ParseMode
+from aiogram import Bot, F
+from aiogram.enums import ParseMode
+from aiogram.filters.logic import and_f, or_f
+from aiogram.types import Message
 
-from bot.command_handler import COMMAND, CommandHandler
+from bot.command_handler import COMMAND
 from bot.database import db
 from bot.keyboards.colored import btn_url, build_keyboard
 from bot.emojis import E, EID
+from bot.pipeline import on, GROUPS, cmd
+from bot.reply import reply_text
 
 logger = logging.getLogger(__name__)
 
 
-async def _is_admin(update, context):
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
+async def _is_admin(message, bot):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
     try:
-        member = await context.bot.get_chat_member(chat_id, user_id)
+        member = await bot.get_chat_member(chat_id, user_id)
         return member.status in ["administrator", "creator"]
     except Exception:
         return False
@@ -40,17 +37,18 @@ def _get_chat_link(chat):
     return chat.title or "Private Chat"
 
 
-async def watch_command(update, context):
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.INFO} This command only works in groups.",
+async def watch_command(message: Message, bot: Bot, args: list):
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.INFO} This command only works in groups.",
             parse_mode=ParseMode.HTML)
         return
-    if not await _is_admin(update, context):
-        await update.message.reply_text(f"{E.ERROR} Only admins can manage watch words.",
+    if not await _is_admin(message, bot):
+        await reply_text(message, f"{E.ERROR} Only admins can manage watch words.",
             parse_mode=ParseMode.HTML)
         return
-    if not context.args:
-        await update.message.reply_text(
+    if not args:
+        await reply_text(
+            message,
             f"{E.EYES} <b>Watch Words</b>\n\n"
             "<b>Usage:</b>\n"
             "  /watch &lt;word or phrase&gt; - Add a watch word\n"
@@ -62,80 +60,84 @@ async def watch_command(update, context):
         )
         return
 
-    chat_id = update.effective_chat.id
-    admin_id = update.effective_user.id
-    word = " ".join(context.args).lower().strip()
+    chat_id = message.chat.id
+    admin_id = message.from_user.id
+    word = " ".join(args).lower().strip()
 
     existing = db.get_watch_words(chat_id, admin_id)
     if word in existing:
-        await update.message.reply_text(f"{E.WARNING} <b>{word}</b> is already being watched.", parse_mode=ParseMode.HTML)
+        await reply_text(message, f"{E.WARNING} <b>{word}</b> is already being watched.", parse_mode=ParseMode.HTML)
         return
 
     db.add_watch_word(chat_id, admin_id, word)
-    await update.message.reply_text(
+    await reply_text(
+        message,
         f"{E.CHECK} Added <b>{word}</b> to your watch list.\nI'll notify you in DM when someone uses it.",
         parse_mode=ParseMode.HTML,
     )
 
 
-async def unwatch_command(update, context):
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.INFO} This command only works in groups.",
+async def unwatch_command(message: Message, bot: Bot, args: list):
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.INFO} This command only works in groups.",
             parse_mode=ParseMode.HTML)
         return
-    if not await _is_admin(update, context):
-        await update.message.reply_text(f"{E.ERROR} Only admins can manage watch words.",
+    if not await _is_admin(message, bot):
+        await reply_text(message, f"{E.ERROR} Only admins can manage watch words.",
             parse_mode=ParseMode.HTML)
         return
-    if not context.args:
-        await update.message.reply_text(f"{E.INFO} Usage: /unwatch &lt;word or phrase&gt;", parse_mode=ParseMode.HTML)
+    if not args:
+        await reply_text(message, f"{E.INFO} Usage: /unwatch &lt;word or phrase&gt;", parse_mode=ParseMode.HTML)
         return
 
-    chat_id = update.effective_chat.id
-    admin_id = update.effective_user.id
-    word = " ".join(context.args).lower().strip()
+    chat_id = message.chat.id
+    admin_id = message.from_user.id
+    word = " ".join(args).lower().strip()
 
     if db.remove_watch_word(chat_id, admin_id, word):
-        await update.message.reply_text(f"{E.CHECK} Removed <b>{word}</b> from your watch list.", parse_mode=ParseMode.HTML)
+        await reply_text(message, f"{E.CHECK} Removed <b>{word}</b> from your watch list.", parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text(f"{E.WARNING} Word not found in your watch list.",
+        await reply_text(message, f"{E.WARNING} Word not found in your watch list.",
             parse_mode=ParseMode.HTML)
 
 
-async def watchlist_command(update, context):
-    if update.effective_chat.type == "private":
-        await update.message.reply_text("This command only works in groups.")
+async def watchlist_command(message: Message):
+    if message.chat.type == "private":
+        await reply_text(message, "This command only works in groups.")
         return
 
-    chat_id = update.effective_chat.id
-    admin_id = update.effective_user.id
+    chat_id = message.chat.id
+    admin_id = message.from_user.id
     words = db.get_watch_words(chat_id, admin_id)
 
     if not words:
-        await update.message.reply_text(
+        await reply_text(
+            message,
             f"{E.INFO} Your watch list is empty.\nUse /watch &lt;word&gt; to add words.",
             parse_mode=ParseMode.HTML,
         )
         return
 
     word_list = "\n".join([f"  - <code>{w}</code>" for w in sorted(words)])
-    await update.message.reply_text(
+    await reply_text(
+        message,
         f"{E.EYES} <b>Your Watched Words ({len(words)}):</b>\n{word_list}",
         parse_mode=ParseMode.HTML,
     )
 
 
-async def watchmode_command(update, context):
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.INFO} This command only works in groups.",
+async def watchmode_command(message: Message, bot: Bot, args: list):
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.INFO} This command only works in groups.",
             parse_mode=ParseMode.HTML)
         return
-    if not await _is_admin(update, context):
-        await update.message.reply_text(f"{E.ERROR} Only admins can change watch settings.",
+    if not await _is_admin(message, bot):
+        await reply_text(message, f"{E.ERROR} Only admins can change watch settings.",
             parse_mode=ParseMode.HTML)
         return
-    if not context.args or context.args[0].lower() not in ["copy", "forward"]:
-        await update.message.reply_text(
+    if not args or args[0].lower() not in ["copy", "forward"]:
+        await reply_text(
+            message,
             f"{E.SETTINGS} Choose mode: <b>copy</b> or <b>forward</b>\n\n"
             "<b>copy</b> - Formatted log with chat, sender, word, date, message.\n"
             "<b>forward</b> - Forwards the original message.",
@@ -143,20 +145,19 @@ async def watchmode_command(update, context):
         )
         return
 
-    chat_id = update.effective_chat.id
-    admin_id = update.effective_user.id
-    mode = context.args[0].lower()
+    chat_id = message.chat.id
+    admin_id = message.from_user.id
+    mode = args[0].lower()
     db.set_watch_mode(chat_id, admin_id, mode)
-    await update.message.reply_text(f"{E.CHECK} Watch mode set to: <b>{mode}</b>", parse_mode=ParseMode.HTML)
+    await reply_text(message, f"{E.CHECK} Watch mode set to: <b>{mode}</b>", parse_mode=ParseMode.HTML)
 
 
-async def watch_check(update, context):
-    if not update.message or update.effective_chat.type == "private":
+async def watch_check(message: Message, bot: Bot):
+    if not message or message.chat.type == "private":
         return
 
-    chat_id = update.effective_chat.id
-    chat = update.effective_chat
-    message = update.message
+    chat_id = message.chat.id
+    chat = message.chat
     text = (message.text or message.caption or "").lower()
 
     if not text:
@@ -200,7 +201,7 @@ async def watch_check(update, context):
                             tg_buttons.append([btn_url("View Message", msg_link, icon_emoji_id=EID.WATCH)])
 
                         reply_markup = build_keyboard(tg_buttons) if tg_buttons else None
-                        await context.bot.send_message(
+                        await bot.send_message(
                             chat_id=admin_id,
                             text=copy_text,
                             parse_mode=ParseMode.HTML,
@@ -214,9 +215,9 @@ async def watch_check(update, context):
                         )
                         # plain text fallback if HTML entities in title break parse
                         try:
-                            await context.bot.send_message(chat_id=admin_id, text=header, parse_mode=ParseMode.HTML)
+                            await bot.send_message(chat_id=admin_id, text=header, parse_mode=ParseMode.HTML)
                         except Exception:
-                            await context.bot.send_message(
+                            await bot.send_message(
                                 chat_id=admin_id,
                                 text=f"Watch Word Alert!\nChat: {chat.title}\nMatched: {word}",
                             )
@@ -228,11 +229,11 @@ async def watch_check(update, context):
                 break
 
 
-def setup(app: Application) -> list:
-    app.add_handler(CommandHandler("watch", watch_command, filters=filters.ChatType.GROUPS))
-    app.add_handler(CommandHandler("unwatch", unwatch_command, filters=filters.ChatType.GROUPS))
-    app.add_handler(CommandHandler("watchlist", watchlist_command, filters=filters.ChatType.GROUPS))
-    app.add_handler(CommandHandler("watchmode", watchmode_command, filters=filters.ChatType.GROUPS))
-    app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~COMMAND, watch_check), group=3)
+def setup() -> list:
+    on("message", watch_command, flt=and_f(cmd("watch"), GROUPS))
+    on("message", unwatch_command, flt=and_f(cmd("unwatch"), GROUPS))
+    on("message", watchlist_command, flt=and_f(cmd("watchlist"), GROUPS))
+    on("message", watchmode_command, flt=and_f(cmd("watchmode"), GROUPS))
+    on("message", watch_check, group=3, flt=and_f(or_f(F.text, F.caption), ~COMMAND))
 
     return ["watch", "unwatch", "watchlist", "watchmode"]

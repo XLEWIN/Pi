@@ -28,13 +28,13 @@ import sys
 from html import escape
 from typing import List, Optional
 
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import Application, ContextTypes
+from aiogram.enums import ParseMode
+from aiogram.types import Message
 
-from bot.command_handler import CommandHandler
 from bot.config import settings
 from bot.emojis import E
+from bot.pipeline import cmd, on
+from bot.reply import reply_text
 from bot.responses import action_card, field_extra, plain_error
 
 logger = logging.getLogger(__name__)
@@ -94,13 +94,14 @@ async def _flush_write_behinds() -> None:
         logger.warning(f"restart: activity buffer flush failed: {e}")
 
 
-async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
+async def restart_command(message: Message) -> None:
+    msg = message
     if msg is None:
         return
-    user = update.effective_user
+    user = message.from_user
     if user is None or not settings.owner_id or user.id != settings.owner_id:
-        await msg.reply_text(
+        await reply_text(
+            msg,
             f"{E.CROWN} Only the bot owner can restart me.",
             parse_mode=ParseMode.HTML,
         )
@@ -111,7 +112,7 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         [field_extra(E.TIME, "Mode", "in-place re-exec")],
         icon=E.CROWN,
     )
-    prog = await msg.reply_text(card, parse_mode=ParseMode.HTML)
+    prog = await reply_text(msg, card, parse_mode=ParseMode.HTML)
     await asyncio.sleep(_NOTICE_WAIT)
     await _flush_write_behinds()
 
@@ -125,6 +126,6 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
 
-def setup(app: Application) -> List[str]:
-    app.add_handler(CommandHandler(["restart", "reboot"], restart_command))
+def setup() -> List[str]:
+    on("message", restart_command, flt=cmd("restart", "reboot"))
     return ["/restart", "/reboot"]

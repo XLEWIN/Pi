@@ -15,7 +15,7 @@ Environment isolation (BEFORE any bot import):
     * BOT_TOKEN is forced — importing `bot` pulls bot.config, which
       exits without one.
     * LOCALAPPDATA points at a temp dir so any DB touch stays isolated.
-No network: the helpers only inspect update/context objects.
+No network: the helpers only inspect message/args objects.
 """
 
 from __future__ import annotations
@@ -46,13 +46,14 @@ from bot.modules.moderation import (  # noqa: E402
     action_args,
     parse_duration_reason,
 )
+from aiofakes import make_message  # noqa: E402
 
 
 # ── Fakes ─────────────────────────────────────────────────────────
 
-def _update(text: str, *, reply: bool = False, entity=None):
-    """Minimal update: message text + optional reply/mention entity."""
-    msg = SimpleNamespace(
+def _msg(text: str, *, reply: bool = False, entity=None):
+    """Minimal aiogram-style message: text + optional reply/entity."""
+    return make_message(
         text=text,
         caption=None,
         reply_to_message=(
@@ -62,7 +63,6 @@ def _update(text: str, *, reply: bool = False, entity=None):
         ),
         entities=[entity] if entity else [],
     )
-    return SimpleNamespace(message=msg)
 
 
 def _entity(offset: int, length: int, user_id: int = 7):
@@ -74,77 +74,73 @@ def _entity(offset: int, length: int, user_id: int = 7):
     )
 
 
-def _context(args: list[str]):
-    return SimpleNamespace(args=args)
-
-
 # ═════════════════════════════════════════════════════════════════
 # action_args — target token never reaches the reason
 # ═════════════════════════════════════════════════════════════════
 
 class TestActionArgs(unittest.TestCase):
     def test_no_args(self):
-        self.assertEqual(action_args(_update("/mute"), _context([])), [])
+        self.assertEqual(action_args(_msg("/mute"), []), [])
 
     def test_reply_keeps_every_arg(self):
         # Reply supplies the target — duration/reason are ALL the args.
-        upd = _update("/mute 1h spam", reply=True)
-        self.assertEqual(action_args(upd, _context(["1h", "spam"])), ["1h", "spam"])
-        upd = _update("/mute spam", reply=True)
-        self.assertEqual(action_args(upd, _context(["spam"])), ["spam"])
+        upd = _msg("/mute 1h spam", reply=True)
+        self.assertEqual(action_args(upd, ["1h", "spam"]), ["1h", "spam"])
+        upd = _msg("/mute spam", reply=True)
+        self.assertEqual(action_args(upd, ["spam"]), ["spam"])
 
     def test_at_mention_target_dropped(self):
-        upd = _update("/mute @user 1h spam")
+        upd = _msg("/mute @user 1h spam")
         self.assertEqual(
-            action_args(upd, _context(["@user", "1h", "spam"])),
+            action_args(upd, ["@user", "1h", "spam"]),
             ["1h", "spam"],
         )
 
     def test_at_mention_only(self):
-        upd = _update("/mute @user")
-        self.assertEqual(action_args(upd, _context(["@user"])), [])
+        upd = _msg("/mute @user")
+        self.assertEqual(action_args(upd, ["@user"]), [])
 
     def test_numeric_id_target_dropped(self):
         # The core bug: the ID must not become the reason.
-        upd = _update("/mute 8458275552")
-        self.assertEqual(action_args(upd, _context(["8458275552"])), [])
+        upd = _msg("/mute 8458275552")
+        self.assertEqual(action_args(upd, ["8458275552"]), [])
 
     def test_numeric_id_target_with_duration_and_reason(self):
-        upd = _update("/mute 8458275552 1h spam")
+        upd = _msg("/mute 8458275552 1h spam")
         self.assertEqual(
-            action_args(upd, _context(["8458275552", "1h", "spam"])),
+            action_args(upd, ["8458275552", "1h", "spam"]),
             ["1h", "spam"],
         )
 
     def test_text_mention_returns_text_after_entity(self):
         # "/mute John 1h spam" with John as text_mention (entity covers
         # the name) → duration/reason are what follows the name.
-        upd = _update("/mute John 1h spam", entity=_entity(offset=6, length=4))
+        upd = _msg("/mute John 1h spam", entity=_entity(offset=6, length=4))
         self.assertEqual(
-            action_args(upd, _context(["John", "1h", "spam"])),
+            action_args(upd, ["John", "1h", "spam"]),
             ["1h", "spam"],
         )
 
     def test_text_mention_nothing_after(self):
-        upd = _update("/mute John", entity=_entity(offset=6, length=4))
-        self.assertEqual(action_args(upd, _context(["John"])), [])
+        upd = _msg("/mute John", entity=_entity(offset=6, length=4))
+        self.assertEqual(action_args(upd, ["John"]), [])
 
     def test_text_mention_utf16_offsets(self):
         # Entity offsets are UTF-16 code units — an astral-plane char in
         # the name must not shift the cut point.
         name = "\U0001F600\U0001F600"          # 2 codepoints, 4 UTF-16 units
         text = f"/mute {name} 1h spam"          # offset 6, length 4
-        upd = _update(text, entity=_entity(offset=6, length=4))
+        upd = _msg(text, entity=_entity(offset=6, length=4))
         self.assertEqual(
-            action_args(upd, _context([name, "1h", "spam"])),
+            action_args(upd, [name, "1h", "spam"]),
             ["1h", "spam"],
         )
 
     def test_reply_wins_over_entity(self):
         # get_target_user resolves reply first; args then are pure reason.
-        upd = _update("/mute John 1h", reply=True, entity=_entity(offset=6, length=4))
+        upd = _msg("/mute John 1h", reply=True, entity=_entity(offset=6, length=4))
         self.assertEqual(
-            action_args(upd, _context(["John", "1h"])),
+            action_args(upd, ["John", "1h"]),
             ["John", "1h"],
         )
 
@@ -204,17 +200,17 @@ class TestParseDurationReason(unittest.TestCase):
 class TestReportedBug(unittest.TestCase):
     def test_numeric_id_target_never_becomes_reason(self):
         """.mute 8458275552 → reason 'No reason provided', not the ID."""
-        upd = _update("/mute 8458275552")
+        upd = _msg("/mute 8458275552")
         duration, reason = parse_duration_reason(
-            action_args(upd, _context(["8458275552"]))
+            action_args(upd, ["8458275552"])
         )
         self.assertIsNone(duration)
         self.assertEqual(reason, "No reason provided")
 
     def test_numeric_id_with_duration_keeps_reason(self):
-        upd = _update("/mute 8458275552 2h spamming")
+        upd = _msg("/mute 8458275552 2h spamming")
         duration, reason = parse_duration_reason(
-            action_args(upd, _context(["8458275552", "2h", "spamming"]))
+            action_args(upd, ["8458275552", "2h", "spamming"])
         )
         self.assertEqual(duration, timedelta(hours=2))
         self.assertEqual(reason, "spamming")

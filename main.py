@@ -1,189 +1,132 @@
 """Phi pi - Pure Bot API entry point.
 
-Runs python-telegram-bot (Bot API) with colored inline buttons.
+Runs aiogram (Bot API) with colored inline buttons.
 No Telethon dependency.
 """
 
 import asyncio
-import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
-from telegram import Update
-from telegram.error import NetworkError
-from telegram.ext import Application, ContextTypes
+from aiogram import Bot, Dispatcher
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.enums import UpdateType
+from aiogram.client.default import DefaultBotProperties
 
+from bot import pipeline
 from bot.config import settings
 from bot.constants import BOT_NAME, LOG_CHANNEL_ID
+from bot.errors import on_error
 from bot.loader import load_modules
 from bot.logger import logger
-from bot.database import DB_DIR
 
 
-# ── Startup log ──────────────────────────────────────────
-HANDLER_ERRORS_FILE = DB_DIR / "handler_errors.log"
-
-
-def _persist_handler_error(update: object, err: Exception) -> None:
-    """Append full traceback to a log file (diagnosable without a paste)."""
+async def _startup_log(bot: Bot, me, privacy_on: bool) -> None:  # noqa: ANN001
     try:
-        uid = getattr(update, "update_id", "?")
-        chat = "?"
-        user = "?"
-        if isinstance(update, Update) and update.effective_chat:
-            chat = update.effective_chat.id
-            user = getattr(update.effective_user, "id", "?")
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        tb = "".join(
-            traceback.format_exception(type(err), err, err.__traceback__)
+        privacy_line = (
+            "<b>Privacy:</b> ON — plain messages HIDDEN! "
+            "BotFather /setprivacy → Disable"
+            if privacy_on else
+            "<b>Privacy:</b> OFF — all group messages visible"
         )
-        with open(HANDLER_ERRORS_FILE, "a", encoding="utf-8") as f:
-            f.write(
-                f"=== {ts} update={uid} chat={chat} user={user} "
-                f"{type(err).__name__}: {err}\n{tb}\n"
-            )
-    except Exception:
-        pass  # diagnosis must never raise
-
-
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log handler exceptions so failures never disappear silently."""
-    err = context.error
-    # Expected/soft failures — one line, no traceback noise. isinstance
-    # (not just the type name) so every NetworkError subclass — TimedOut,
-    # InternalServerError, httpx wrapping — is treated as network.
-    if isinstance(err, Exception) and (
-        isinstance(err, (NetworkError, TimeoutError))
-        or type(err).__name__ in {"TimedOut", "BadRequest"}
-    ):
-        logger.warning(f"Handler network/API issue: {err}")
-        return
-    logger.error("Handler error", exc_info=err)
-    if isinstance(update, Update) and update.effective_message:
-        logger.error(
-            "  update=%s chat=%s user=%s",
-            update.update_id,
-            getattr(update.effective_chat, "id", "?"),
-            getattr(update.effective_user, "id", "?"),
+        startup_msg = (
+            f"<b>Bot Started Successfully!</b>\n\n"
+            f"<b>Bot:</b> @{me.username}\n"
+            f"<b>Bot ID:</b> <code>{me.id}</code>\n"
+            f"<b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            f"<b>Modules:</b> Loaded\n"
+            f"<b>Database:</b> Connected\n"
+            f"<b>Colored Buttons:</b> Active (aiogram)\n"
+            f"<b>Logging:</b> Active\n"
+            f"{privacy_line}\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━"
         )
-    if isinstance(err, Exception):
-        _persist_handler_error(update, err)
-
-
-async def post_init(app: Application) -> None:
-    """Fetch bot identity; never block polling on the startup log."""
-    # asyncio.to_thread / run_in_executor(None, ...) all share ONE pool.
-    # The default is min(32, cpu+4) ≈ 5 workers on a 1-CPU container, so
-    # a couple of slow PIL rank renders would queue message-count jobs
-    # behind them and lag replies. One pool sized for bursty handlers.
-    loop = asyncio.get_running_loop()
-    loop.set_default_executor(
-        ThreadPoolExecutor(max_workers=32, thread_name_prefix="pi-worker")
-    )
-
-    me = await app.bot.get_me()
-    app.bot_data["username"] = me.username
-    app.bot_data["name"] = me.full_name
-    logger.info(f"Bot API connected as @{me.username} — {me.full_name}")
-
-    # Group privacy mode: when ON, Telegram does not deliver plain group
-    # messages to the bot at all — rankings/anti-flood would count nothing.
-    privacy_on = not getattr(me, "can_read_all_group_messages", True)
-    if privacy_on:
-        logger.warning(
-            "Group privacy is ON — plain group messages are NOT delivered to the "
-            "bot (chat rankings, XP and anti-flood won't see them). "
-            "Fix: BotFather → /setprivacy → Disable."
+        await bot.send_message(
+            chat_id=LOG_CHANNEL_ID,
+            text=startup_msg,
+            parse_mode="HTML",
         )
-
-    async def _startup_log() -> None:
-        try:
-            privacy_line = (
-                "<b>Privacy:</b> ON — plain messages HIDDEN! "
-                "BotFather /setprivacy → Disable"
-                if privacy_on else
-                "<b>Privacy:</b> OFF — all group messages visible"
-            )
-            startup_msg = (
-                f"<b>Bot Started Successfully!</b>\n\n"
-                f"<b>Bot:</b> @{me.username}\n"
-                f"<b>Bot ID:</b> <code>{me.id}</code>\n"
-                f"<b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                f"<b>Modules:</b> Loaded\n"
-                f"<b>Database:</b> Connected\n"
-                f"<b>Colored Buttons:</b> Active (Pure PTB)\n"
-                f"<b>Logging:</b> Active\n"
-                f"{privacy_line}\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━"
-            )
-            await app.bot.send_message(
-                chat_id=LOG_CHANNEL_ID,
-                text=startup_msg,
-                parse_mode="HTML",
-            )
-            logger.info("Startup log sent to channel")
-        except Exception as e:
-            logger.warning(f"Startup log not sent: {e}")
-
-    # Fire-and-forget: start listening for updates immediately.
-    asyncio.create_task(_startup_log())
+        logger.info("Startup log sent to channel")
+    except Exception as e:
+        logger.warning(f"Startup log not sent: {e}")
 
 
-async def post_shutdown(app: Application) -> None:
-    """Cleanup on shutdown."""
+async def _flush() -> None:
+    """post_shutdown parity — persist write-behind buffers on exit."""
     try:
         from bot.database import db
-
-        # Write-behind counters (counts, analytics) — persist on exit.
         await asyncio.to_thread(db.flush_buffers)
     except Exception as e:
         logger.warning(f"final buffer flush failed: {e}")
     try:
         from bot.modules.tagging import activity_tracker
-
-        # Tagging activity write-behind (~3s buffer) — persist on exit.
         await asyncio.to_thread(activity_tracker.flush_now)
     except Exception as e:
         logger.warning(f"final activity flush failed: {e}")
-    logger.info("Shutdown complete")
 
 
 def main() -> None:
     logger.info(f"Starting {BOT_NAME} (Pure Bot API Mode)...")
 
-    app = (
-        Application.builder()
-        .token(settings.bot_token)
-        # Handlers are mostly async + the DB layer is cached/buffered, so
-        # processing updates concurrently keeps one slow handler (rank
-        # renders, network retries) from queueing every other chat's
-        # replies behind it.
-        .concurrent_updates(True)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        # Regular Bot API HTTP timeouts (sendMessage, etc.) — PTB defaults
-        # are often ~5s and fail on slow routes to api.telegram.org.
-        .read_timeout(30)
-        .write_timeout(30)
-        .connect_timeout(30)
-        .pool_timeout(30)
-        .connection_pool_size(20)
-        # Long-poll getUpdates (separate from ordinary API calls).
-        .get_updates_read_timeout(30)
-        .get_updates_connect_timeout(30)
-        .get_updates_write_timeout(30)
-        .get_updates_pool_timeout(30)
-        .build()
+    # Regular Bot API HTTP timeouts (sendMessage, etc.).
+    bot = Bot(
+        token=settings.bot_token,
+        session=AiohttpSession(timeout=30.0, limit=20),
+        default=DefaultBotProperties(parse_mode=None),
     )
-    app.add_error_handler(on_error)
+    dp = Dispatcher()
+    dp.errors.register(on_error)
 
-    count = load_modules(app)
+    count = load_modules()
+    pipeline.install(dp)
     logger.info(f"Loaded {count} module(s) — {BOT_NAME} is ready")
 
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
+    async def amain() -> None:
+        try:
+            # Handlers are mostly async + the DB layer is cached/buffered;
+            # one sized pool keeps slow PIL rank renders from queueing
+            # message-count jobs behind them.
+            loop = asyncio.get_running_loop()
+            loop.set_default_executor(
+                ThreadPoolExecutor(max_workers=32, thread_name_prefix="pi-worker")
+            )
+
+            me = await bot.get_me()
+            pipeline.BOT_DATA["username"] = me.username
+            pipeline.BOT_DATA["name"] = me.full_name
+            logger.info(f"Bot API connected as @{me.username} — {me.full_name}")
+
+            # Group privacy mode: when ON, Telegram does not deliver plain
+            # group messages to the bot at all.
+            privacy_on = not getattr(me, "can_read_all_group_messages", True)
+            if privacy_on:
+                logger.warning(
+                    "Group privacy is ON — plain group messages are NOT delivered to the "
+                    "bot (chat rankings, XP and anti-flood won't see them). "
+                    "Fix: BotFather → /setprivacy → Disable."
+                )
+
+            # Fire-and-forget: start listening for updates immediately.
+            asyncio.create_task(_startup_log(bot, me, privacy_on))
+
+            # PTB run_polling(drop_pending_updates=True) parity: clear the
+            # backlog and detach any webhook before long-polling.
+            await bot.delete_webhook(drop_pending_updates=True)
+
+            await dp.start_polling(
+                bot,
+                allowed_updates=[t.value for t in UpdateType],
+                polling_timeout=30,
+            )
+        finally:
+            await _flush()
+            try:
+                await bot.session.close()
+            except Exception:
+                pass
+            logger.info("Shutdown complete")
+
+    asyncio.run(amain())
 
 
 if __name__ == "__main__":

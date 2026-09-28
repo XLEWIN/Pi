@@ -20,9 +20,7 @@ import shutil
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
 
 # ── Environment isolation — must precede bot imports ──────────────
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,34 +33,62 @@ os.environ["LOCALAPPDATA"] = _TEST_DIR
 atexit.register(shutil.rmtree, _TEST_DIR, ignore_errors=True)
 
 # ── Imports (after env) ───────────────────────────────────────────
-from telegram import Chat, Message, Update  # noqa: E402
-from telegram.ext import CommandHandler as PTBCommandHandler  # noqa: E402
-from telegram.ext import filters as ptb_filters  # noqa: E402
+from aiogram import F  # noqa: E402
+from aiogram.filters import Command as AiogramCommand  # noqa: E402
+from aiogram.filters import Filter, and_f  # noqa: E402
+from aiogram.utils.magic_filter import MagicFilter  # noqa: E402
 
+from bot import pipeline  # noqa: E402
 from bot.command_handler import (  # noqa: E402
     COMMAND,
     COMMAND_PREFIXES,
+    CommandFilter,
     CommandHandler,
+    cmd,
     parse_command,
 )
+from bot.loader import load_modules  # noqa: E402
+from aiofakes import FakeBot, make_message  # noqa: E402
 
 BOT_USERNAME = "PiModulerBot"
 
 
-async def _noop(update, context):  # noqa: ANN001, ANN201
-    return None
+def _msg(text: str):
+    """Text-message event bound to a fake supergroup."""
+    return make_message(text, chat_id=-100123, chat_type="supergroup")
 
 
-def _update(text: str) -> Update:
-    """Build a text message update bound to a fake bot identity."""
-    msg = Message(
-        message_id=1,
-        date=datetime(2026, 1, 1, tzinfo=timezone.utc),
-        chat=Chat(id=-100123, type="supergroup"),
-        text=text,
-    )
-    msg._bot = SimpleNamespace(username=BOT_USERNAME)
-    return Update(update_id=1, message=msg)
+def asyncio_run(coro):
+    import asyncio
+    return asyncio.run(coro)
+
+
+def _command_nodes(flt, out=None):
+    """CommandFilter / aiogram-Command nodes inside any filter tree.
+
+    Walks ``and_f``/``or_f`` targets, ``~invert`` targets and plain
+    ``.filters`` containers; MagicFilter branches (``F.chat.type`` …)
+    are not command registrations and are skipped.
+    """
+    if out is None:
+        out = []
+    if flt is None or isinstance(flt, MagicFilter):
+        return out
+    if isinstance(flt, (CommandFilter, AiogramCommand)):
+        out.append(flt)
+        return out
+    if hasattr(flt, "targets"):
+        for t in flt.targets:
+            _command_nodes(getattr(t, "callback", t), out)
+        return out
+    if hasattr(flt, "target"):
+        _command_nodes(getattr(flt.target, "callback", flt.target), out)
+        return out
+    for sub in getattr(flt, "filters", None) or []:
+        if isinstance(sub, MagicFilter):
+            continue
+        _command_nodes(getattr(sub, "callback", sub), out)
+    return out
 
 
 class TestParseCommand(unittest.TestCase):
@@ -79,8 +105,8 @@ class TestParseCommand(unittest.TestCase):
             self.assertEqual(parsed[1], [])
 
     def test_args_split(self):
-        cmd, args = parse_command(".all mode all")
-        self.assertEqual(cmd, "all")
+        cmd_name, args = parse_command(".all mode all")
+        self.assertEqual(cmd_name, "all")
         self.assertEqual(args, ["mode", "all"])
 
     def test_rejects_plain_text(self):
@@ -102,106 +128,127 @@ class TestParseCommand(unittest.TestCase):
 
 class TestCommandHandler(unittest.TestCase):
     def setUp(self):
-        self.h = CommandHandler("help", _noop)
+        self.h = cmd("help")
+        self.bot = FakeBot(username=BOT_USERNAME)
 
-    def _match(self, text):
-        return self.h.check_update(_update(text))
+    def _match(self, text, bot=None):
+        return asyncio_run(self.h(_msg(text), bot=bot or self.bot))
 
     def test_all_prefixes_match(self):
         for p in COMMAND_PREFIXES:
             res = self._match(p + "help")
-            self.assertIsInstance(res, tuple, f"prefix {p!r} did not match")
-            self.assertEqual(res[0], [], f"prefix {p!r} args wrong")
+            self.assertEqual(
+                res, {"args": []}, f"prefix {p!r} did not match"
+            )
 
     def test_args_reached_handler(self):
         res = self._match("!help me now")
-        self.assertIsInstance(res, tuple)
-        self.assertEqual(res[0], ["me", "now"])
+        self.assertEqual(res, {"args": ["me", "now"]})
 
     def test_case_insensitive(self):
-        self.assertIsInstance(self._match("!HELP"), tuple)
-        self.assertIsInstance(self._match("/Help"), tuple)
+        self.assertEqual(self._match("!HELP"), {"args": []})
+        self.assertEqual(self._match("/Help"), {"args": []})
 
     def test_at_self_accepted(self):
-        self.assertIsInstance(self._match(f"!help@{BOT_USERNAME}"), tuple)
+        self.assertEqual(
+            self._match(f"!help@{BOT_USERNAME}"), {"args": []}
+        )
 
     def test_at_other_bot_rejected(self):
-        self.assertIsNone(self._match("!help@OtherBot"))
+        self.assertFalse(self._match("!help@OtherBot"))
 
     def test_unregistered_rejected(self):
-        self.assertIsNone(self._match("!nope"))
-        self.assertIsNone(self._match("/nope"))
+        self.assertFalse(self._match("!nope"))
+        self.assertFalse(self._match("/nope"))
 
     def test_plain_text_rejected(self):
-        self.assertIsNone(self._match("just talking about help"))
+        self.assertFalse(self._match("just talking about help"))
 
     def test_entity_parity_tails(self):
         # PTB entity parity: trailing punctuation/dashes are not part of
         # the command word — "/help!" and "!help-me" still trigger help.
-        self.assertIsInstance(self._match("/help!"), tuple)
-        self.assertIsInstance(self._match("!help-me"), tuple)
+        self.assertEqual(self._match("/help!"), {"args": []})
+        self.assertEqual(self._match("!help-me"), {"args": []})
 
-    def test_has_args_still_works(self):
-        h = CommandHandler("go", _noop, has_args=True)
-        self.assertIsNone(h.check_update(_update("!go")))
-        self.assertIsInstance(h.check_update(_update("!go now")), tuple)
+    def test_args_always_injected(self):
+        # Match data always carries an args list — never None (the
+        # aiogram stand-in for context.args).
+        h = cmd("go")
+        self.assertEqual(
+            asyncio_run(h(_msg("!go"), bot=self.bot)), {"args": []}
+        )
+        self.assertEqual(
+            asyncio_run(h(_msg("!go now"), bot=self.bot)), {"args": ["now"]}
+        )
 
-    def test_is_ptb_subclass(self):
-        # Application.add_handler accepts it exactly like PTB's class.
-        self.assertIsInstance(self.h, PTBCommandHandler)
+    def test_is_aiogram_filter(self):
+        # The dispatcher registers it like any aiogram filter, and the
+        # PTB-era CommandHandler alias still points at the same class.
+        self.assertIsInstance(self.h, CommandFilter)
+        self.assertIsInstance(self.h, Filter)
+        self.assertIs(CommandHandler, CommandFilter)
 
 
 class TestCommandFilter(unittest.TestCase):
+    def _check(self, text):
+        return asyncio_run(COMMAND(_msg(text)))
+
     def test_matches_all_prefixes(self):
         for p in COMMAND_PREFIXES:
             self.assertTrue(
-                COMMAND.check_update(_update(p + "anything")),
+                self._check(p + "anything"),
                 f"filter missed prefix {p!r}",
             )
 
     def test_rejects_plain_text(self):
-        self.assertFalse(COMMAND.check_update(_update("hello there")))
+        self.assertFalse(self._check("hello there"))
 
     def test_negation_works(self):
         neg = ~COMMAND
-        self.assertFalse(neg.check_update(_update(".trigger")))
-        self.assertTrue(neg.check_update(_update("normal chat")))
+        self.assertFalse(asyncio_run(neg(_msg(".trigger"))))
+        self.assertTrue(asyncio_run(neg(_msg("normal chat"))))
 
     def test_combined_like_text_pipelines(self):
-        combo = ptb_filters.TEXT & ~COMMAND
-        self.assertFalse(combo.check_update(_update("!cmd arg")))
-        self.assertTrue(combo.check_update(_update("plain words")))
+        combo = and_f(F.text, ~COMMAND)
+        self.assertFalse(asyncio_run(combo(_msg("!cmd arg"))))
+        self.assertTrue(asyncio_run(combo(_msg("plain words"))))
 
 
 class TestModuleWiring(unittest.TestCase):
-    """load_modules() smoke: every registered command handler is ours."""
+    """load_modules() smoke: every registered command is ours."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.loaded = load_modules()
+        cls.entries = pipeline.snapshot()
 
     def test_all_modules_register_multi_prefix_handler(self):
-        from bot.loader import load_modules
+        self.assertGreater(self.loaded, 5, "loader found almost no modules")
 
-        handlers = []
-
-        class _AppStub:
-            bot_data = {}
-
-            def add_handler(self, handler, group=0):  # noqa: ANN001, ANN202
-                handlers.append((group, handler))
-
-        loaded = load_modules(_AppStub())
-        self.assertGreater(loaded, 5, "loader found almost no modules")
-
-        cmd_handlers = [
-            h for (_, h) in handlers if isinstance(h, PTBCommandHandler)
-        ]
-        foreign = [h for h in cmd_handlers if not isinstance(h, CommandHandler)]
+        ours, foreign = [], []
+        for e in self.entries:
+            for node in _command_nodes(e.flt):
+                (ours if isinstance(node, CommandFilter) else foreign).append(
+                    e.key
+                )
         self.assertEqual(
             foreign, [],
-            "modules still register plain telegram.ext.CommandHandler: "
-            f"{[type(f).__module__ + '.' + type(f).__name__ for f in foreign]}",
+            "modules still register aiogram's '/'-only Command filter: "
+            f"{foreign}",
         )
         self.assertGreaterEqual(
-            len(cmd_handlers), 40, "expected dozens of registered commands"
+            len(ours), 40, "expected dozens of registered commands"
         )
+
+        by_key = {e.key: e for e in self.entries}
+        info = _command_nodes(by_key["bot.modules.users.info_command"].flt)
+        self.assertEqual(len(info), 1)
+        self.assertEqual(info[0].commands, frozenset({"info"}))
+        promo = _command_nodes(
+            by_key["bot.modules.admin.promote_command"].flt
+        )
+        self.assertEqual(len(promo), 1)
+        self.assertEqual(promo[0].commands, frozenset({"promote"}))
 
 
 if __name__ == "__main__":

@@ -16,18 +16,16 @@ from collections import defaultdict, deque
 from html import escape
 from typing import Deque, Dict, Optional, Tuple
 
-from telegram import ChatMember, ChatPermissions, Update
-from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from aiogram import Bot, F
+from aiogram.enums import ChatMemberStatus, ParseMode
+from aiogram.filters.logic import and_f
+from aiogram.types import ChatPermissions, Message
 
-from bot.command_handler import COMMAND, CommandHandler
+from bot.command_handler import COMMAND
 from bot.database import db
 from bot.emojis import E
+from bot.pipeline import GROUPS, SERVICE, cmd, on
+from bot.reply import reply_text
 from bot.responses import action_card, field_extra, field_user, reply_card
 
 logger = logging.getLogger(__name__)
@@ -64,8 +62,8 @@ async def _member_is_admin(bot, chat_id: int, user_id: int) -> Optional[bool]:
     except Exception:
         return None  # callers keep the old bare-except semantics
     ok = member.status in (
-        ChatMember.ADMINISTRATOR,
-        ChatMember.OWNER,
+        ChatMemberStatus.ADMINISTRATOR,
+        ChatMemberStatus.CREATOR,
         "administrator",
         "creator",
     )
@@ -75,9 +73,9 @@ async def _member_is_admin(bot, chat_id: int, user_id: int) -> Optional[bool]:
     return ok
 
 
-async def _is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+async def _is_admin(message: Message, bot: Bot) -> bool:
     return await _member_is_admin(
-        context.bot, update.effective_chat.id, update.effective_user.id
+        bot, message.chat.id, message.from_user.id
     ) is True
 
 
@@ -97,23 +95,23 @@ def _prune_deque(d: Deque[float], window: int) -> None:
 
 
 async def _take_action(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    message: Message,
+    bot: Bot,
     user_id: int,
     action: str,
     reason: str,
 ) -> bool:
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     try:
         if action == "mute":
-            await context.bot.restrict_chat_member(
+            await bot.restrict_chat_member(
                 chat_id, user_id, ChatPermissions(can_send_messages=False)
             )
         elif action == "kick":
-            await context.bot.ban_chat_member(chat_id, user_id)
-            await context.bot.unban_chat_member(chat_id, user_id)
+            await bot.ban_chat_member(chat_id, user_id)
+            await bot.unban_chat_member(chat_id, user_id)
         elif action == "ban":
-            await context.bot.ban_chat_member(chat_id, user_id)
+            await bot.ban_chat_member(chat_id, user_id)
         else:
             return False
         db.bump_mod_actions(chat_id, 1)
@@ -125,7 +123,7 @@ async def _take_action(
 
 
 async def _set_lockdown(
-    context: ContextTypes.DEFAULT_TYPE, chat_id: int, enabled: bool
+    chat_id: int, enabled: bool
 ) -> bool:
     """Toggle lockdown flag only.
 
@@ -141,23 +139,23 @@ async def _set_lockdown(
 
 
 async def enforce_lockdown(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+    message: Message, bot: Bot
 ) -> None:
     """While lockdown is ON, delete messages from non-admins."""
-    if not update.message or update.effective_chat.type == "private":
+    if not message or message.chat.type == "private":
         return
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     settings = db.get_shield_settings(chat_id)
     if not settings.get("lockdown"):
         return
-    user = update.effective_user
-    if not user or user.is_bot or user.id == context.bot.id:
+    user = message.from_user
+    if not user or user.is_bot or user.id == bot.id:
         return
     # None (API error) and True (admin) both keep the old early-return.
-    if await _member_is_admin(context.bot, chat_id, user.id) is not False:
+    if await _member_is_admin(bot, chat_id, user.id) is not False:
         return
     try:
-        await update.message.delete()
+        await message.delete()
     except Exception:
         pass
 
@@ -165,15 +163,15 @@ async def enforce_lockdown(
 # ── Detection ───────────────────────────────────────────
 
 async def detect_join_burst(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+    message: Message, bot: Bot
 ) -> None:
     """Count new-member events per chat in a sliding window."""
-    if not update.message or not update.message.new_chat_members:
+    if not message or not message.new_chat_members:
         return
-    if update.effective_chat.type == "private":
+    if message.chat.type == "private":
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     settings = db.get_shield_settings(chat_id)
     if not settings.get("shield_enabled", 1):
         return
@@ -182,7 +180,7 @@ async def detect_join_burst(
     limit = int(settings.get("join_limit") or 8)
     now = time.time()
     dq = _join_times[chat_id]
-    for _ in update.message.new_chat_members:
+    for _ in message.new_chat_members:
         dq.append(now)
     _prune_deque(dq, window)
 
@@ -199,7 +197,7 @@ async def detect_join_burst(
 
     names = ", ".join(
         (m.first_name or m.username or str(m.id))
-        for m in update.message.new_chat_members[:5]
+        for m in message.new_chat_members[:5]
     )
     action = str(settings.get("action") or "alert").lower()
     text = action_card(
@@ -212,39 +210,40 @@ async def detect_join_burst(
         icon=E.ALERT,
     )
     try:
-        await update.message.reply_text(
+        await reply_text(
+            message,
             text, parse_mode=ParseMode.HTML, quote=False
         )
     except Exception as e:
         logger.warning(f"raid alert send failed: {e}")
 
     if action in ("mute", "kick", "ban"):
-        for member in update.message.new_chat_members:
-            if member.is_bot or member.id == context.bot.id:
+        for member in message.new_chat_members:
+            if member.is_bot or member.id == bot.id:
                 continue
-            await _take_action(update, context, member.id, action, "Raid join burst")
+            await _take_action(message, bot, member.id, action, "Raid join burst")
 
 
 async def detect_message_burst(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+    message: Message, bot: Bot
 ) -> None:
     """Count messages per user in a sliding window."""
-    if not update.message or not update.effective_user:
+    if not message or not message.from_user:
         return
-    if update.effective_chat.type == "private":
+    if message.chat.type == "private":
         return
 
-    user = update.effective_user
+    user = message.from_user
     if user.is_bot:
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     settings = db.get_shield_settings(chat_id)
     if not settings.get("shield_enabled", 1):
         return
 
     # Admins are never flood-punished (cached — was a TG API call per message).
-    if await _member_is_admin(context.bot, chat_id, user.id) is True:
+    if await _member_is_admin(bot, chat_id, user.id) is True:
         return
 
     window = int(settings.get("msg_window") or 5)
@@ -276,42 +275,46 @@ async def detect_message_burst(
         icon=E.ALERT,
     )
     try:
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+        await reply_text(message, text, parse_mode=ParseMode.HTML)
     except Exception as e:
         logger.warning(f"flood alert send failed: {e}")
 
     if action in ("mute", "kick", "ban"):
-        await _take_action(update, context, user.id, action, "Message flood")
+        await _take_action(message, bot, user.id, action, "Message flood")
 
 
 # ── Commands ────────────────────────────────────────────
 
-async def shield_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(
+async def shield_command(message: Message, bot: Bot, args: list):
+    if message.chat.type == "private":
+        await reply_text(
+            message,
             f"{E.INFO} This command only works in groups.", parse_mode=ParseMode.HTML
         )
         return
-    if not await _is_admin(update, context):
-        await update.message.reply_text(
+    if not await _is_admin(message, bot):
+        await reply_text(
+            message,
             f"{E.ERROR} Only admins can manage the shield.", parse_mode=ParseMode.HTML
         )
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     settings = db.get_shield_settings(chat_id)
 
-    if context.args:
-        arg = context.args[0].lower()
+    if args:
+        arg = args[0].lower()
         if arg in ("on", "enable"):
             db.set_shield_settings(chat_id, shield_enabled=1)
-            await update.message.reply_text(
+            await reply_text(
+                message,
                 f"{E.CHECK} Shield <b>ON</b>.", parse_mode=ParseMode.HTML
             )
             return
         if arg in ("off", "disable"):
             db.set_shield_settings(chat_id, shield_enabled=0)
-            await update.message.reply_text(
+            await reply_text(
+                message,
                 f"{E.CROSS} Shield <b>OFF</b>.", parse_mode=ParseMode.HTML
             )
             return
@@ -329,17 +332,19 @@ async def shield_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         icon=E.ALERT,
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    await reply_text(message, text, parse_mode=ParseMode.HTML)
 
 
-async def shieldcfg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(
+async def shieldcfg_command(message: Message, bot: Bot, args: list):
+    if message.chat.type == "private":
+        await reply_text(
+            message,
             f"{E.INFO} This command only works in groups.", parse_mode=ParseMode.HTML
         )
         return
-    if not await _is_admin(update, context):
-        await update.message.reply_text(
+    if not await _is_admin(message, bot):
+        await reply_text(
+            message,
             f"{E.ERROR} Only admins can configure the shield.", parse_mode=ParseMode.HTML
         )
         return
@@ -350,84 +355,92 @@ async def shieldcfg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/shieldcfg msgs &lt;count&gt; &lt;seconds&gt;\n"
         "/shieldcfg action &lt;alert|mute|kick|ban&gt;"
     )
-    if not context.args:
-        await update.message.reply_text(usage, parse_mode=ParseMode.HTML)
+    if not args:
+        await reply_text(message, usage, parse_mode=ParseMode.HTML)
         return
 
-    chat_id = update.effective_chat.id
-    key = context.args[0].lower()
+    chat_id = message.chat.id
+    key = args[0].lower()
 
-    if key in ("joins", "join") and len(context.args) >= 3:
+    if key in ("joins", "join") and len(args) >= 3:
         try:
-            n, sec = int(context.args[1]), int(context.args[2])
+            n, sec = int(args[1]), int(args[2])
             if n < 2 or sec < 1:
                 raise ValueError
         except ValueError:
-            await update.message.reply_text(
+            await reply_text(
+                message,
                 f"{E.ERROR} Use: joins &lt;2+&gt; &lt;seconds&gt;",
                 parse_mode=ParseMode.HTML,
             )
             return
         db.set_shield_settings(chat_id, join_limit=n, join_window=sec)
-        await update.message.reply_text(
+        await reply_text(
+            message,
             f"{E.CHECK} Join burst: <b>{n}</b> joins / <b>{sec}s</b>.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    if key in ("msgs", "messages", "msg") and len(context.args) >= 3:
+    if key in ("msgs", "messages", "msg") and len(args) >= 3:
         try:
-            n, sec = int(context.args[1]), int(context.args[2])
+            n, sec = int(args[1]), int(args[2])
             if n < 3 or sec < 1:
                 raise ValueError
         except ValueError:
-            await update.message.reply_text(
+            await reply_text(
+                message,
                 f"{E.ERROR} Use: msgs &lt;3+&gt; &lt;seconds&gt;",
                 parse_mode=ParseMode.HTML,
             )
             return
         db.set_shield_settings(chat_id, msg_limit=n, msg_window=sec)
-        await update.message.reply_text(
+        await reply_text(
+            message,
             f"{E.CHECK} Message burst: <b>{n}</b> msgs / <b>{sec}s</b>.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    if key == "action" and len(context.args) >= 2:
-        action = context.args[1].lower()
+    if key == "action" and len(args) >= 2:
+        action = args[1].lower()
         if action not in ("alert", "mute", "kick", "ban"):
-            await update.message.reply_text(
+            await reply_text(
+                message,
                 f"{E.ERROR} Choose: alert, mute, kick, or ban.",
                 parse_mode=ParseMode.HTML,
             )
             return
         db.set_shield_settings(chat_id, action=action)
-        await update.message.reply_text(
+        await reply_text(
+            message,
             f"{E.CHECK} Shield action: <b>{action.capitalize()}</b>.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    await update.message.reply_text(usage, parse_mode=ParseMode.HTML)
+    await reply_text(message, usage, parse_mode=ParseMode.HTML)
 
 
-async def lockdown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(
+async def lockdown_command(message: Message, bot: Bot, args: list):
+    if message.chat.type == "private":
+        await reply_text(
+            message,
             f"{E.INFO} This command only works in groups.", parse_mode=ParseMode.HTML
         )
         return
-    if not await _is_admin(update, context):
-        await update.message.reply_text(
+    if not await _is_admin(message, bot):
+        await reply_text(
+            message,
             f"{E.ERROR} Only admins can use lockdown.", parse_mode=ParseMode.HTML
         )
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     settings = db.get_shield_settings(chat_id)
     enable: Optional[bool] = None
-    if context.args:
-        arg = context.args[0].lower()
+    if args:
+        arg = args[0].lower()
         if arg in ("on", "enable", "1"):
             enable = True
         elif arg in ("off", "disable", "0"):
@@ -439,8 +452,9 @@ async def lockdown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if enable:
         db.set_shield_settings(chat_id, lockdown=1)
         db.log_raid_event(chat_id, "lockdown", "Lockdown enabled by admin", 1)
-        await _set_lockdown(context, chat_id, True)
-        await update.message.reply_text(
+        await _set_lockdown(chat_id, True)
+        await reply_text(
+            message,
             f"{E.ALERT} Lockdown <b>ON</b> — non-admin messages will be deleted "
             "until you run /lockdown off.",
             parse_mode=ParseMode.HTML,
@@ -448,34 +462,38 @@ async def lockdown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         db.set_shield_settings(chat_id, lockdown=0)
         db.log_raid_event(chat_id, "lockdown", "Lockdown disabled by admin", 1)
-        await _set_lockdown(context, chat_id, False)
-        await update.message.reply_text(
+        await _set_lockdown(chat_id, False)
+        await reply_text(
+            message,
             f"{E.CHECK} Lockdown <b>OFF</b>.", parse_mode=ParseMode.HTML
         )
 
 
-async def raidlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(
+async def raidlog_command(message: Message, bot: Bot, args: list):
+    if message.chat.type == "private":
+        await reply_text(
+            message,
             f"{E.INFO} This command only works in groups.", parse_mode=ParseMode.HTML
         )
         return
-    if not await _is_admin(update, context):
-        await update.message.reply_text(
+    if not await _is_admin(message, bot):
+        await reply_text(
+            message,
             f"{E.ERROR} Only admins can view the raid log.", parse_mode=ParseMode.HTML
         )
         return
 
     limit = 10
-    if context.args:
+    if args:
         try:
-            limit = max(1, min(25, int(context.args[0])))
+            limit = max(1, min(25, int(args[0])))
         except ValueError:
             pass
 
-    events = db.get_raid_events(update.effective_chat.id, limit=limit)
+    events = db.get_raid_events(message.chat.id, limit=limit)
     if not events:
-        await update.message.reply_text(
+        await reply_text(
+            message,
             f"{E.CHECK} No raid events recorded.", parse_mode=ParseMode.HTML
         )
         return
@@ -488,42 +506,39 @@ async def raidlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• <b>{kind}</b> — {detail}")
         if ts:
             lines.append(f"  <code>{ts}</code>")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    await reply_text(message, "\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 # ── Setup ───────────────────────────────────────────────
 
-def setup(app: Application) -> list:
-    group_filter = filters.ChatType.GROUPS
+def setup() -> list:
+    group_filter = GROUPS
 
-    app.add_handler(CommandHandler("shield", shield_command, filters=group_filter))
-    app.add_handler(CommandHandler("shieldcfg", shieldcfg_command, filters=group_filter))
-    app.add_handler(CommandHandler("lockdown", lockdown_command, filters=group_filter))
-    app.add_handler(CommandHandler("raidlog", raidlog_command, filters=group_filter))
+    on("message", shield_command, flt=and_f(cmd("shield"), group_filter))
+    on("message", shieldcfg_command, flt=and_f(cmd("shieldcfg"), group_filter))
+    on("message", lockdown_command, flt=and_f(cmd("lockdown"), group_filter))
+    on("message", raidlog_command, flt=and_f(cmd("raidlog"), group_filter))
 
     # Joins: after welcome(10)/bind join(11) → group 12.
-    app.add_handler(
-        MessageHandler(
-            group_filter & filters.StatusUpdate.NEW_CHAT_MEMBERS,
-            detect_join_burst,
-        ),
+    on(
+        "message",
+        detect_join_burst,
         group=12,
+        flt=group_filter & F.new_chat_members,
     )
     # Message flood: after leveling XP (5) → group 6.
-    app.add_handler(
-        MessageHandler(
-            group_filter & ~COMMAND & ~filters.StatusUpdate.ALL,
-            detect_message_burst,
-        ),
+    on(
+        "message",
+        detect_message_burst,
         group=6,
+        flt=and_f(group_filter, ~COMMAND, ~SERVICE),
     )
     # Lockdown gate: delete non-admin messages while lockdown=ON.
-    app.add_handler(
-        MessageHandler(
-            group_filter & ~filters.StatusUpdate.ALL,
-            enforce_lockdown,
-        ),
+    on(
+        "message",
+        enforce_lockdown,
         group=8,
+        flt=group_filter & ~SERVICE,
     )
 
     return [

@@ -27,7 +27,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from telegram.error import BadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 
 # ── Environment isolation — must precede bot imports ──────────────
 ROOT = Path(__file__).resolve().parents[1]
@@ -77,6 +77,7 @@ from bot.modules.tagging.utils import (  # noqa: E402
     progress_bar,
     utf16_len,
 )
+from aiofakes import call  # noqa: E402
 
 CHAT = -999123456
 OTHER_CHAT = -999123999
@@ -235,8 +236,8 @@ class TestUtils(unittest.TestCase):
 
 class TestFloodParsing(unittest.TestCase):
     def test_retry_after_attribute(self):
-        from telegram.error import RetryAfter
-        self.assertEqual(sender.flood_seconds(RetryAfter(7)), 7)
+        exc = TelegramRetryAfter(method=None, message="flood", retry_after=7)
+        self.assertEqual(sender.flood_seconds(exc), 7)
 
     def test_value_attribute_fallback(self):
         exc = SimpleNamespace(retry_after=None, value=9)
@@ -649,19 +650,23 @@ def _fake_source(chat_id=CHAT, message_id=77):
 
 def _fake_status():
     msg = SimpleNamespace(deleted=False, edits=[], replies=[])
+    msg.chat = SimpleNamespace(id=CHAT, type="supergroup")
+    msg.message_id = 501
+    msg.message_thread_id = None
 
-    async def edit_message_text(text, parse_mode=None, reply_markup=None):
+    async def edit_text(text, parse_mode=None, reply_markup=None):
         msg.edits.append(text)
 
     async def delete():
         msg.deleted = True
 
-    async def reply_text(text, parse_mode=None, reply_markup=None):
+    async def reply(text, parse_mode=None, reply_markup=None):
         msg.replies.append(text)
 
-    msg.edit_message_text = edit_message_text
+    msg.edit_text = edit_text
     msg.delete = delete
-    msg.reply_text = reply_text
+    msg.reply = reply
+    msg.answer = reply
     return msg
 
 
@@ -670,9 +675,11 @@ def _failing_status():
     msg = _fake_status()
 
     async def boom(text, parse_mode=None, reply_markup=None):
-        raise BadRequest("message to edit not found")
+        raise TelegramBadRequest(
+            method=None, message="message to edit not found"
+        )
 
-    msg.edit_message_text = boom
+    msg.edit_text = boom
     return msg
 
 
@@ -866,53 +873,47 @@ class _FakeBot:
 
 
 class _FakeMessage:
-    def __init__(self, *, chat_id=CHAT, reply_to=None, args=None):
-        self.chat = SimpleNamespace(id=chat_id, type="supergroup")
+    def __init__(self, *, chat_id=CHAT, chat_type="supergroup", reply_to=None,
+                 user_id=42):
+        self.chat = SimpleNamespace(id=chat_id, type=chat_type)
+        self.from_user = SimpleNamespace(
+            id=user_id, is_bot=False, first_name="Invoker", username="invoker",
+        )
         self.reply_to_message = reply_to
         self.replies = []
         self.message_id = 500
         self.message_thread_id = None
+        self.sender_chat = None
+        self.new_chat_members = None
+        self.left_chat_member = None
 
-    async def reply_text(self, text, parse_mode=None, reply_markup=None):
+    async def _record(self, text, parse_mode=None, reply_markup=None):
         self.replies.append({"text": text, "markup": reply_markup})
-        return SimpleNamespace(message_id=501, chat=self.chat,
-                               message_thread_id=None)
+        status = _fake_status()
+        status.chat = self.chat
+        return status
+
+    reply = answer = _record
 
     @property
     def last(self):
         return self.replies[-1]["text"] if self.replies else ""
 
 
-def _fake_update(msg, user_id=42, chat_type="supergroup"):
-    return SimpleNamespace(
-        effective_message=msg,
-        effective_chat=msg.chat if hasattr(msg, "chat")
-        else SimpleNamespace(id=CHAT, type=chat_type),
-        effective_user=SimpleNamespace(id=user_id),
-    )
-
-
-def _fake_context(bot=None, args=None):
-    return SimpleNamespace(bot=bot or _FakeBot(), args=args or [])
-
-
 class TestAllCommand(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
     async def test_private_rejected(self):
-        msg = _FakeMessage()
-        upd = _fake_update(msg)
-        upd.effective_chat = SimpleNamespace(id=1, type="private")
-        await all_command(upd, _fake_context())
+        msg = _FakeMessage(chat_id=1, chat_type="private")
+        await call(all_command, msg, bot=_FakeBot())
         self.assertIn(config.MSG_NOT_GROUP, msg.last)
 
     async def test_requires_reply(self):
         msg = _FakeMessage(reply_to=None)
-        await all_command(_fake_update(msg), _fake_context())
+        await call(all_command, msg, bot=_FakeBot())
         self.assertIn(config.MSG_NO_REPLY, msg.last)
 
     async def test_requires_admin(self):
         msg = _FakeMessage(reply_to=_fake_source())
-        ctx = _fake_context(bot=_FakeBot(invoker_status="member"))
-        await all_command(_fake_update(msg), ctx)
+        await call(all_command, msg, bot=_FakeBot(invoker_status="member"))
         self.assertIn(config.MSG_NOT_ADMIN, msg.last)
 
     async def test_admin_fetch_failure_is_fatal(self):
@@ -923,13 +924,13 @@ class TestAllCommand(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("nope")
 
         bot.get_chat_administrators = boom
-        await all_command(_fake_update(msg), _fake_context(bot=bot))
+        await call(all_command, msg, bot=bot)
         self.assertIn(config.MSG_ADMIN_FETCH_FAIL, msg.last)
 
     async def test_admin_starts_session(self):
         msg = _FakeMessage(reply_to=_fake_source())
         with patch.object(sender, "run", new=AsyncMock()) as run_mock:
-            await all_command(_fake_update(msg), _fake_context())
+            await call(all_command, msg, bot=_FakeBot())
             self.assertIn("Tagging Started", msg.last)
             self.assertIsNotNone(sess_mod.get(CHAT))
             self.assertEqual(run_mock.call_count, 1)
@@ -942,7 +943,7 @@ class TestAllCommand(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
 class TestTagabort(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
     async def test_no_session(self):
         msg = _FakeMessage()
-        await tagabort_command(_fake_update(msg), _fake_context())
+        await call(tagabort_command, msg, bot=_FakeBot())
         self.assertIn(config.MSG_NO_SESSION, msg.last)
 
     async def test_requires_admin(self):
@@ -953,8 +954,7 @@ class TestTagabort(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
             settings=st, admin_ids=set(),
         )
         msg = _FakeMessage()
-        ctx = _fake_context(bot=_FakeBot(invoker_status="member"))
-        await tagabort_command(_fake_update(msg), ctx)
+        await call(tagabort_command, msg, bot=_FakeBot(invoker_status="member"))
         self.assertIn(config.MSG_NOT_ADMIN, msg.last)
 
     async def test_abort_replies_stopped(self):
@@ -969,7 +969,7 @@ class TestTagabort(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
         # Simulate the sender finishing shortly after cancellation.
         asyncio.get_running_loop().call_later(0.05, s.done.set)
         msg = _FakeMessage()
-        await tagabort_command(_fake_update(msg), _fake_context())
+        await call(tagabort_command, msg, bot=_FakeBot())
         self.assertIn(
             config.MSG_STOPPED_FMT.format(tagged=9, total=30), msg.last
         )
@@ -978,26 +978,26 @@ class TestTagabort(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
 class TestAllsettingsAndStats(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
     async def test_show_settings_card(self):
         msg = _FakeMessage()
-        await allsettings_command(_fake_update(msg), _fake_context())
+        await call(allsettings_command, msg, bot=_FakeBot())
         self.assertIn("Mass Tag Settings", msg.last)
         self.assertIsNotNone(msg.replies[-1]["markup"])
 
     async def test_invalid_value(self):
         msg = _FakeMessage()
-        ctx = _fake_context(args=["mode", "nope"])
-        await allsettings_command(_fake_update(msg), ctx)
+        await call(allsettings_command, msg, bot=_FakeBot(),
+                   args=["mode", "nope"])
         self.assertIn("Unknown mode", msg.last)
 
     async def test_valid_value_updates(self):
         msg = _FakeMessage()
-        ctx = _fake_context(args=["window", "6h"])
-        await allsettings_command(_fake_update(msg), ctx)
+        await call(allsettings_command, msg, bot=_FakeBot(),
+                   args=["window", "6h"])
         self.assertIn("Settings Updated", msg.last)
         self.assertEqual(settings_mod.get(CHAT).window_hours, 6)
 
     async def test_stats_card(self):
         msg = _FakeMessage()
-        await tagstats_command(_fake_update(msg), _fake_context())
+        await call(tagstats_command, msg, bot=_FakeBot())
         self.assertIn("Mass Tag Stats", msg.last)
         self.assertIn("Presence source", msg.last)
 
@@ -1011,9 +1011,7 @@ class TestObservers(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
             id=777, first_name="Buf", last_name="Fer",
             username="buffer", bot=False,
         )
-        msg.sender_chat = None
-        upd = _fake_update(msg)
-        await activity_observer(upd, _fake_context())
+        await call(activity_observer, msg)
         self.assertEqual(activity_tracker.pending(), 1)
         flushed = activity_tracker.flush_now()
         self.assertEqual(flushed, 1)
@@ -1030,7 +1028,7 @@ class TestObservers(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
         msg.from_user = SimpleNamespace(id=778, first_name="Anon",
                                         last_name=None, username=None, bot=False)
         msg.sender_chat = SimpleNamespace(id=1)  # anonymous
-        await activity_observer(_fake_update(msg), _fake_context())
+        await call(activity_observer, msg)
         self.assertEqual(activity_tracker.pending(), 0)
 
     async def test_join_leave_registry(self):
@@ -1043,13 +1041,13 @@ class TestObservers(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
         msg = _FakeMessage()
         msg.new_chat_members = [joiner]
         msg.left_chat_member = None
-        await member_observer(_fake_update(msg), _fake_context())
+        await call(member_observer, msg)
         self.assertEqual(tdb.count_members(CHAT), 1)
 
         msg2 = _FakeMessage()
         msg2.new_chat_members = []
         msg2.left_chat_member = joiner
-        await member_observer(_fake_update(msg2), _fake_context())
+        await call(member_observer, msg2)
         self.assertEqual(tdb.count_members(CHAT), 0)
 
 
@@ -1091,7 +1089,7 @@ class TestSenderRun(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
         s = _run_session(status, st)
         bot = _RunBot()
 
-        await sender.run(s, _fake_context(bot=bot))
+        await sender.run(s, bot)
 
         self.assertTrue(s.done.is_set())
         self.assertIsNone(sess_mod.get(CHAT))  # discarded after finish
@@ -1112,7 +1110,7 @@ class TestSenderRun(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
         status = _failing_status()  # every edit raises BadRequest
         s = _run_session(status, st)
 
-        await sender.run(s, _fake_context(bot=_RunBot()))
+        await sender.run(s, _RunBot())
 
         self.assertTrue(status.replies)  # fresh reply landed instead
         self.assertIn(config.MSG_NOBODY, status.replies[-1])
@@ -1129,7 +1127,7 @@ class TestSenderRun(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
         s = _run_session(status, st)
         bot = _RunBot()
 
-        await sender.run(s, _fake_context(bot=bot))
+        await sender.run(s, bot)
 
         self.assertEqual(s.state, "completed")
         self.assertEqual(len(bot.copied), 1)  # source copied once

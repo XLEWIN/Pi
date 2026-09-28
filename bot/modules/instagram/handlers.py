@@ -18,13 +18,14 @@ import time
 from html import escape
 from typing import Optional
 
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import ContextTypes
+from aiogram import Bot
+from aiogram.enums import ParseMode
+from aiogram.types import CallbackQuery, Message
 
 from bot.config import settings as bot_settings
 from bot.database import db
 from bot.emojis import E
+from bot.reply import reply_text
 from bot.responses import action_card, error_card
 
 from .cache import (
@@ -54,15 +55,15 @@ def _is_owner(user_id: Optional[int]) -> bool:
     return bool(user_id and bot_settings.owner_id and user_id == bot_settings.owner_id)
 
 
-async def _is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    user = update.effective_user
-    chat = update.effective_chat
+async def _is_admin(message: Message, bot: Bot) -> bool:
+    user = message.from_user
+    chat = message.chat
     if not user or not chat:
         return False
     if _is_owner(user.id):
         return True
     try:
-        member = await context.bot.get_chat_member(chat.id, user.id)
+        member = await bot.get_chat_member(chat.id, user.id)
         return member.status in ("administrator", "creator")
     except Exception:
         return False
@@ -113,7 +114,7 @@ def _first_caption_html(post, norm_url: str) -> str:
 
 
 async def _send_cached(
-    context: ContextTypes.DEFAULT_TYPE,
+    bot: Bot,
     chat_id: int,
     post,
     cached: dict,
@@ -129,24 +130,24 @@ async def _send_cached(
         rid = reply_to_message_id if i == 0 else None
         parse = ParseMode.HTML if cap else None
         if kind == MediaKind.PHOTO:
-            await context.bot.send_photo(
+            await bot.send_photo(
                 chat_id, photo=file_id, caption=cap, parse_mode=parse, reply_to_message_id=rid
             )
         elif kind == MediaKind.VIDEO:
-            await context.bot.send_video(
+            await bot.send_video(
                 chat_id, video=file_id, caption=cap, parse_mode=parse,
                 reply_to_message_id=rid, supports_streaming=True,
             )
         elif kind == MediaKind.AUDIO:
-            await context.bot.send_audio(
+            await bot.send_audio(
                 chat_id, audio=file_id, caption=cap, parse_mode=parse, reply_to_message_id=rid
             )
         elif kind == MediaKind.ANIMATION:
-            await context.bot.send_animation(
+            await bot.send_animation(
                 chat_id, animation=file_id, caption=cap, parse_mode=parse, reply_to_message_id=rid
             )
         else:
-            await context.bot.send_document(
+            await bot.send_document(
                 chat_id, document=file_id, caption=cap, parse_mode=parse, reply_to_message_id=rid
             )
         db.ig_touch_file_id(key)
@@ -174,7 +175,7 @@ def _extract_file_id(message) -> Optional[str]:
 
 
 async def process_url(
-    context: ContextTypes.DEFAULT_TYPE,
+    bot: Bot,
     chat_id: int,
     url: str,
     *,
@@ -204,7 +205,7 @@ async def process_url(
             put_resolved(key, post)
         else:
             ig_log(f"resolve-cache hit {post.media_id}")
-        transport = TelegramTransport(context.bot)
+        transport = TelegramTransport(bot)
         caption = _first_caption_html(post, norm)
 
         cache_keys = [f"{post.media_id}:{i}" for i in range(len(post.assets))]
@@ -214,7 +215,7 @@ async def process_url(
         if post.assets and len(cached) == len(cache_keys):
             try:
                 await _send_cached(
-                    context, chat_id, post, cached, caption, reply_to_message_id
+                    bot, chat_id, post, cached, caption, reply_to_message_id
                 )
                 elapsed = int((time.perf_counter() - t0) * 1000)
                 db.ig_log_download(
@@ -282,15 +283,12 @@ async def process_url(
 
 # ── Auto-detect handler (group 14) ──────────────────────────────
 
-async def auto_download_handler(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
+async def auto_download_handler(message: Message, bot: Bot) -> None:
     """Catch non-command text containing Instagram URLs when auto mode is on."""
     if not ig_config.enabled:
         return
-    message = update.effective_message
-    chat = update.effective_chat
-    user = update.effective_user
+    chat = message.chat
+    user = message.from_user
     if not message or not chat:
         return
 
@@ -315,7 +313,8 @@ async def auto_download_handler(
     metrics.bump("auto_triggers")
     # Send status concurrently so resolve/download starts immediately.
     status_task = asyncio.create_task(
-        message.reply_text(
+        reply_text(
+            message,
             f"{E.SPARKLE} Downloading…",
             parse_mode=ParseMode.HTML,
             quote=True,
@@ -323,7 +322,7 @@ async def auto_download_handler(
     )
     try:
         await process_url(
-            context,
+            bot,
             chat.id,
             url,
             requester_id=user.id if user else 0,
@@ -342,7 +341,8 @@ async def auto_download_handler(
             await _safe_edit(status, _error_text(e), reply_markup=error_keyboard(url))
         else:
             try:
-                await message.reply_text(
+                await reply_text(
+                    message,
                     _error_text(e),
                     parse_mode=ParseMode.HTML,
                     reply_markup=error_keyboard(url),
@@ -353,25 +353,26 @@ async def auto_download_handler(
 
 # ── /igdl ───────────────────────────────────────────────────────
 
-async def igdl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_chat:
+async def igdl_command(message: Message, bot: Bot, args: list) -> None:
+    if not message or not message.chat:
         return
     if not ig_config.enabled:
-        await update.message.reply_text(
+        await reply_text(
+            message,
             error_card("Instagram Download Failed", escape("Module is disabled.")),
             parse_mode=ParseMode.HTML,
         )
         return
 
     url: Optional[str] = None
-    if context.args:
-        found = find_instagram_urls(" ".join(context.args))
+    if args:
+        found = find_instagram_urls(" ".join(args))
         try:
             url = first_post_url(found) or (normalize_url(found[0]) if found else None)
         except IGInvalidUrl:
             url = None
-    elif update.message.reply_to_message:
-        rt = update.message.reply_to_message
+    elif message.reply_to_message:
+        rt = message.reply_to_message
         found = find_instagram_urls(rt.text or rt.caption or "")
         try:
             url = first_post_url(found) or (normalize_url(found[0]) if found else None)
@@ -379,7 +380,8 @@ async def igdl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             url = None
 
     if not url:
-        await update.message.reply_text(
+        await reply_text(
+            message,
             action_card(
                 "Instagram Download",
                 [
@@ -393,17 +395,18 @@ async def igdl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     status_task = asyncio.create_task(
-        update.message.reply_text(
+        reply_text(
+            message,
             f"{E.SPARKLE} Downloading…",
             parse_mode=ParseMode.HTML,
         )
     )
     try:
         await process_url(
-            context,
-            update.effective_chat.id,
+            bot,
+            message.chat.id,
             url,
-            requester_id=update.effective_user.id if update.effective_user else 0,
+            requester_id=message.from_user.id if message.from_user else 0,
         )
         try:
             status = await status_task
@@ -419,7 +422,8 @@ async def igdl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await _safe_edit(status, _error_text(e), reply_markup=error_keyboard(url))
         else:
             try:
-                await update.message.reply_text(
+                await reply_text(
+                    message,
                     _error_text(e),
                     parse_mode=ParseMode.HTML,
                     reply_markup=error_keyboard(url),
@@ -443,18 +447,19 @@ def _settings_card(auto: bool, mx: int) -> str:
     )
 
 
-async def igsettings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_chat:
+async def igsettings_command(message: Message, bot: Bot, args: list) -> None:
+    if not message or not message.chat:
         return
-    if not await _is_admin(update, context):
-        await update.message.reply_text(
+    if not await _is_admin(message, bot):
+        await reply_text(
+            message,
             error_card("Not allowed", escape("Admins only.")),
             parse_mode=ParseMode.HTML,
         )
         return
 
-    chat_id = update.effective_chat.id
-    args = [a.lower() for a in (context.args or [])]
+    chat_id = message.chat.id
+    args = [a.lower() for a in (args or [])]
 
     if args:
         if args[0] in {"auto", "autodl"} and len(args) >= 2:
@@ -470,7 +475,8 @@ async def igsettings_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     st = _ig_settings(chat_id)
     auto = bool(st.get("auto_download"))
     mx = int(st.get("max_items") or ig_config.max_items)
-    await update.message.reply_text(
+    await reply_text(
+        message,
         _settings_card(auto, mx),
         parse_mode=ParseMode.HTML,
         reply_markup=settings_keyboard(auto, mx),
@@ -479,11 +485,12 @@ async def igsettings_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ── /igstats ────────────────────────────────────────────────────
 
-async def igstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
+async def igstats_command(message: Message, bot: Bot) -> None:
+    if not message:
         return
-    if not await _is_admin(update, context):
-        await update.message.reply_text(
+    if not await _is_admin(message, bot):
+        await reply_text(
+            message,
             error_card("Not allowed", escape("Admins only.")),
             parse_mode=ParseMode.HTML,
         )
@@ -508,22 +515,23 @@ async def igstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         ],
         icon=E.CHART,
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    await reply_text(message, text, parse_mode=ParseMode.HTML)
 
 
 # ── /igcache ────────────────────────────────────────────────────
 
-async def igcache_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_user:
+async def igcache_command(message: Message, args: list) -> None:
+    if not message or not message.from_user:
         return
-    if not _is_owner(update.effective_user.id):
-        await update.message.reply_text(
+    if not _is_owner(message.from_user.id):
+        await reply_text(
+            message,
             error_card("Not allowed", escape("Owner only.")),
             parse_mode=ParseMode.HTML,
         )
         return
 
-    args = [a.lower() for a in (context.args or [])]
+    args = [a.lower() for a in (args or [])]
     if args and args[0] == "clear":
         n = clear_cache()
         text = action_card(
@@ -543,30 +551,32 @@ async def igcache_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             ],
             icon=E.FOLDER,
         )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    await reply_text(message, text, parse_mode=ParseMode.HTML)
 
 
 # ── /igbenchmark ────────────────────────────────────────────────
 
-async def igbenchmark_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_user:
+async def igbenchmark_command(message: Message, args: list) -> None:
+    if not message or not message.from_user:
         return
-    if not _is_owner(update.effective_user.id):
-        await update.message.reply_text(
+    if not _is_owner(message.from_user.id):
+        await reply_text(
+            message,
             error_card("Not allowed", escape("Owner only.")),
             parse_mode=ParseMode.HTML,
         )
         return
 
     url = None
-    if context.args:
-        found = find_instagram_urls(" ".join(context.args))
+    if args:
+        found = find_instagram_urls(" ".join(args))
         try:
             url = first_post_url(found) or (normalize_url(found[0]) if found else None)
         except IGInvalidUrl:
             url = None
     if not url:
-        await update.message.reply_text(
+        await reply_text(
+            message,
             action_card(
                 "Instagram Benchmark",
                 [(E.INFO, "Detail", "Usage: /igbenchmark &lt;url&gt;")],
@@ -576,7 +586,8 @@ async def igbenchmark_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    status = await update.message.reply_text(
+    status = await reply_text(
+        message,
         f"{E.TIME} Benchmarking…", parse_mode=ParseMode.HTML
     )
     t0 = time.perf_counter()
@@ -602,8 +613,8 @@ async def igbenchmark_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # ── Callbacks (settings toggles / close) ────────────────────────
 
-async def ig_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
+async def ig_callback(callback_query: CallbackQuery, bot: Bot) -> None:
+    query = callback_query
     if not query or not query.data or not query.data.startswith("ig:"):
         return
     await query.answer()
@@ -619,7 +630,7 @@ async def ig_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not query.message or not query.from_user:
             return
         chat_id = query.message.chat_id
-        if not await _member_is_admin(context.bot, chat_id, query.from_user.id):
+        if not await _member_is_admin(bot, chat_id, query.from_user.id):
             await query.answer("Admins only.", show_alert=True)
             return
 
@@ -637,7 +648,7 @@ async def ig_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         auto = bool(st.get("auto_download"))
         mx = int(st.get("max_items") or ig_config.max_items)
         try:
-            await query.edit_message_text(
+            await query.message.edit_text(
                 _settings_card(auto, mx),
                 parse_mode=ParseMode.HTML,
                 reply_markup=settings_keyboard(auto, mx),

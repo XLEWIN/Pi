@@ -34,8 +34,11 @@ os.environ["LOCALAPPDATA"] = _TEST_DIR
 atexit.register(shutil.rmtree, _TEST_DIR, ignore_errors=True)
 
 # ── Imports (after env) ───────────────────────────────────────────
+from bot import pipeline  # noqa: E402
+from bot.command_handler import CommandFilter  # noqa: E402
 from bot.database import db  # noqa: E402
 from bot.modules import requests as req  # noqa: E402
+from aiofakes import call, make_callback, make_message  # noqa: E402
 
 CHAT_ID = -1009999999991
 OTHER_CHAT = -1009999999992
@@ -86,72 +89,58 @@ class _FakeBot:
         return True
 
 
-class _FakeMessage:
-    def __init__(self, chat_id: int = CHAT_ID, chat_type: str = "supergroup"):
-        self.chat = SimpleNamespace(id=chat_id, type=chat_type, title="Test")
-        self.replies: list = []
+def _cmd(*, chat_type: str = "supergroup", chat_id: int = CHAT_ID):
+    """Command message + bot — sends record on ``msg.calls``."""
+    msg = make_message(
+        "/request", chat_id=chat_id, chat_type=chat_type,
+        user_id=7, first_name="Admin",
+    )
 
-    async def reply_text(self, text, parse_mode=None, reply_markup=None, **kw):
-        self.replies.append({"text": text, "markup": reply_markup})
+    async def reply_text(text, **kw):
+        # bot.responses.reply_card still calls the PTB-era
+        # message.reply_text(...) shortcut, so route it exactly like
+        # bot.reply.reply_text does (group → reply, private → answer).
+        if msg.chat.type != "private":
+            return await msg.reply(text, **kw)
+        return await msg.answer(text, **kw)
 
-    @property
-    def last(self):
-        return self.replies[-1] if self.replies else None
-
-
-class _FakeQuery:
-    def __init__(self, data: str, user=None):
-        self.data = data
-        self.from_user = user or _user(7, "Admin Clicker")
-        self.answers: list = []
-        self.edits: list = []
-
-    async def answer(self, text=None, show_alert=False, **kw):
-        self.answers.append({"text": text, "show_alert": show_alert})
-
-    async def edit_message_text(self, text, parse_mode=None, reply_markup=None, **kw):
-        self.edits.append(text)
+    msg.reply_text = reply_text
+    return msg, _FakeBot()
 
 
-def _cmd_update(args=None, chat_type: str = "supergroup",
-                chat_id: int = CHAT_ID, user=None):
-    msg = _FakeMessage(chat_id, chat_type)
+def _jr(chat_id: int = CHAT_ID):
+    """Duck ChatJoinRequest event."""
     return SimpleNamespace(
-        message=msg,
-        effective_message=msg,
-        effective_chat=msg.chat,
-        effective_user=user or _user(7, "Admin Clicker"),
-    ), SimpleNamespace(args=args or [], bot=_FakeBot())
-
-
-def _jr_update(enabled_via_bot: _FakeBot, chat_id: int = CHAT_ID):
-    return SimpleNamespace(
-        chat_join_request=SimpleNamespace(
-            chat=SimpleNamespace(id=chat_id, type="supergroup", title="Test"),
-            from_user=_user(),
-        )
+        chat=SimpleNamespace(id=chat_id, type="supergroup", title="Test"),
+        from_user=_user(),
     )
 
 
-def _cb_update(data: str, status: str = "administrator", user=None):
+def _cb(data: str, status: str = "administrator"):
+    """joinreq:* callback + its bot; message records edits."""
     bot = _FakeBot(status)
-    upd = SimpleNamespace(
-        callback_query=_FakeQuery(data, user=user),
-        bot=bot,
-    )
-    return upd, SimpleNamespace(bot=bot)
+    cb = make_callback(data, user_id=7)
+    cb.from_user.first_name = "Admin"
+    cb.from_user.last_name = "Clicker"
+    cb.from_user.full_name = "Admin Clicker"
+    return cb, bot
+
+
+def _text(msg):
+    """Last reply/answer text recorded on a FakeMessage."""
+    for kind, t, _ in reversed(msg.calls):
+        if kind in ("reply", "answer"):
+            return t
+    return None
+
+
+def _edits(msg):
+    """All edit_text payloads, oldest first."""
+    return [t for (k, t, _) in msg.calls if k == "edit_text"]
 
 
 def _flat(markup):
     return [b for row in markup.inline_keyboard for b in row]
-
-
-class _FakeApp:
-    def __init__(self):
-        self.handlers: list = []
-
-    def add_handler(self, handler, group=0):
-        self.handlers.append((group, handler))
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -183,17 +172,13 @@ class TestCardAndKeyboard(unittest.TestCase):
             accept.callback_data,
             f"joinreq:accept:{CHAT_ID}:{REQUESTER_ID}",
         )
-        self.assertEqual(
-            (getattr(accept, "api_kwargs", None) or {}).get("style"), "success"
-        )
+        self.assertEqual(getattr(accept, "style", None), "success")
         self.assertEqual(decline.text, "Decline")
         self.assertEqual(
             decline.callback_data,
             f"joinreq:decline:{CHAT_ID}:{REQUESTER_ID}",
         )
-        self.assertEqual(
-            (getattr(decline, "api_kwargs", None) or {}).get("style"), "danger"
-        )
+        self.assertEqual(getattr(decline, "style", None), "danger")
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -210,38 +195,38 @@ class TestRequestCommand(unittest.IsolatedAsyncioTestCase):
         db.set_join_requests(OTHER_CHAT, False)
 
     async def test_status_when_no_args(self):
-        upd, ctx = _cmd_update()
-        await req.request_command(upd, ctx)
-        self.assertIn("Disabled", upd.message.last["text"])
+        msg, bot = _cmd()
+        await call(req.request_command, msg, bot=bot)
+        self.assertIn("Disabled", _text(msg))
 
     async def test_enable_and_disable(self):
-        upd, ctx = _cmd_update(["on"])
-        await req.request_command(upd, ctx)
+        msg, bot = _cmd()
+        await call(req.request_command, msg, bot=bot, args=["on"])
         self.assertTrue(db.get_join_requests(CHAT_ID))
-        self.assertIn("Enabled", upd.message.last["text"])
+        self.assertIn("Enabled", _text(msg))
 
-        upd, ctx = _cmd_update(["off"])
-        await req.request_command(upd, ctx)
+        msg, bot = _cmd()
+        await call(req.request_command, msg, bot=bot, args=["off"])
         self.assertFalse(db.get_join_requests(CHAT_ID))
-        self.assertIn("Disabled", upd.message.last["text"])
+        self.assertIn("Disabled", _text(msg))
 
     async def test_invalid_arg_shows_status(self):
-        upd, ctx = _cmd_update(["maybe"])
-        await req.request_command(upd, ctx)
-        self.assertIn("Status", upd.message.last["text"])
+        msg, bot = _cmd()
+        await call(req.request_command, msg, bot=bot, args=["maybe"])
+        self.assertIn("Status", _text(msg))
         self.assertFalse(db.get_join_requests(CHAT_ID))
 
     async def test_non_admin_denied(self):
-        upd, ctx = _cmd_update(["on"])
-        ctx.bot.member_status = "member"
-        await req.request_command(upd, ctx)
-        self.assertIn("admin rights", upd.message.last["text"])
+        msg, bot = _cmd()
+        bot.member_status = "member"
+        await call(req.request_command, msg, bot=bot, args=["on"])
+        self.assertIn("admin rights", _text(msg))
         self.assertFalse(db.get_join_requests(CHAT_ID))
 
     async def test_private_denied(self):
-        upd, ctx = _cmd_update(["on"], chat_type="private")
-        await req.request_command(upd, ctx)
-        self.assertIn("groups", upd.message.last["text"])
+        msg, bot = _cmd(chat_type="private")
+        await call(req.request_command, msg, bot=bot, args=["on"])
+        self.assertIn("groups", _text(msg))
         self.assertFalse(db.get_join_requests(CHAT_ID))
 
 
@@ -260,15 +245,13 @@ class TestOnJoinRequest(unittest.IsolatedAsyncioTestCase):
 
     async def test_disabled_sends_nothing(self):
         bot = _FakeBot()
-        upd = _jr_update(bot)
-        await req.on_join_request(upd, SimpleNamespace(bot=bot))
+        await call(req.on_join_request, _jr(), bot=bot)
         self.assertEqual(bot.sent, [])
 
     async def test_enabled_posts_card_with_buttons(self):
         db.set_join_requests(CHAT_ID, True)
         bot = _FakeBot()
-        upd = _jr_update(bot)
-        await req.on_join_request(upd, SimpleNamespace(bot=bot))
+        await call(req.on_join_request, _jr(), bot=bot)
         self.assertEqual(len(bot.sent), 1)
         chat_id, text, markup = bot.sent[0]
         self.assertEqual(chat_id, CHAT_ID)
@@ -296,73 +279,74 @@ class TestJoinRequestCallback(unittest.IsolatedAsyncioTestCase):
         req._PENDING.clear()
 
     async def test_admin_accept_approves_and_edits_result(self):
-        upd, ctx = _cb_update(f"joinreq:accept:{CHAT_ID}:{REQUESTER_ID}")
-        await req.join_request_callback(upd, ctx)
-        self.assertEqual(ctx.bot.approved, [(CHAT_ID, REQUESTER_ID)])
-        self.assertEqual(ctx.bot.declined, [])
-        self.assertEqual(len(upd.callback_query.answers), 1)
-        self.assertFalse(upd.callback_query.answers[0]["show_alert"])
-        self.assertEqual(len(upd.callback_query.edits), 1)
-        text = upd.callback_query.edits[0]
-        self.assertIn("accepted join request of", text)
-        self.assertIn("Admin Clicker", text)
-        self.assertIn("Nobara", text)  # live member lookup after approve
+        cb, bot = _cb(f"joinreq:accept:{CHAT_ID}:{REQUESTER_ID}")
+        await call(req.join_request_callback, cb, bot=bot)
+        self.assertEqual(bot.approved, [(CHAT_ID, REQUESTER_ID)])
+        self.assertEqual(bot.declined, [])
+        self.assertEqual(len(cb.answers), 1)
+        self.assertFalse(cb.answers[0]["show_alert"])
+        edits = _edits(cb.message)
+        self.assertEqual(len(edits), 1)
+        self.assertIn("accepted join request of", edits[0])
+        self.assertIn("Admin Clicker", edits[0])
+        self.assertIn("Nobara", edits[0])  # live member lookup after approve
 
     async def test_admin_decline_declines_and_edits_result(self):
-        upd, ctx = _cb_update(f"joinreq:decline:{CHAT_ID}:{REQUESTER_ID}")
-        await req.join_request_callback(upd, ctx)
-        self.assertEqual(ctx.bot.declined, [(CHAT_ID, REQUESTER_ID)])
-        self.assertEqual(ctx.bot.approved, [])
-        text = upd.callback_query.edits[0]
-        self.assertIn("declined join request of", text)
-        self.assertIn("Nobara", text)  # card-time cache fallback
+        cb, bot = _cb(f"joinreq:decline:{CHAT_ID}:{REQUESTER_ID}")
+        await call(req.join_request_callback, cb, bot=bot)
+        self.assertEqual(bot.declined, [(CHAT_ID, REQUESTER_ID)])
+        self.assertEqual(bot.approved, [])
+        edits = _edits(cb.message)
+        self.assertIn("declined join request of", edits[0])
+        self.assertIn("Nobara", edits[0])  # card-time cache fallback
 
     async def test_non_admin_cannot_process(self):
-        upd, ctx = _cb_update(
+        cb, bot = _cb(
             f"joinreq:accept:{CHAT_ID}:{REQUESTER_ID}", status="member"
         )
-        await req.join_request_callback(upd, ctx)
-        self.assertEqual(ctx.bot.approved, [])
-        self.assertEqual(ctx.bot.declined, [])
-        self.assertEqual(upd.callback_query.edits, [])
-        self.assertEqual(len(upd.callback_query.answers), 1)
-        self.assertTrue(upd.callback_query.answers[0]["show_alert"])
+        await call(req.join_request_callback, cb, bot=bot)
+        self.assertEqual(bot.approved, [])
+        self.assertEqual(bot.declined, [])
+        self.assertEqual(_edits(cb.message), [])
+        self.assertEqual(len(cb.answers), 1)
+        self.assertTrue(cb.answers[0]["show_alert"])
 
     async def test_owner_status_accepted(self):
-        upd, ctx = _cb_update(
+        cb, bot = _cb(
             f"joinreq:accept:{CHAT_ID}:{REQUESTER_ID}", status="creator"
         )
-        await req.join_request_callback(upd, ctx)
-        self.assertEqual(ctx.bot.approved, [(CHAT_ID, REQUESTER_ID)])
+        await call(req.join_request_callback, cb, bot=bot)
+        self.assertEqual(bot.approved, [(CHAT_ID, REQUESTER_ID)])
 
     async def test_invalid_data_alerts(self):
-        upd, ctx = _cb_update("joinreq:accept:bad:bad")
-        await req.join_request_callback(upd, ctx)
-        self.assertEqual(ctx.bot.approved, [])
-        self.assertTrue(upd.callback_query.answers[0]["show_alert"])
-        self.assertEqual(upd.callback_query.edits, [])
+        cb, bot = _cb("joinreq:accept:bad:bad")
+        await call(req.join_request_callback, cb, bot=bot)
+        self.assertEqual(bot.approved, [])
+        self.assertTrue(cb.answers[0]["show_alert"])
+        self.assertEqual(_edits(cb.message), [])
 
     async def test_api_failure_edits_error(self):
-        upd, ctx = _cb_update(f"joinreq:accept:{CHAT_ID}:{REQUESTER_ID}")
+        cb, bot = _cb(f"joinreq:accept:{CHAT_ID}:{REQUESTER_ID}")
 
         async def boom(chat_id, user_id):
             raise RuntimeError("Bad Request: user not found")
 
-        ctx.bot.approve_chat_join_request = boom
-        await req.join_request_callback(upd, ctx)
-        self.assertEqual(len(upd.callback_query.edits), 1)
-        self.assertIn("Could not accept", upd.callback_query.edits[0])
+        bot.approve_chat_join_request = boom
+        await call(req.join_request_callback, cb, bot=bot)
+        edits = _edits(cb.message)
+        self.assertEqual(len(edits), 1)
+        self.assertIn("Could not accept", edits[0])
 
     async def test_admin_gate_failure_alerts(self):
-        upd, ctx = _cb_update(f"joinreq:accept:{CHAT_ID}:{REQUESTER_ID}")
+        cb, bot = _cb(f"joinreq:accept:{CHAT_ID}:{REQUESTER_ID}")
 
         async def boom(chat_id, user_id):
             raise RuntimeError("network down")
 
-        ctx.bot.get_chat_member = boom
-        await req.join_request_callback(upd, ctx)
-        self.assertEqual(ctx.bot.approved, [])
-        self.assertTrue(upd.callback_query.answers[0]["show_alert"])
+        bot.get_chat_member = boom
+        await call(req.join_request_callback, cb, bot=bot)
+        self.assertEqual(bot.approved, [])
+        self.assertTrue(cb.answers[0]["show_alert"])
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -385,14 +369,29 @@ class TestDatabaseAndSetup(unittest.TestCase):
         self.assertEqual(db.count_user_groups(987654321), 0)
 
     def test_setup_registers_handlers(self):
-        app = _FakeApp()
-        routes = req.setup(app)
-        kinds = [type(h).__name__ for _, h in app.handlers]
-        self.assertEqual(len(app.handlers), 3)
-        self.assertTrue(any("CommandHandler" in k for k in kinds))
-        self.assertTrue(any("ChatJoinRequestHandler" in k for k in kinds))
-        self.assertTrue(any("CallbackQueryHandler" in k for k in kinds))
-        self.assertEqual(routes[0], "/request on|off")
+        pipeline.clear()
+        try:
+            routes = req.setup()
+            self.assertEqual(routes[0], "/request on|off")
+
+            entries = [
+                e for e in pipeline.snapshot()
+                if e.fn.__module__ == "bot.modules.requests"
+            ]
+            self.assertEqual(len(entries), 3)
+            self.assertEqual(
+                {e.event: e.fn.__name__ for e in entries},
+                {
+                    "message": "request_command",
+                    "chat_join_request": "on_join_request",
+                    "callback_query": "join_request_callback",
+                },
+            )
+            msg_entry = next(e for e in entries if e.event == "message")
+            self.assertIsInstance(msg_entry.flt, CommandFilter)
+            self.assertEqual(msg_entry.flt.commands, frozenset({"request"}))
+        finally:
+            pipeline.clear()
 
 
 if __name__ == "__main__":

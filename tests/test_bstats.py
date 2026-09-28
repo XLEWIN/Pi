@@ -15,6 +15,7 @@ No network: fake messages/queries; bm.db and bm.moderation patched.
 
 from __future__ import annotations
 
+import asyncio
 import atexit
 import os
 import shutil
@@ -37,6 +38,10 @@ os.environ["LOCALAPPDATA"] = _TEST_DIR
 atexit.register(shutil.rmtree, _TEST_DIR, ignore_errors=True)
 
 # ── Imports (after env) ───────────────────────────────────────────
+from aiogram.dispatcher.event.handler import FilterObject, HandlerObject  # noqa: E402
+
+from aiofakes import FakeMessage, call, command_filters, make_callback  # noqa: E402
+from bot import pipeline  # noqa: E402
 from bot.constants import BOT_START_TIME, HELP_MENU  # noqa: E402
 from bot.emojis import E, EID  # noqa: E402
 from bot.modules import bstats as bm  # noqa: E402
@@ -76,97 +81,58 @@ def _fake_db(rules=None, **kw):
         yield
 
 
-class _Sent:
-    def __init__(self):
-        self.edits: list = []
+class _Msg(FakeMessage):
+    """Command/card message — reply/answer returns the message itself, so
+    /ping can edit the card it just sent.  Every send/edit lands in .calls."""
 
-    async def edit_text(self, text, **kw):
-        self.edits.append({"text": text, **kw})
+    def __init__(self, text: str = "/bstats", *, user_id: int = OWNER_ID,
+                 **kw) -> None:
+        super().__init__(text, user_id=user_id, **kw)
+
+    async def answer(self, text, **kw):
+        self.calls.append(("answer", text, kw))
         return self
 
-    @property
-    def last(self):
-        return self.edits[-1] if self.edits else None
+    async def reply(self, text, **kw):
+        self.calls.append(("reply", text, kw))
+        return self
 
 
-class _Msg:
-    def __init__(self, text="/bstats") -> None:
-        self.text = text
-        self.replies: list = []
-        self.sent: _Sent | None = None
+class _StaleMsg(_Msg):
+    """Fake message for the Close path — delete() refuses ("too old")."""
 
-    async def reply_text(self, text, **kw):
-        self.replies.append({"text": text, **kw})
-        self.sent = _Sent()
-        return self.sent
-
-    @property
-    def last(self):
-        return self.replies[-1] if self.replies else None
+    async def delete(self, **kw):
+        raise RuntimeError("message is too old")
 
 
-class _DelMsg:
-    """Fake message for the Close path — ``query.message.delete()``."""
-
-    def __init__(self, fail: bool = False) -> None:
-        self.fail = fail
-        self.deleted = False
-
-    async def delete(self):
-        if self.fail:
-            raise RuntimeError("message is too old")
-        self.deleted = True
+def _sent(msg):
+    """{"text", **kw} of the last ("answer"/"reply", …) record on msg."""
+    for kind, text, kw in reversed(msg.calls):
+        if kind in ("answer", "reply"):
+            return {"text": text, **kw}
+    return None
 
 
-class _Query:
-    def __init__(self, data: str, user_id=OWNER_ID, message=None) -> None:
-        self.data = data
-        self.from_user = (
-            None if user_id is None
-            else SimpleNamespace(id=user_id, username=None, first_name="T")
-        )
-        self.message = message if message is not None else _DelMsg()
-        self.answers: list = []
-        self.edits: list = []
-        self.reply_markup_stripped = False
-
-    async def answer(self, text=None, show_alert=False):
-        self.answers.append({"text": text, "show_alert": show_alert})
-
-    async def edit_message_text(self, text, **kw):
-        self.edits.append({"text": text, **kw})
-        return True
-
-    async def edit_message_reply_markup(self, reply_markup=None):
-        self.reply_markup_stripped = True
-
-    @property
-    def last_edit(self):
-        return self.edits[-1] if self.edits else None
+def _edits(msg):
+    """[{"text", **kw}] for every ("edit_text", …) record on msg."""
+    return [{"text": t, **kw} for (k, t, kw) in msg.calls if k == "edit_text"]
 
 
-def _update(msg, user_id=OWNER_ID):
-    user = None if user_id is None else SimpleNamespace(
-        id=user_id, username=None, first_name="T"
-    )
-    return SimpleNamespace(effective_message=msg, effective_user=user,
-                           message=msg)
+def _kinds(msg):
+    """Every recorded action kind, in order."""
+    return [k for (k, _, _) in msg.calls]
 
 
-def _cb_update(query):
-    return SimpleNamespace(callback_query=query)
+def _query(data: str, *, user_id=OWNER_ID, message=None):
+    return make_callback(data, user_id=user_id, message=message)
 
 
-class _FakeBot:
-    async def get_me(self):
-        return SimpleNamespace(id=1, username="pi_bot")
-
-
-class _Ctx:
-    def __init__(self, bot=None):
-        self.bot = bot if bot is not None else _FakeBot()
-        self.bot_data: dict = {}
-        self.args: list = []
+def _matches(flt, data: str) -> bool:
+    """True when a callback_query pipeline filter accepts ``data``."""
+    handler = HandlerObject(callback=bm.stats_callback,
+                            filters=[FilterObject(flt)])
+    ok, _ = asyncio.run(handler.check(make_callback(data)))
+    return ok
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -252,42 +218,45 @@ class TestBstatsCard(unittest.TestCase):
 
 class TestBstatsCommand(unittest.IsolatedAsyncioTestCase):
     async def test_non_owner_denied(self):
-        msg = _Msg()
+        msg = _Msg(user_id=99)
         with _owner(), _fake_db():
-            await bm.bstats_command(_update(msg, user_id=99), _Ctx())
-        self.assertIn("Only the bot owner", msg.last["text"])
-        self.assertIn("/bstats", msg.last["text"])
-        self.assertNotIn("reply_markup", msg.last)
+            await call(bm.bstats_command, msg)
+        self.assertEqual(msg.last[0], "reply")
+        self.assertIn("Only the bot owner", msg.last[1])
+        self.assertIn("/bstats", msg.last[1])
+        self.assertNotIn("reply_markup", msg.last[2])
 
     async def test_missing_user_denied(self):
         msg = _Msg()
+        msg.from_user = None
         with _owner(), _fake_db():
-            await bm.bstats_command(_update(msg, user_id=None), _Ctx())
-        self.assertIn("Only the bot owner", msg.last["text"])
+            await call(bm.bstats_command, msg)
+        self.assertIn("Only the bot owner", msg.last[1])
 
     async def test_unconfigured_owner_denies_everyone(self):
-        msg = _Msg()
+        msg = _Msg(user_id=0)
         with mock.patch.object(bm, "settings", SimpleNamespace(owner_id=0)), \
                 _fake_db():
-            await bm.bstats_command(_update(msg, user_id=0), _Ctx())
-        self.assertIn("Only the bot owner", msg.last["text"])
+            await call(bm.bstats_command, msg)
+        self.assertIn("Only the bot owner", msg.last[1])
 
     async def test_owner_gets_card_with_counts_and_buttons(self):
         msg = _Msg()
         with _owner(), _fake_db(users=51, chats=1, sudos=2, gbanned=7):
-            await bm.bstats_command(_update(msg), _Ctx())
-        self.assertEqual(len(msg.replies), 1)
-        self.assertEqual(msg.last["parse_mode"], "HTML")
-        self.assertIn("Total Users: 51", msg.last["text"])
-        self.assertIn("Total Sudos: 2", msg.last["text"])
-        self.assertIn("GBanned Users: 7", msg.last["text"])
-        self.assertIn("Total Rules: 1", msg.last["text"])  # 1 rules_db entry
-        markup = msg.last["reply_markup"]
+            await call(bm.bstats_command, msg)
+        self.assertEqual(len(msg.sent_texts), 1)
+        card = _sent(msg)
+        self.assertEqual(card["parse_mode"], "HTML")
+        self.assertIn("Total Users: 51", card["text"])
+        self.assertIn("Total Sudos: 2", card["text"])
+        self.assertIn("GBanned Users: 7", card["text"])
+        self.assertIn("Total Rules: 1", card["text"])  # 1 rules_db entry
+        markup = card["reply_markup"]
         labels = [b.text for row in markup.inline_keyboard for b in row]
         self.assertEqual(labels, ["Refresh", "Close"])
         for row in markup.inline_keyboard:
             for b in row:
-                self.assertEqual(b.api_kwargs.get("style"),
+                self.assertEqual(b.style,
                                  "success" if b.text == "Refresh" else "danger")
 
 
@@ -297,39 +266,39 @@ class TestBstatsCommand(unittest.IsolatedAsyncioTestCase):
 
 class TestBstatsCallback(unittest.IsolatedAsyncioTestCase):
     async def test_non_owner_refresh_alerted_without_edit(self):
-        q = _Query("bstats:refresh", user_id=99)
+        q = _query("bstats:refresh", user_id=99)
         with _owner(), _fake_db():
-            await bm.stats_callback(_cb_update(q), _Ctx())
+            await call(bm.stats_callback, q)
         self.assertTrue(q.answers[0]["show_alert"])
         self.assertIn("Only the bot owner", q.answers[0]["text"])
-        self.assertEqual(q.edits, [])
+        self.assertEqual(_edits(q.message), [])
 
     async def test_refresh_edits_fresh_card(self):
-        q = _Query("bstats:refresh")
+        q = _query("bstats:refresh")
         with _owner(), _fake_db(users=7):
-            await bm.stats_callback(_cb_update(q), _Ctx())
-        self.assertEqual(len(q.edits), 1)
-        self.assertIn("Total Users: 7", q.last_edit["text"])
-        self.assertIn("Refresh", str(q.last_edit["reply_markup"]))
+            await call(bm.stats_callback, q)
+        self.assertEqual(len(_edits(q.message)), 1)
+        self.assertIn("Total Users: 7", _edits(q.message)[-1]["text"])
+        self.assertIn("Refresh", str(_edits(q.message)[-1]["reply_markup"]))
 
     async def test_close_deletes_message(self):
-        target = _DelMsg()
-        q = _Query("bstats:close", message=target)
+        target = _Msg()
+        q = _query("bstats:close", message=target)
         with _owner(), _fake_db():
-            await bm.stats_callback(_cb_update(q), _Ctx())
-        self.assertTrue(target.deleted)
+            await call(bm.stats_callback, q)
+        self.assertIn("delete", _kinds(target))
 
     async def test_close_falls_back_to_stripping_buttons(self):
-        q = _Query("bstats:close", message=_DelMsg(fail=True))
+        q = _query("bstats:close", message=_StaleMsg())
         with _owner(), _fake_db():
-            await bm.stats_callback(_cb_update(q), _Ctx())
-        self.assertFalse(q.message.deleted)
-        self.assertTrue(q.reply_markup_stripped)
+            await call(bm.stats_callback, q)
+        self.assertNotIn("delete", _kinds(q.message))
+        self.assertIn("edit_reply_markup", _kinds(q.message))
 
     async def test_unknown_action_flagged(self):
-        q = _Query("bstats:bogus")
+        q = _query("bstats:bogus")
         with _owner(), _fake_db():
-            await bm.stats_callback(_cb_update(q), _Ctx())
+            await call(bm.stats_callback, q)
         self.assertEqual(q.answers[-1]["text"], "Unknown option")
 
 
@@ -339,41 +308,41 @@ class TestBstatsCallback(unittest.IsolatedAsyncioTestCase):
 
 class TestPing(unittest.IsolatedAsyncioTestCase):
     async def test_command_measures_and_edits_card(self):
-        msg = _Msg(text="/ping")
-        await bm.ping_command(_update(msg, user_id=99), _Ctx())
+        msg = _Msg(text="/ping", user_id=99)
+        await call(bm.ping_command, msg)
         # ping is public — non-owner works
-        self.assertEqual(len(msg.replies), 1)
-        card = msg.sent.last
-        self.assertIsNotNone(card)
+        self.assertEqual(len(msg.sent_texts), 1)
+        card = _edits(msg)
+        self.assertEqual(len(card), 1)
+        card = card[0]
         self.assertIn("Pong!", card["text"])
         self.assertRegex(card["text"], r"Ping: \d+\.\d{2} ms")
         self.assertIn("Uptime:", card["text"])
         self.assertEqual(card["parse_mode"], "HTML")
         btn = card["reply_markup"].inline_keyboard[0][0]
         self.assertEqual(btn.text, "Ping Again")
-        self.assertEqual(btn.api_kwargs.get("style"), "success")
-        self.assertEqual(btn.api_kwargs.get("icon_custom_emoji_id"),
-                         EID.FIRE)
+        self.assertEqual(btn.style, "success")
+        self.assertEqual(btn.icon_custom_emoji_id, EID.FIRE)
 
     async def test_again_callback_remeasures(self):
-        q = _Query("ping:again", user_id=99)   # public — any user
-        await bm.stats_callback(_cb_update(q), _Ctx())
-        self.assertEqual(len(q.edits), 1)
-        self.assertRegex(q.last_edit["text"], r"Ping: \d+\.\d{2} ms")
-        self.assertIn("Pong!", q.last_edit["text"])
+        q = _query("ping:again", user_id=99)   # public — any user
+        await call(bm.stats_callback, q)
+        self.assertEqual(len(_edits(q.message)), 1)
+        self.assertRegex(_edits(q.message)[-1]["text"], r"Ping: \d+\.\d{2} ms")
+        self.assertIn("Pong!", _edits(q.message)[-1]["text"])
 
     async def test_again_survives_api_error(self):
         class _DeadBot:
             async def get_me(self):
                 raise RuntimeError("network down")
 
-        q = _Query("ping:again", user_id=99)
-        await bm.stats_callback(_cb_update(q), _Ctx(bot=_DeadBot()))
-        self.assertEqual(len(q.edits), 1)   # still edits (0.00 ms card)
+        q = _query("ping:again", user_id=99)
+        await call(bm.stats_callback, q, bot=_DeadBot())
+        self.assertEqual(len(_edits(q.message)), 1)   # still edits (0.00 ms card)
 
     async def test_unknown_ping_action_flagged(self):
-        q = _Query("ping:bogus", user_id=99)
-        await bm.stats_callback(_cb_update(q), _Ctx())
+        q = _query("ping:bogus", user_id=99)
+        await call(bm.stats_callback, q)
         self.assertEqual(q.answers[-1]["text"], "Unknown option")
 
 
@@ -383,29 +352,24 @@ class TestPing(unittest.IsolatedAsyncioTestCase):
 
 class TestWiring(unittest.TestCase):
     def test_setup_registers_both_commands(self):
-        from telegram.ext import (CallbackQueryHandler,
-                                  CommandHandler as PTBCommandHandler)
-
-        class _App:
-            def __init__(self):
-                self.handlers = []
-
-            def add_handler(self, handler, group=0):
-                self.handlers.append(handler)
-
-        app = _App()
-        routes = bm.setup(app)
+        pipeline.clear()
+        routes = bm.setup()
         self.assertEqual(routes, ["/bstats", "/ping"])
-        cmds = [h for h in app.handlers
-                if isinstance(h, PTBCommandHandler)]
-        cbs = [h for h in app.handlers
-               if isinstance(h, CallbackQueryHandler)]
+        entries = pipeline.snapshot()
+        cmds = [e for e in entries if e.event == "message"]
+        cbs = [e for e in entries if e.event == "callback_query"]
         self.assertEqual(
-            sorted(set().union(*(c.commands for c in cmds))),
+            sorted(set().union(*(
+                set(cf.commands) for e in cmds
+                for cf in command_filters(e.flt)
+            ))),
             ["bstats", "ping"],
         )
         self.assertEqual(len(cbs), 1)
-        self.assertEqual(cbs[0].pattern.pattern, "^(bstats|ping):")
+        flt = cbs[0].flt          # ^(bstats|ping):
+        self.assertTrue(_matches(flt, "bstats:refresh"))
+        self.assertTrue(_matches(flt, "ping:again"))
+        self.assertFalse(_matches(flt, "other:x"))
 
     def test_help_documents_bstats_and_ping(self):
         general = next(m for m in HELP_MENU if m["key"] == "general")

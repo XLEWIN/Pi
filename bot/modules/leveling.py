@@ -8,21 +8,19 @@ same source /rankings displays. XP and streaks are cosmetic extras.
 import asyncio
 import logging
 import os
+import re
 import tempfile
 import time
 from html import escape
 
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
-from telegram.constants import ParseMode
+from aiogram import Bot, F
+from aiogram.enums import ParseMode
+from aiogram.filters.logic import and_f
+from aiogram.types import CallbackQuery, Message
 
-from bot.command_handler import COMMAND, CommandHandler
+from bot.command_handler import COMMAND
+from bot.pipeline import cmd, on
+from bot.reply import reply_text, reply_photo
 from bot.constants import CHAT_RANK_MESSAGES, GLOBAL_RANK_MESSAGES
 from bot.database import db
 from bot.keyboards.colored import btn_primary, btn_url, build_keyboard
@@ -56,19 +54,19 @@ def _bar(done: int, total: int, width: int = 10) -> tuple[str, int]:
     return "▰" * filled + "▱" * (width - filled), pct
 
 
-def _bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
+def _bot_username(bot: Bot, bot_data: dict) -> str:
     """Bot username for deep links (same lookup as bot/modules/help.py)."""
     try:
-        name = (context.bot_data or {}).get("username")
+        name = (bot_data or {}).get("username")
     except (AttributeError, TypeError):
         name = None
-    name = name or getattr(context.bot, "username", None)
+    name = name or getattr(bot, "username", None)
     return name or "PiModulerBot"
 
 
-def _see_rank_keyboard(context: ContextTypes.DEFAULT_TYPE):
+def _see_rank_keyboard(bot: Bot, bot_data: dict):
     """Colored 'See Your Rank' button — opens the bot DM and starts it."""
-    url = f"https://t.me/{_bot_username(context)}?start=rank"
+    url = f"https://t.me/{_bot_username(bot, bot_data)}?start=rank"
     return build_keyboard(
         [[btn_url("See Your Rank", url, icon_emoji_id=EID.CROWN, style="primary")]]
     )
@@ -123,16 +121,16 @@ def _progress_text(info: dict, is_group: bool) -> str:
 
 
 # ── Message tracker for XP ──────────────────────────────
-async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def track_message(message: Message):
     """Track messages for XP + streaks (DB work runs off the event loop).
 
     Message COUNTS and rank-up announcements belong to the counter in
     bot/modules/chatstats.py — this path only awards cosmetic XP.
     """
-    if not update.message or update.effective_chat.type == "private":
+    if not message or message.chat.type == "private":
         return
 
-    user = update.effective_user
+    user = message.from_user
     if not user or user.is_bot:
         return
 
@@ -140,7 +138,7 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if db.is_spam_blocked(user.id):
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     user_id = user.id
 
     # Cooldown: 30 seconds between XP gains
@@ -164,27 +162,27 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ── Command handlers ─────────────────────────────────────
-async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def rank_command(message: Message, bot: Bot, args: list, bot_data: dict):
     """Handle /rank — show user rank card using smash-style renderer."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.INFO} This command only works in groups.",
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.INFO} This command only works in groups.",
             parse_mode=ParseMode.HTML)
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
 
     # Get target user
-    if context.args and context.args[0].startswith("@"):
+    if args and args[0].startswith("@"):
         try:
-            member = await context.bot.get_chat_member(chat_id, context.args[0])
+            member = await bot.get_chat_member(chat_id, args[0])
             target_user = member.user
         except Exception:
-            await update.message.reply_text("User not found.")
+            await reply_text(message, "User not found.")
             return
-    elif update.message.reply_to_message:
-        target_user = update.message.reply_to_message.from_user
+    elif message.reply_to_message:
+        target_user = message.reply_to_message.from_user
     else:
-        target_user = update.effective_user
+        target_user = message.from_user
 
     user_id = target_user.id
 
@@ -215,12 +213,12 @@ async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         avatar_path = cached[1] or None
     else:
         try:
-            photos = await context.bot.get_user_profile_photos(user_id, limit=1)
+            photos = await bot.get_user_profile_photos(user_id, limit=1)
             if photos.photos:
-                f = await context.bot.get_file(photos.photos[0][-1].file_id)
+                f = await bot.get_file(photos.photos[0][-1].file_id)
                 os.makedirs(_AVATAR_DIR, exist_ok=True)
                 avatar_path = os.path.join(_AVATAR_DIR, f"{user_id}.jpg")
-                await f.download_to_drive(avatar_path)
+                await bot.download(f, avatar_path)
                 _avatars[user_id] = (now + _AVATAR_TTL, avatar_path)
             else:
                 # No photos — cache the negative so repeats are free too.
@@ -250,16 +248,16 @@ async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if result and os.path.exists(output_path):
             caption = _rank_caption(name)
             with open(output_path, "rb") as f:
-                await update.message.reply_photo(
+                await reply_photo(message, 
                     photo=f,
                     caption=caption,
                     parse_mode=ParseMode.HTML,
-                    reply_markup=_see_rank_keyboard(context),
+                    reply_markup=_see_rank_keyboard(bot, bot_data),
                 )
         else:
-            await update.message.reply_text("Error generating rank card.")
+            await reply_text(message, "Error generating rank card.")
     except Exception as e:
-        await update.message.reply_text(f"Error generating rank card: {e}")
+        await reply_text(message, f"Error generating rank card: {e}")
     finally:
         # Cleanup temp files — the avatar stays (it is the cache).
         keep = _avatars.get(user_id, (0.0, ""))[1]
@@ -271,15 +269,15 @@ async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
 
 
-async def ranktemplate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def ranktemplate_command(message: Message, args: list):
     """Handle /ranktemplate — pick rank card template (DM only)."""
-    if update.effective_chat.type != "private":
-        await update.message.reply_text(f"{E.INFO} Use this command in my DM for privacy.",
+    if message.chat.type != "private":
+        await reply_text(message, f"{E.INFO} Use this command in my DM for privacy.",
             parse_mode=ParseMode.HTML)
         return
 
-    if not context.args:
-        await update.message.reply_text(
+    if not args:
+        await reply_text(message, 
             f"{E.SETTINGS} <b>Rank Templates</b>\n\n"
             f"{get_theme_list()}\n\n"
             f"<b>Usage:</b> /ranktemplate &lt;number&gt;\n"
@@ -289,41 +287,41 @@ async def ranktemplate_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     try:
-        template = int(context.args[0])
+        template = int(args[0])
         if template not in THEMES:
-            await update.message.reply_text(f"{E.ERROR} Invalid template. Choose 1-6.",
+            await reply_text(message, f"{E.ERROR} Invalid template. Choose 1-6.",
             parse_mode=ParseMode.HTML)
             return
     except ValueError:
-        await update.message.reply_text(f"{E.ERROR} Please provide a number (1-6).",
+        await reply_text(message, f"{E.ERROR} Please provide a number (1-6).",
             parse_mode=ParseMode.HTML)
         return
 
-    db.set_template(update.effective_user.id, template)
+    db.set_template(message.from_user.id, template)
     theme_name = THEMES[template]["name"]
-    await update.message.reply_text(f"{E.CHECK} Template set to {theme_name}!",
+    await reply_text(message, f"{E.CHECK} Template set to {theme_name}!",
             parse_mode=ParseMode.HTML)
 
 
-async def nextlevel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def nextlevel_command(message: Message):
     """Handle /nextlevel — messages needed for the next chat/global rank."""
-    user_id = update.effective_user.id
-    is_group = update.effective_chat.type != "private"
+    user_id = message.from_user.id
+    is_group = message.chat.type != "private"
     info = await asyncio.to_thread(
         db.get_user_rank_info, user_id,
-        update.effective_chat.id if is_group else None,
+        message.chat.id if is_group else None,
     )
 
-    await update.message.reply_text(
+    await reply_text(message, 
         _progress_text(info, is_group),
         parse_mode=ParseMode.HTML,
         reply_markup=_nextlevel_keyboard(),
     )
 
 
-async def nextlevel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def nextlevel_callback(callback_query: CallbackQuery):
     """Handle the 'My Next Level' button — fresh progress card, new message."""
-    query = update.callback_query
+    query = callback_query
     if not query or not query.message or not query.from_user:
         return
     await query.answer()
@@ -334,21 +332,21 @@ async def nextlevel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         db.get_user_rank_info, query.from_user.id,
         chat.id if is_group else None,
     )
-    await query.message.reply_text(
+    await reply_text(query.message, 
         _progress_text(info, is_group),
         parse_mode=ParseMode.HTML,
         reply_markup=_nextlevel_keyboard(),
     )
 
 
-async def streak_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def streak_command(message: Message):
     """Handle /streak — show message streak."""
-    user_id = update.effective_user.id
+    user_id = message.from_user.id
     user_data = db.get_user_level(user_id)
     current = user_data.get("streak_current", 0)
     best = user_data.get("streak_best", 0)
 
-    await update.message.reply_text(
+    await reply_text(message, 
         f"{E.FIRE} Message Streak\n"
         f"├ Current: <b>{current}</b> days\n"
         f"└ Best: <b>{best}</b> days",
@@ -356,22 +354,22 @@ async def streak_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def leaderboard_command(message: Message):
     """Handle /leaderboard /lb — show chat leaderboard."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text("This command only works in groups.")
+    if message.chat.type == "private":
+        await reply_text(message, "This command only works in groups.")
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     lb = await asyncio.to_thread(db.get_leaderboard, chat_id, limit=10)
 
     if not lb:
-        await update.message.reply_text(f"{E.INFO} No leaderboard data yet. Start chatting!",
+        await reply_text(message, f"{E.INFO} No leaderboard data yet. Start chatting!",
             parse_mode=ParseMode.HTML)
         return
 
     medals = [E.MEDAL_1, E.MEDAL_2, E.MEDAL_3]
-    lines = [f"{E.STAR} <b>Leaderboard — {update.effective_chat.title}</b>\n"]
+    lines = [f"{E.STAR} <b>Leaderboard — {message.chat.title}</b>\n"]
 
     for i, entry in enumerate(lb):
         name = entry.get("first_name") or entry.get("username") or str(entry["user_id"])
@@ -381,20 +379,20 @@ async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"{entry['messages']:,} msgs"
         )
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    await reply_text(message, "\n".join(lines), parse_mode=ParseMode.HTML)
 
 
-async def daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def daily_command(message: Message):
     """Handle /daily — top chatters today."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text("This command only works in groups.")
+    if message.chat.type == "private":
+        await reply_text(message, "This command only works in groups.")
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     top = await asyncio.to_thread(db.get_daily_top, chat_id, limit=10)
 
     if not top:
-        await update.message.reply_text(f"{E.INFO} No messages today yet. Be the first!",
+        await reply_text(message, f"{E.INFO} No messages today yet. Be the first!",
             parse_mode=ParseMode.HTML)
         return
 
@@ -406,22 +404,22 @@ async def daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         medal = medals[i] if i < 3 else f"  {i+1}."
         lines.append(f"{medal} <b>{name}</b> — {entry['messages']:,} messages")
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    await reply_text(message, "\n".join(lines), parse_mode=ParseMode.HTML)
 
 
-async def weekly_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def weekly_command(message: Message):
     """Handle /weekly — top chatters this week (Monday IST, like /rankings)."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text("This command only works in groups.")
+    if message.chat.type == "private":
+        await reply_text(message, "This command only works in groups.")
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     top = await asyncio.to_thread(
         db.get_period_top, chat_id, since=ist_monday(), limit=10
     )
 
     if not top:
-        await update.message.reply_text(f"{E.INFO} No messages this week yet!",
+        await reply_text(message, f"{E.INFO} No messages this week yet!",
             parse_mode=ParseMode.HTML)
         return
 
@@ -433,22 +431,22 @@ async def weekly_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         medal = medals[i] if i < 3 else f"  {i+1}."
         lines.append(f"{medal} <b>{name}</b> — {entry.get('total_messages', 0):,} messages")
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    await reply_text(message, "\n".join(lines), parse_mode=ParseMode.HTML)
 
 
-async def monthly_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def monthly_command(message: Message):
     """Handle /monthly — top chatters this month (IST calendar month)."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text("This command only works in groups.")
+    if message.chat.type == "private":
+        await reply_text(message, "This command only works in groups.")
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     top = await asyncio.to_thread(
         db.get_period_top, chat_id, since=ist_month_start(), limit=10
     )
 
     if not top:
-        await update.message.reply_text(f"{E.INFO} No messages this month yet!",
+        await reply_text(message, f"{E.INFO} No messages this month yet!",
             parse_mode=ParseMode.HTML)
         return
 
@@ -460,30 +458,31 @@ async def monthly_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         medal = medals[i] if i < 3 else f"  {i+1}."
         lines.append(f"{medal} <b>{name}</b> — {entry.get('total_messages', 0):,} messages")
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    await reply_text(message, "\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 # ── Module setup ─────────────────────────────────────────
-def setup(app: Application) -> list:
+def setup() -> list:
     """Register leveling commands and message tracker."""
     # Commands
-    app.add_handler(CommandHandler("rank", rank_command))
-    app.add_handler(CommandHandler("ranktemplate", ranktemplate_command))
-    app.add_handler(CommandHandler("nextlevel", nextlevel_command))
-    app.add_handler(
-        CallbackQueryHandler(nextlevel_callback, pattern=r"^nextlevel:me$")
+    on("message", rank_command, flt=cmd("rank"))
+    on("message", ranktemplate_command, flt=cmd("ranktemplate"))
+    on("message", nextlevel_command, flt=cmd("nextlevel"))
+    on(
+        "callback_query", nextlevel_callback,
+        flt=F.data.regexp(re.compile(r"^nextlevel:me$")),
     )
-    app.add_handler(CommandHandler("streak", streak_command))
-    app.add_handler(CommandHandler("leaderboard", leaderboard_command))
-    app.add_handler(CommandHandler("lb", leaderboard_command))
-    app.add_handler(CommandHandler("daily", daily_command))
-    app.add_handler(CommandHandler("weekly", weekly_command))
-    app.add_handler(CommandHandler("monthly", monthly_command))
+    on("message", streak_command, flt=cmd("streak"))
+    on("message", leaderboard_command, flt=cmd("leaderboard"))
+    on("message", leaderboard_command, flt=cmd("lb"))
+    on("message", daily_command, flt=cmd("daily"))
+    on("message", weekly_command, flt=cmd("weekly"))
+    on("message", monthly_command, flt=cmd("monthly"))
 
     # Message tracker for XP (group 5 to avoid conflicts)
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~COMMAND, track_message),
-        group=5,
+    on(
+        "message", track_message, group=5,
+        flt=and_f(F.text, ~COMMAND),
     )
 
     return ["rank", "ranktemplate", "nextlevel", "streak", "leaderboard", "daily", "weekly", "monthly"]

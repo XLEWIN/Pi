@@ -16,18 +16,16 @@ from __future__ import annotations
 import asyncio
 from typing import List, Optional
 
-from telegram import Message
-from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
-
-# PTB 21.6 exposes RetryAfter (the flood-wait exception); older/newer
-# lines may expose FloodWait instead — bind whichever exists.
-try:  # pragma: no cover - depends on installed PTB version
-    from telegram.error import FloodWait as _FloodExc
-except ImportError:  # pragma: no cover
-    _FloodExc = RetryAfter
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+)
+from aiogram.types import Message
 
 from bot.emojis import E
 from bot.logger import logger
+from bot.reply import reply_text
 from bot.responses import action_card
 
 from . import batcher, config, database as tdb, member_registry, session as sess_mod
@@ -43,7 +41,7 @@ from .session import TagSession
 from .utils import fmt_duration, fmt_n, pct, progress_bar
 
 # Errors that are expected/soft in a mass-send loop.
-_SOFT_NET = (TimedOut, NetworkError)
+_SOFT_NET = (TelegramNetworkError,)
 
 
 def flood_seconds(exc) -> int:
@@ -165,7 +163,7 @@ async def _edit_status(
         if gap < config.PROGRESS_EDIT_MIN:
             return False
     try:
-        await s.status_message.edit_message_text(
+        await s.status_message.edit_text(
             text,
             parse_mode="HTML",
             reply_markup=keyboard,
@@ -173,7 +171,7 @@ async def _edit_status(
         s._last_edit = _time.monotonic()  # type: ignore[attr-defined]
         s.metrics.edits += 1
         return True
-    except BadRequest as e:
+    except TelegramBadRequest as e:
         if "not modified" in str(e).lower():
             return True  # the card already shows this text
         # Terminal (force) failures must be visible; progress-only
@@ -199,7 +197,7 @@ async def _finalize_status(s: TagSession, text: str) -> None:
     if await _edit_status(s, text, keyboard=None, force=True):
         return
     try:
-        await s.status_message.reply_text(text, parse_mode="HTML")
+        await reply_text(s.status_message, text, parse_mode="HTML")
         logger.warning(
             f"Tagging final-card edit failed — sent fallback reply "
             f"chat={s.chat_id}"
@@ -210,7 +208,7 @@ async def _finalize_status(s: TagSession, text: str) -> None:
 
 # ── Sending ───────────────────────────────────────────────────────
 
-async def _send_batch(context, s: TagSession, text: str) -> int:
+async def _send_batch(bot, s: TagSession, text: str) -> int:
     """Send one batch with flood/retry handling; returns mention count."""
     token = s.token
     attempts = 0
@@ -224,9 +222,9 @@ async def _send_batch(context, s: TagSession, text: str) -> int:
             )
             if s.thread_id:
                 kwargs["message_thread_id"] = s.thread_id
-            await context.bot.send_message(**kwargs)
+            await bot.send_message(**kwargs)
             return batcher.count_mentions(text)
-        except _FloodExc as e:
+        except TelegramRetryAfter as e:
             secs = flood_seconds(e)
             s.metrics.floodwaits += 1
             if secs > config.FLOOD_MAX:
@@ -243,7 +241,7 @@ async def _send_batch(context, s: TagSession, text: str) -> int:
             await token.sleep(1.0)
 
 
-async def _copy_source(context, s: TagSession) -> Optional[Message]:
+async def _copy_source(bot, s: TagSession) -> Optional[Message]:
     """copy_message of the replied source (no re-upload of media)."""
     try:
         kwargs = dict(
@@ -253,7 +251,7 @@ async def _copy_source(context, s: TagSession) -> Optional[Message]:
         )
         if s.thread_id:
             kwargs["message_thread_id"] = s.thread_id
-        return await context.bot.copy_message(**kwargs)
+        return await bot.copy_message(**kwargs)
     except Exception as e:
         logger.warning(f"Tagging source copy failed (continuing): {e}")
         return None
@@ -261,7 +259,7 @@ async def _copy_source(context, s: TagSession) -> Optional[Message]:
 
 # ── Main entry ────────────────────────────────────────────────────
 
-async def run(session: TagSession, context) -> None:
+async def run(session: TagSession, bot) -> None:
     """Execute one full tagging session (always terminal-states itself)."""
     s = session
     # Track last progress-edit time (attached dynamically; dataclass has
@@ -297,7 +295,7 @@ async def run(session: TagSession, context) -> None:
         s.total = len(candidates)
 
         # 2. Copy the source message first — the chat sees context instantly.
-        await _copy_source(context, s)
+        await _copy_source(bot, s)
 
         # 3. Mention batches.
         mentions = member_registry.mention_list(candidates)
@@ -308,7 +306,7 @@ async def run(session: TagSession, context) -> None:
 
         for text in batches:
             s.token.check()
-            n = await _send_batch(context, s, text)
+            n = await _send_batch(bot, s, text)
             s.tagged += n
             s.metrics.record_send(n)
             await _edit_status(s, progress_card(s), keyboard=progress_keyboard())

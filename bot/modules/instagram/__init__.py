@@ -1,7 +1,7 @@
 """Instagram media downloader — auto-detect links + manual commands.
 
 Auto-discovered by bot.loader as package `bot.modules.instagram`.
-setup(app) lives here so the top-level package exposes setup().
+setup() lives here so the top-level package exposes setup().
 
 Commands:
   /igdl <url> / /igsettings / /igstats / /igcache / /igbenchmark
@@ -10,10 +10,14 @@ Auto-detect: group 14 (text messages containing instagram.com URLs).
 
 from __future__ import annotations
 
-from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
+import re
 
-from bot.command_handler import COMMAND, CommandHandler
+from aiogram import F
+from aiogram.filters.logic import and_f
+
+from bot.command_handler import COMMAND, cmd
 from bot.logger import logger
+from bot.pipeline import on
 
 from .config import HANDLER_GROUP, ig_config
 from .downloader import sweep_stale
@@ -28,7 +32,7 @@ from .handlers import (
 )
 
 
-def setup(app: Application) -> list[str]:
+def setup() -> list[str]:
     """Register Instagram commands, callbacks, and auto-detect handler."""
     if not ig_config.enabled:
         logger.info("[IG] module disabled via IG_ENABLED=0")
@@ -41,27 +45,24 @@ def setup(app: Application) -> list[str]:
         logger.warning(f"[IG] temp sweep failed: {e}")
 
     # Commands — default group 0 (same as other CommandHandlers).
-    app.add_handler(CommandHandler("igdl", igdl_command))
-    app.add_handler(CommandHandler("igsettings", igsettings_command))
-    app.add_handler(CommandHandler("igstats", igstats_command))
-    app.add_handler(CommandHandler("igcache", igcache_command))
-    app.add_handler(CommandHandler("igbenchmark", igbenchmark_command))
+    on("message", igdl_command, flt=cmd("igdl"))
+    on("message", igsettings_command, flt=cmd("igsettings"))
+    on("message", igstats_command, flt=cmd("igstats"))
+    on("message", igcache_command, flt=cmd("igcache"))
+    on("message", igbenchmark_command, flt=cmd("igbenchmark"))
 
     # Settings callbacks.
-    app.add_handler(CallbackQueryHandler(ig_callback, pattern=r"^ig:"))
+    on("callback_query", ig_callback, flt=F.data.regexp(re.compile(r"^ig:")))
 
     # Auto-detect — dedicated high group so we never steal updates from
     # filters(1)/blocklist(2)/watchwords(3)/bind(4)/leveling(5)/…/analytics(13).
     # Narrow filter: only non-command text that contains an Instagram host.
-    ig_filter = (
-        filters.TEXT
-        & ~COMMAND
-        & filters.Regex(r"(?i)(instagram\.com|instagr\.am)/")
+    ig_filter = and_f(
+        F.text,
+        ~COMMAND,
+        F.text.regexp(re.compile(r"(?i)(instagram\.com|instagr\.am)/")),
     )
-    app.add_handler(
-        MessageHandler(ig_filter, auto_download_handler),
-        group=HANDLER_GROUP,
-    )
+    on("message", auto_download_handler, group=HANDLER_GROUP, flt=ig_filter)
 
     logger.info(f"[IG] registered (auto group={HANDLER_GROUP})")
     return [

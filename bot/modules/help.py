@@ -35,12 +35,13 @@ from __future__ import annotations
 import re
 from html import escape, unescape
 
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import Application, CallbackQueryHandler, ContextTypes
+from aiogram import Bot, F
+from aiogram.enums import ParseMode
+from aiogram.types import CallbackQuery, Message
 
-from bot.command_handler import CommandHandler
 from bot.constants import BOT_DESCRIPTION, HELP_MENU, START_TEXT
+from bot.pipeline import cmd, on
+from bot.reply import reply_text
 from bot.emojis import E, EID
 from bot.keyboards.colored import (
     btn_danger,
@@ -111,13 +112,13 @@ def _module(key: str) -> dict | None:
     return None
 
 
-def _bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
+def _bot_username(bot: Bot, bot_data: dict) -> str:
     name = None
     try:
-        name = (context.bot_data or {}).get("username")
+        name = (bot_data or {}).get("username")
     except (AttributeError, TypeError):
         pass
-    name = name or getattr(context.bot, "username", None)
+    name = name or getattr(bot, "username", None)
     return name or _FALLBACK_USERNAME
 
 
@@ -304,7 +305,7 @@ async def _send_text(target, text: str, markup, plain_markup) -> bool:
     last: Exception | None = None
     for body, kb in ((text, markup), (_strip_custom_emoji(text), plain_markup)):
         try:
-            await target.reply_text(
+            await reply_text(target, 
                 body, parse_mode=ParseMode.HTML, reply_markup=kb
             )
             return True
@@ -343,13 +344,13 @@ async def _safe_edit(query, text: str, markup, plain_markup) -> None:
     for body, kb in ((text, markup), (_strip_custom_emoji(text), plain_markup)):
         try:
             if is_photo:
-                await query.edit_message_caption(
+                await query.message.edit_caption(
                     caption=body,
                     parse_mode=ParseMode.HTML,
                     reply_markup=kb,
                 )
             else:
-                await query.edit_message_text(
+                await query.message.edit_text(
                     body, parse_mode=ParseMode.HTML, reply_markup=kb
                 )
             return
@@ -379,22 +380,21 @@ async def _close(query) -> None:
         await query.message.delete()
     except Exception:
         try:
-            await query.edit_message_reply_markup(reply_markup=None)
+            await query.message.edit_reply_markup(reply_markup=None)
         except Exception as e:
             logger.debug(f"help close failed: {e}")
 
 
 # ── Handlers ─────────────────────────────────────────────────────
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def help_command(message: Message, bot: Bot, bot_data: dict) -> None:
     """/help — DM: menu text message; groups: DM-redirect text message."""
-    message = update.effective_message or update.message
-    chat = update.effective_chat
+    chat = message.chat
     if message is None:
         return
 
     if chat is not None and chat.type != "private":
-        username = _bot_username(context)
+        username = _bot_username(bot, bot_data)
         text = (
             f"{E.INFO} Help Menu\n"
             f"├ {E.USER} Detail: Browse every command in the bot's DM\n"
@@ -411,11 +411,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await _send_menu(message)
 
 
-async def show_main_menu(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
+async def show_main_menu(callback_query: CallbackQuery) -> None:
     """Open the menu (start:help) — swaps out the clicked message."""
-    query = update.callback_query
+    query = callback_query
     await _answer(query)
     target = query.message
     if target is None:
@@ -427,9 +425,9 @@ async def show_main_menu(
             logger.debug(f"help start-swap delete failed: {e}")
 
 
-async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def help_callback(callback_query: CallbackQuery, bot: Bot, bot_data: dict) -> None:
     """Route help:* callbacks — pagination, drill-down, close, back."""
-    query = update.callback_query
+    query = callback_query
     if query is None:
         return
     data = query.data or ""
@@ -480,7 +478,7 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _answer(query)
         await _safe_edit(
             query,
-            _build_start_message(_bot_username(context)),
+            _build_start_message(_bot_username(bot, bot_data)),
             build_start_keyboard(),
             build_start_keyboard(icons=False),
         )
@@ -489,8 +487,8 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _answer(query, "Unknown option", alert=True)
 
 
-def setup(app: Application) -> list[str]:
+def setup() -> list[str]:
     """Register this module's handlers. Returns route descriptions for the log."""
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CallbackQueryHandler(help_callback, pattern=rf"^{_CB}:"))
+    on("message", help_command, flt=cmd("help"))
+    on("callback_query", help_callback, flt=F.data.regexp(re.compile(rf"^{_CB}:")))
     return ["/help", "help:* callbacks"]

@@ -14,21 +14,23 @@ Total Rules — rules live in ``moderation.rules_db`` (in-memory).
 from __future__ import annotations
 
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict
 
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import Application, CallbackQueryHandler, ContextTypes
+from aiogram import Bot, F
+from aiogram.enums import ParseMode
+from aiogram.types import CallbackQuery, Message
 
-from bot.command_handler import CommandHandler
 from bot.config import settings
 from bot.constants import BOT_START_TIME
 from bot.database import db
 from bot.emojis import E, EID
 from bot.keyboards.colored import btn_danger, btn_success, build_keyboard
 from bot.modules import moderation
+from bot.pipeline import cmd, on
+from bot.reply import reply_text
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +144,7 @@ async def _answer(query, text: str | None = None, *, alert: bool = False) -> Non
 
 async def _safe_edit(query, text: str, markup) -> None:
     try:
-        await query.edit_message_text(
+        await query.message.edit_text(
             text, parse_mode=ParseMode.HTML, reply_markup=markup
         )
     except Exception as e:
@@ -156,19 +158,20 @@ async def _safe_edit(query, text: str, markup) -> None:
 
 # ── /bstats ─────────────────────────────────────────────────────
 
-async def bstats_command(update: Update,
-                         context: ContextTypes.DEFAULT_TYPE) -> None:
+async def bstats_command(message: Message) -> None:
     """/bstats — owner-only database + uptime card."""
-    msg = update.effective_message
+    msg = message
     if msg is None:
         return
-    if not _is_owner(update.effective_user):
-        await msg.reply_text(
+    if not _is_owner(message.from_user):
+        await reply_text(
+            msg,
             f"{E.CROWN} Only the bot owner can use /bstats.",
             parse_mode=ParseMode.HTML,
         )
         return
-    await msg.reply_text(
+    await reply_text(
+        msg,
         bstats_text(_counts()),
         parse_mode=ParseMode.HTML,
         reply_markup=_bstats_kb(),
@@ -177,14 +180,14 @@ async def bstats_command(update: Update,
 
 # ── /ping ───────────────────────────────────────────────────────
 
-async def ping_command(update: Update,
-                       context: ContextTypes.DEFAULT_TYPE) -> None:
+async def ping_command(message: Message) -> None:
     """/ping — API latency measured around a real send (boa-style)."""
-    msg = update.effective_message
+    msg = message
     if msg is None:
         return
     start = time.perf_counter()
-    sent = await msg.reply_text(
+    sent = await reply_text(
+        msg,
         f"{E.FORWARD} Pinging...", parse_mode=ParseMode.HTML
     )
     elapsed_ms = (time.perf_counter() - start) * 1000
@@ -197,10 +200,10 @@ async def ping_command(update: Update,
 
 # ── Callbacks ───────────────────────────────────────────────────
 
-async def stats_callback(update: Update,
-                         context: ContextTypes.DEFAULT_TYPE) -> None:
+async def stats_callback(callback_query: CallbackQuery,
+                         bot: Bot) -> None:
     """Route bstats:* and ping:* callbacks (Refresh / Close / Again)."""
-    query = update.callback_query
+    query = callback_query
     if query is None:
         return
     data = str(query.data or "")
@@ -222,7 +225,7 @@ async def stats_callback(update: Update,
                 await query.message.delete()
             except Exception:
                 try:
-                    await query.edit_message_reply_markup(reply_markup=None)
+                    await query.message.edit_reply_markup(reply_markup=None)
                 except Exception as e:
                     logger.debug("bstats close failed: %s", e)
             return
@@ -236,7 +239,7 @@ async def stats_callback(update: Update,
             await _answer(query)
             start = time.perf_counter()
             try:
-                await context.bot.get_me()
+                await bot.get_me()
             except Exception as e:
                 logger.warning("ping re-measure failed: %s", e)
             elapsed_ms = (time.perf_counter() - start) * 1000
@@ -248,11 +251,12 @@ async def stats_callback(update: Update,
     await _answer(query, "Unknown option", alert=True)
 
 
-def setup(app: Application) -> list[str]:
+def setup() -> list[str]:
     """Register /bstats and /ping + their callbacks."""
-    app.add_handler(CommandHandler("bstats", bstats_command))
-    app.add_handler(CommandHandler("ping", ping_command))
-    app.add_handler(
-        CallbackQueryHandler(stats_callback, pattern=r"^(bstats|ping):")
+    on("message", bstats_command, flt=cmd("bstats"))
+    on("message", ping_command, flt=cmd("ping"))
+    on(
+        "callback_query", stats_callback,
+        flt=F.data.regexp(re.compile(r"^(bstats|ping):")),
     )
     return ["/bstats", "/ping"]

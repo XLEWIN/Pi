@@ -11,6 +11,8 @@ Environment isolation (BEFORE any bot import):
     * LOCALAPPDATA points at a temp dir so runtime files are isolated.
 
 No network: every Telegram call goes through fake bots/queries.
+Handlers are aiogram-era: ``await call(fn, event, bot=..., bot_data=...)``
+passes only the deps each signature declares.
 """
 
 from __future__ import annotations
@@ -37,6 +39,8 @@ os.environ["LOCALAPPDATA"] = _TEST_DIR
 atexit.register(shutil.rmtree, _TEST_DIR, ignore_errors=True)
 
 # ── Imports (after env) ───────────────────────────────────────────
+from aiofakes import FakeMessage, call, command_filters  # noqa: E402
+from bot import pipeline  # noqa: E402
 from bot.constants import HELP_MENU  # noqa: E402
 from bot.database import db  # noqa: E402
 from bot.modules import mychats as mm  # noqa: E402
@@ -108,18 +112,39 @@ class _Ctx:
         self.bot_data: dict = {}
 
 
-class _Msg:
-    def __init__(self, text: str = "/mychats") -> None:
-        self.text = text
+class _Msg(FakeMessage):
+    """Command message — records reply_text kwargs dicts (PTB-era shape)."""
+
+    def __init__(self, text: str = "/mychats", user_id=OWNER_ID) -> None:
+        super().__init__(text, chat_id=1, chat_type="private",
+                         user_id=user_id if user_id is not None else 0)
+        if user_id is None:
+            self.from_user = None
         self.replies: list = []
 
-    async def reply_text(self, text, **kw):
+    async def answer(self, text, **kw):
         self.replies.append({"text": text, **kw})
-        return self
+        return await super().answer(text, **kw)
+
+    async def reply(self, text, **kw):
+        self.replies.append({"text": text, **kw})
+        return await super().reply(text, **kw)
 
     @property
     def last(self):
         return self.replies[-1] if self.replies else None
+
+
+class _EditTarget(FakeMessage):
+    """The callback's message — records edit_text kwargs dicts."""
+
+    def __init__(self) -> None:
+        super().__init__(chat_id=1, chat_type="private")
+        self.edits: list = []
+
+    async def edit_text(self, text, **kw):
+        self.edits.append({"text": text, **kw})
+        return self
 
 
 class _Query:
@@ -129,32 +154,19 @@ class _Query:
             None if user_id is None
             else SimpleNamespace(id=user_id, username=None, first_name="T")
         )
-        self.message = None
+        self.message = _EditTarget()
         self.answers: list = []
-        self.edits: list = []
 
-    async def answer(self, text=None, show_alert=False):
+    async def answer(self, text=None, show_alert=False, **kw):
         self.answers.append({"text": text, "show_alert": show_alert})
 
-    async def edit_message_text(self, text, **kw):
-        self.edits.append({"text": text, **kw})
-        return True
+    @property
+    def edits(self):
+        return self.message.edits
 
     @property
     def last_edit(self):
         return self.edits[-1] if self.edits else None
-
-
-def _update(msg: _Msg, user_id=OWNER_ID):
-    user = None if user_id is None else SimpleNamespace(
-        id=user_id, username=None, first_name="T"
-    )
-    return SimpleNamespace(effective_message=msg, effective_user=user,
-                           message=msg)
-
-
-def _cb_update(data: str, user_id=OWNER_ID):
-    return SimpleNamespace(callback_query=_Query(data, user_id=user_id))
 
 
 @contextmanager
@@ -168,6 +180,10 @@ def _db(rows: list):
     with mock.patch.object(mm, "db",
                            SimpleNamespace(get_all_groups=lambda: rows)):
         yield
+
+
+def _style(btn):
+    return getattr(btn, "style", None)
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -271,11 +287,9 @@ class TestMenuKeyboard(unittest.TestCase):
         kb = mm._menu_keyboard(_chats(12), 1)
         for row in kb.inline_keyboard:
             for btn in row:
-                self.assertEqual(btn.api_kwargs.get("style"), "success")
+                self.assertEqual(_style(btn), "success")
         back = mm._back_keyboard(2)
-        self.assertEqual(
-            back.inline_keyboard[0][0].api_kwargs.get("style"), "success"
-        )
+        self.assertEqual(_style(back.inline_keyboard[0][0]), "success")
         self.assertEqual(back.inline_keyboard[0][0].callback_data,
                          "mychats:page:2")
 
@@ -295,7 +309,7 @@ class TestScanAdminChats(unittest.IsolatedAsyncioTestCase):
         }
         bot = _FakeBot(statuses=statuses)
         with _db(rows):
-            found = await mm._scan_admin_chats(_Ctx(bot))
+            found = await mm._scan_admin_chats(bot)
         self.assertEqual(
             [(c["chat_id"], c["title"]) for c in found],
             [(-100000, "Chat 0"), (-100002, "Chat 2")],
@@ -304,19 +318,19 @@ class TestScanAdminChats(unittest.IsolatedAsyncioTestCase):
     async def test_missing_title_becomes_unnamed(self):
         bot = _FakeBot(statuses={-100000: "administrator"})
         with _db([{"chat_id": -100000, "chat_title": None}]):
-            found = await mm._scan_admin_chats(_Ctx(bot))
+            found = await mm._scan_admin_chats(bot)
         self.assertEqual(found, [{"chat_id": -100000, "title": "Unnamed"}])
 
     async def test_row_without_chat_id_skipped(self):
         bot = _FakeBot(statuses={-100000: "administrator"})
         with _db([{"chat_title": "No id"}, {"chat_id": -100000,
                                             "chat_title": "Ok"}]):
-            found = await mm._scan_admin_chats(_Ctx(bot))
+            found = await mm._scan_admin_chats(bot)
         self.assertEqual([c["chat_id"] for c in found], [-100000])
 
     async def test_empty_db_returns_empty(self):
         with _db([]):
-            found = await mm._scan_admin_chats(_Ctx(_FakeBot()))
+            found = await mm._scan_admin_chats(_FakeBot())
         self.assertEqual(found, [])
         self.assertEqual(_FakeBot().calls, [])  # untouched fake sanity
 
@@ -324,8 +338,8 @@ class TestScanAdminChats(unittest.IsolatedAsyncioTestCase):
         bot = _FakeBot(statuses={-100000: "administrator"})
         ctx = _Ctx(bot)
         with _db(_rows(1)):
-            chats = await mm._fresh_chats(ctx)
-        self.assertEqual(mm._cached(ctx), chats)
+            chats = await mm._fresh_chats(bot, ctx.bot_data)
+        self.assertEqual(mm._cached(ctx.bot_data), chats)
         self.assertEqual(len(bot.calls), 1)
 
 
@@ -335,24 +349,24 @@ class TestScanAdminChats(unittest.IsolatedAsyncioTestCase):
 
 class TestOwnerGateCommand(unittest.IsolatedAsyncioTestCase):
     async def test_non_owner_denied_without_scan(self):
-        msg = _Msg()
+        msg = _Msg(user_id=99)
         bot = _FakeBot(statuses={})           # would raise on any call
         with _owner(), _db(_rows(3)):
-            await mm.mychats_command(_update(msg, user_id=99), _Ctx(bot))
+            await call(mm.mychats_command, msg, bot=bot, bot_data={})
         self.assertIn("Only the bot owner", msg.last["text"])
         self.assertIn("/mychats", msg.last["text"])
         self.assertEqual(bot.calls, [])
 
     async def test_missing_user_denied(self):
-        msg = _Msg()
+        msg = _Msg(user_id=None)
         with _owner(), _db([]):
-            await mm.mychats_command(_update(msg, user_id=None), _Ctx())
+            await call(mm.mychats_command, msg, bot=_FakeBot(), bot_data={})
         self.assertIn("Only the bot owner", msg.last["text"])
 
     async def test_unconfigured_owner_denies_everyone(self):
-        msg = _Msg()
+        msg = _Msg(user_id=0)
         with mock.patch.object(mm, "settings", SimpleNamespace(owner_id=0)):
-            await mm.mychats_command(_update(msg, user_id=0), _Ctx())
+            await call(mm.mychats_command, msg, bot=_FakeBot(), bot_data={})
         self.assertIn("Only the bot owner", msg.last["text"])
 
 
@@ -365,9 +379,7 @@ class TestOwnerGateCallback(unittest.IsolatedAsyncioTestCase):
         q = _Query("mychats:page:1", user_id=99)
         bot = _FakeBot()
         with _owner(), _db(_rows(6)):
-            await mm.mychats_callback(
-                SimpleNamespace(callback_query=q), _Ctx(bot)
-            )
+            await call(mm.mychats_callback, q, bot=bot, bot_data={})
         self.assertEqual(len(q.answers), 1)
         self.assertIn("Only the bot owner", q.answers[0]["text"])
         self.assertTrue(q.answers[0]["show_alert"])
@@ -377,26 +389,20 @@ class TestOwnerGateCallback(unittest.IsolatedAsyncioTestCase):
     async def test_unconfigured_owner_denies_everyone(self):
         q = _Query("mychats:noop", user_id=0)
         with mock.patch.object(mm, "settings", SimpleNamespace(owner_id=0)):
-            await mm.mychats_callback(
-                SimpleNamespace(callback_query=q), _Ctx()
-            )
+            await call(mm.mychats_callback, q, bot=_FakeBot(), bot_data={})
         self.assertTrue(q.answers[0]["show_alert"])
 
     async def test_unknown_action_is_flagged(self):
         q = _Query("mychats:bogus")
         with _owner():
-            await mm.mychats_callback(
-                SimpleNamespace(callback_query=q), _Ctx()
-            )
+            await call(mm.mychats_callback, q, bot=_FakeBot(), bot_data={})
         self.assertEqual(q.answers[-1]["text"], "Unknown option")
         self.assertTrue(q.answers[-1]["show_alert"])
 
     async def test_noop_answers_silently(self):
         q = _Query("mychats:noop")
         with _owner():
-            await mm.mychats_callback(
-                SimpleNamespace(callback_query=q), _Ctx()
-            )
+            await call(mm.mychats_callback, q, bot=_FakeBot(), bot_data={})
         self.assertEqual(q.answers, [{"text": None, "show_alert": False}])
         self.assertEqual(q.edits, [])
 
@@ -413,7 +419,7 @@ class TestCommandOwnerPath(unittest.IsolatedAsyncioTestCase):
             -100002: "creator",
         })
         with _owner(), _db(_rows(3)):
-            await mm.mychats_command(_update(msg), _Ctx(bot))
+            await call(mm.mychats_command, msg, bot=bot, bot_data={})
         self.assertEqual(len(msg.replies), 1)
         self.assertIn("Admin chats: 2", msg.last["text"])
         self.assertEqual(msg.last["parse_mode"], "HTML")
@@ -426,7 +432,7 @@ class TestCommandOwnerPath(unittest.IsolatedAsyncioTestCase):
         msg = _Msg()
         bot = _FakeBot(statuses={})            # everything raises
         with _owner(), _db(_rows(2)):
-            await mm.mychats_command(_update(msg), _Ctx(bot))
+            await call(mm.mychats_command, msg, bot=bot, bot_data={})
         self.assertIn("Admin chats: 0", msg.last["text"])
         self.assertIsNone(msg.last["reply_markup"])
 
@@ -440,9 +446,10 @@ class TestPageCallback(unittest.IsolatedAsyncioTestCase):
         q = _Query("mychats:page:1")
         ctx = _Ctx(_FakeBot())                # statuses empty → rescan
         chats = _chats(12)
-        mm._store_cache(ctx, chats)
+        mm._store_cache(ctx.bot_data, chats)
         with _owner():
-            await mm.mychats_callback(SimpleNamespace(callback_query=q), ctx)
+            await call(mm.mychats_callback, q, bot=ctx.bot,
+                       bot_data=ctx.bot_data)
         self.assertEqual(len(q.edits), 1)
         self.assertIn("Page: 2/3", q.edits[0]["text"])
         self.assertEqual(ctx.bot.calls, [])    # cache reused, no network
@@ -450,10 +457,9 @@ class TestPageCallback(unittest.IsolatedAsyncioTestCase):
     async def test_cold_cache_triggers_rescan(self):
         q = _Query("mychats:page:0")
         bot = _FakeBot(statuses={-100000: "administrator"})
+        bot_data: dict = {}
         with _owner(), _db(_rows(1)):
-            await mm.mychats_callback(
-                SimpleNamespace(callback_query=q), _Ctx(bot)
-            )
+            await call(mm.mychats_callback, q, bot=bot, bot_data=bot_data)
         self.assertEqual(len(q.edits), 1)
         self.assertEqual(len(bot.calls), 1)    # the fresh scan ran
 
@@ -462,16 +468,18 @@ class TestPageCallback(unittest.IsolatedAsyncioTestCase):
         ctx = _Ctx(_FakeBot(statuses={-100000: "administrator"}))
         ctx.bot_data[mm._CACHE_KEY] = {"at": 0.0, "chats": _chats(99)}
         with _owner(), _db(_rows(1)):
-            await mm.mychats_callback(SimpleNamespace(callback_query=q), ctx)
+            await call(mm.mychats_callback, q, bot=ctx.bot,
+                       bot_data=ctx.bot_data)
         self.assertEqual(len(ctx.bot.calls), 1)
         self.assertIn("Admin chats: 1", q.edits[0]["text"])
 
     async def test_page_out_of_range_clamps(self):
         q = _Query("mychats:page:99")
         ctx = _Ctx(_FakeBot())
-        mm._store_cache(ctx, _chats(6))        # 2 pages
+        mm._store_cache(ctx.bot_data, _chats(6))        # 2 pages
         with _owner():
-            await mm.mychats_callback(SimpleNamespace(callback_query=q), ctx)
+            await call(mm.mychats_callback, q, bot=ctx.bot,
+                       bot_data=ctx.bot_data)
         self.assertIn("Page: 2/2", q.edits[0]["text"])
 
 
@@ -491,9 +499,10 @@ class TestInfoCallback(unittest.IsolatedAsyncioTestCase):
         bot = _FakeBot(statuses={CID: "administrator"}, count=1234,
                        chat=chat)
         q, ctx = self._run(bot=bot)
-        mm._store_cache(ctx, [{"chat_id": CID, "title": "Fairy"}])
+        mm._store_cache(ctx.bot_data, [{"chat_id": CID, "title": "Fairy"}])
         with _owner():
-            await mm.mychats_callback(SimpleNamespace(callback_query=q), ctx)
+            await call(mm.mychats_callback, q, bot=ctx.bot,
+                       bot_data=ctx.bot_data)
         expected = (
             "ᴄʜᴀᴛ ɴᴀᴍᴇ : Fairy sakti degi mukti\n"
             "ᴄʜᴀᴛ ɪᴅ : -1004331827383\n"
@@ -513,9 +522,10 @@ class TestInfoCallback(unittest.IsolatedAsyncioTestCase):
         bot = _FakeBot(statuses={CID: "administrator"}, chat=chat,
                        can_invite=False)
         q, ctx = self._run(bot=bot)
-        mm._store_cache(ctx, [{"chat_id": CID, "title": "Pub"}])
+        mm._store_cache(ctx.bot_data, [{"chat_id": CID, "title": "Pub"}])
         with _owner():
-            await mm.mychats_callback(SimpleNamespace(callback_query=q), ctx)
+            await call(mm.mychats_callback, q, bot=ctx.bot,
+                       bot_data=ctx.bot_data)
         self.assertIn("ᴄʜᴀᴛ ʟɪɴᴋ : https://t.me/pubchat",
                       q.last_edit["text"])
         kinds = [c[0] for c in bot.calls]
@@ -527,9 +537,10 @@ class TestInfoCallback(unittest.IsolatedAsyncioTestCase):
         bot = _FakeBot(statuses={CID: "administrator"}, chat=chat,
                        can_invite=False)
         q, ctx = self._run(bot=bot)
-        mm._store_cache(ctx, [{"chat_id": CID, "title": "Priv"}])
+        mm._store_cache(ctx.bot_data, [{"chat_id": CID, "title": "Priv"}])
         with _owner():
-            await mm.mychats_callback(SimpleNamespace(callback_query=q), ctx)
+            await call(mm.mychats_callback, q, bot=ctx.bot,
+                       bot_data=ctx.bot_data)
         self.assertIn("ᴄʜᴀᴛ ʟɪɴᴋ : https://t.me/c/4331827383",
                       q.last_edit["text"])
 
@@ -540,9 +551,10 @@ class TestInfoCallback(unittest.IsolatedAsyncioTestCase):
         bot = _FakeBot(statuses={CID: "creator"}, chat=chat,
                        can_invite=False)
         q, ctx = self._run(bot=bot)
-        mm._store_cache(ctx, [{"chat_id": CID, "title": "Crew"}])
+        mm._store_cache(ctx.bot_data, [{"chat_id": CID, "title": "Crew"}])
         with _owner():
-            await mm.mychats_callback(SimpleNamespace(callback_query=q), ctx)
+            await call(mm.mychats_callback, q, bot=ctx.bot,
+                       bot_data=ctx.bot_data)
         self.assertIn("https://t.me/+INVITEHASH", q.last_edit["text"])
 
     async def test_member_count_failure_shows_unknown(self):
@@ -551,17 +563,19 @@ class TestInfoCallback(unittest.IsolatedAsyncioTestCase):
         bot = _FakeBot(statuses={CID: "administrator"}, chat=chat,
                        count_error=True)
         q, ctx = self._run(bot=bot)
-        mm._store_cache(ctx, [{"chat_id": CID, "title": "X"}])
+        mm._store_cache(ctx.bot_data, [{"chat_id": CID, "title": "X"}])
         with _owner():
-            await mm.mychats_callback(SimpleNamespace(callback_query=q), ctx)
+            await call(mm.mychats_callback, q, bot=ctx.bot,
+                       bot_data=ctx.bot_data)
         self.assertIn("ɢʀᴏᴜᴘ ᴍᴇᴍʙᴇʀs : Unknown", q.last_edit["text"])
 
     async def test_chat_load_failure_shows_error_card_with_back(self):
         bot = _FakeBot(chat_error=True)
         q, ctx = self._run(bot=bot)
-        mm._store_cache(ctx, [{"chat_id": CID, "title": "X"}])
+        mm._store_cache(ctx.bot_data, [{"chat_id": CID, "title": "X"}])
         with _owner():
-            await mm.mychats_callback(SimpleNamespace(callback_query=q), ctx)
+            await call(mm.mychats_callback, q, bot=ctx.bot,
+                       bot_data=ctx.bot_data)
         self.assertIn("Could not load this chat", q.last_edit["text"])
         self.assertEqual(
             q.last_edit["reply_markup"].inline_keyboard[0][0].callback_data,
@@ -573,21 +587,23 @@ class TestInfoCallback(unittest.IsolatedAsyncioTestCase):
                                first_name=None)
         bot = _FakeBot(statuses={CID: "administrator"}, chat=chat)
         q, ctx = self._run(page=2, bot=bot)
-        mm._store_cache(ctx, _chats(12))       # 3 pages → page 2 valid
+        mm._store_cache(ctx.bot_data, _chats(12))       # 3 pages → page 2 valid
         with _owner():
-            await mm.mychats_callback(SimpleNamespace(callback_query=q), ctx)
+            await call(mm.mychats_callback, q, bot=ctx.bot,
+                       bot_data=ctx.bot_data)
         back = q.last_edit["reply_markup"].inline_keyboard[0][0]
         self.assertEqual(back.callback_data, "mychats:page:2")
-        self.assertEqual(back.api_kwargs.get("style"), "success")
+        self.assertEqual(_style(back), "success")
 
     async def test_title_is_html_escaped(self):
         chat = SimpleNamespace(id=CID, title="<b>&evil</b>", username=None,
                                first_name=None)
         bot = _FakeBot(statuses={CID: "administrator"}, chat=chat)
         q, ctx = self._run(bot=bot)
-        mm._store_cache(ctx, [{"chat_id": CID, "title": "X"}])
+        mm._store_cache(ctx.bot_data, [{"chat_id": CID, "title": "X"}])
         with _owner():
-            await mm.mychats_callback(SimpleNamespace(callback_query=q), ctx)
+            await call(mm.mychats_callback, q, bot=ctx.bot,
+                       bot_data=ctx.bot_data)
         self.assertIn("ᴄʜᴀᴛ ɴᴀᴍᴇ : &lt;b&gt;&amp;evil&lt;/b&gt;",
                       q.last_edit["text"])
         self.assertNotIn("<b>", q.last_edit["text"])
@@ -623,27 +639,23 @@ class TestGetAllGroups(unittest.TestCase):
 
 class TestWiring(unittest.TestCase):
     def test_setup_registers_command_and_callback(self):
-        from telegram.ext import (CallbackQueryHandler,
-                                  CommandHandler as PTBCommandHandler)
-
-        class _App:
-            def __init__(self):
-                self.handlers = []
-
-            def add_handler(self, handler, group=0):
-                self.handlers.append(handler)
-
-        app = _App()
-        routes = mm.setup(app)
+        pipeline.clear()
+        routes = mm.setup()
         self.assertEqual(routes, ["/mychats"])
-        cmds = [h for h in app.handlers
-                if isinstance(h, PTBCommandHandler)]
-        cbs = [h for h in app.handlers
-               if isinstance(h, CallbackQueryHandler)]
+        entries = pipeline.snapshot()
+        self.assertEqual(len(entries), 2)
+        cmds = [e for e in entries if e.event == "message"]
+        cbs = [e for e in entries if e.event == "callback_query"]
         self.assertEqual(len(cmds), 1)
-        self.assertEqual(sorted(cmds[0].commands), ["mychats"])
+        cf = command_filters(cmds[0].flt)
+        self.assertEqual(len(cf), 1)
+        self.assertEqual(sorted(cf[0].commands), ["mychats"])
         self.assertEqual(len(cbs), 1)
-        self.assertEqual(cbs[0].pattern.pattern, "^mychats:")
+        # ^mychats: — matches the action prefix, nothing else
+        flt = cbs[0].flt
+        self.assertTrue(flt.resolve(SimpleNamespace(data="mychats:page:1")))
+        self.assertFalse(flt.resolve(SimpleNamespace(data="mychats")))
+        self.assertFalse(flt.resolve(SimpleNamespace(data="xmychats:1")))
 
     def test_help_documents_mychats(self):
         general = next(m for m in HELP_MENU if m["key"] == "general")

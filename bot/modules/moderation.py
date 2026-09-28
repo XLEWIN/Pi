@@ -10,12 +10,13 @@ from typing import Optional, Dict, Any
 from enum import Enum
 from html import escape
 
-from telegram import Update, ChatMember, ChatPermissions, User
-from telegram.ext import Application, ContextTypes
-from telegram.constants import ParseMode
+from aiogram import Bot
+from aiogram.enums import ChatMemberStatus, ParseMode
+from aiogram.types import ChatPermissions, Message, User
 
-from bot.command_handler import CommandHandler
 from bot.emojis import E
+from bot.pipeline import cmd, on
+from bot.reply import reply_text
 from bot.responses import (
     action_card,
     field_by,
@@ -103,7 +104,7 @@ def get_user_display(user: User) -> str:
 
 
 async def get_target_user(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+    message: Message, bot: Bot, args: list
 ) -> Optional[User]:
     """
     Extract target user from:
@@ -112,7 +113,6 @@ async def get_target_user(
     3. User ID
     4. Text mention entity
     """
-    message = update.message
     if not message:
         return None
 
@@ -127,14 +127,14 @@ async def get_target_user(
                 return entity.user
 
     # Method 3: Parse from command arguments
-    if context.args and len(context.args) > 0:
-        target = context.args[0]
+    if args and len(args) > 0:
+        target = args[0]
 
         # Try as @username
         if target.startswith("@"):
             try:
-                member = await context.bot.get_chat_member(
-                    update.effective_chat.id, target
+                member = await bot.get_chat_member(
+                    message.chat.id, target
                 )
                 if member and member.user:
                     return member.user
@@ -145,8 +145,8 @@ async def get_target_user(
         # Try as numeric user ID
         try:
             user_id = int(target)
-            member = await context.bot.get_chat_member(
-                update.effective_chat.id, user_id
+            member = await bot.get_chat_member(
+                message.chat.id, user_id
             )
             if member and member.user:
                 return member.user
@@ -160,7 +160,7 @@ async def get_target_user(
 DEFAULT_REASON = "No reason provided"
 
 
-def action_args(update: Update, context: ContextTypes.DEFAULT_TYPE) -> list[str]:
+def action_args(message: Message, args: list) -> list[str]:
     """Command args remaining after the target — the (duration/)reason tokens.
 
     Mirrors :func:`get_target_user`'s resolution order so the target
@@ -172,10 +172,9 @@ def action_args(update: Update, context: ContextTypes.DEFAULT_TYPE) -> list[str]
        text (entity offsets are UTF-16 code units).
     3. @username / numeric-ID target at ``args[0]`` → drop it.
     """
-    args = list(context.args or [])
+    args = list(args or [])
     if not args:
         return []
-    message = update.message
     if (
         message is not None
         and message.reply_to_message
@@ -217,32 +216,32 @@ def parse_duration_reason(
 
 
 async def is_admin(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int = None
+    message: Message, bot: Bot, user_id: int = None
 ) -> bool:
     """Check if a user is an admin in the chat."""
     if user_id is None:
-        if update.effective_user:
-            user_id = update.effective_user.id
+        if message.from_user:
+            user_id = message.from_user.id
         else:
             return False
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
 
     try:
-        member = await context.bot.get_chat_member(chat_id, user_id)
-        return member.status in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]
     except Exception as e:
         logger.warning(f"Error checking admin status: {e}")
         return False
 
 
-async def is_bot_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+async def is_bot_admin(message: Message, bot: Bot) -> bool:
     """Check if the bot is an admin in the chat."""
     try:
-        bot_member = await context.bot.get_chat_member(
-            update.effective_chat.id, context.bot.id
+        bot_member = await bot.get_chat_member(
+            message.chat.id, bot.id
         )
-        return bot_member.status in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]
+        return bot_member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]
     except Exception as e:
         logger.warning(f"Error checking bot admin status: {e}")
         return False
@@ -304,21 +303,21 @@ async def reset_all_warnings(chat_id: int) -> int:
 
 
 async def execute_action(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    message: Message,
+    bot: Bot,
     user_id: int,
     action: WarningAction,
     duration: Optional[timedelta] = None,
     reason: str = "",
 ):
     """Execute moderation action on a user. Returns (ok: bool, detail: str)."""
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
 
     try:
         if action == WarningAction.MUTE:
             until_date = datetime.now() + duration if duration else None
             permissions = ChatPermissions(can_send_messages=False)
-            await context.bot.restrict_chat_member(
+            await bot.restrict_chat_member(
                 chat_id, user_id, permissions, until_date=until_date
             )
             if duration:
@@ -326,13 +325,13 @@ async def execute_action(
             return True, "Muted permanently."
 
         elif action == WarningAction.KICK:
-            await context.bot.ban_chat_member(chat_id, user_id)
-            await context.bot.unban_chat_member(chat_id, user_id)
+            await bot.ban_chat_member(chat_id, user_id)
+            await bot.unban_chat_member(chat_id, user_id)
             return True, "Kicked from the group."
 
         elif action == WarningAction.BAN:
             until_date = datetime.now() + duration if duration else None
-            await context.bot.ban_chat_member(chat_id, user_id, until_date=until_date)
+            await bot.ban_chat_member(chat_id, user_id, until_date=until_date)
             if duration:
                 return True, f"Banned for {duration}."
             return True, "Banned permanently."
@@ -342,7 +341,7 @@ async def execute_action(
                 duration = timedelta(hours=1)
             until_date = datetime.now() + duration
             permissions = ChatPermissions(can_send_messages=False)
-            await context.bot.restrict_chat_member(
+            await bot.restrict_chat_member(
                 chat_id, user_id, permissions, until_date=until_date
             )
             return True, f"Timed out for {duration}."
@@ -436,33 +435,33 @@ def warn_card(
 # ============================================
 
 
-async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def mute_command(message: Message, bot: Bot, args: list):
     """Handle /mute command."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.",
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command can only be used in groups.",
             parse_mode=ParseMode.HTML)
         return
 
-    if not await is_admin(update, context):
-        await update.message.reply_text(
+    if not await is_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} You don't have permission to mute users.\n"
             "Required permission: <b>Can Restrict Members</b>",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    if not await is_bot_admin(update, context):
-        await update.message.reply_text(
+    if not await is_bot_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} I don't have permission to mute users.\n"
             "Please make sure I have the <b>Can Restrict Members</b> permission.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    target_user = await get_target_user(update, context)
+    target_user = await get_target_user(message, bot, args)
 
     if not target_user:
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.ERROR} Please specify a user to mute.\n\n"
             "<b>Usage:</b>\n"
             "• /mute @user [period] [reason]\n"
@@ -471,51 +470,51 @@ async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if target_user.id == update.effective_user.id:
-        await update.message.reply_text(f"{E.ERROR} You cannot mute yourself.",
+    if target_user.id == message.from_user.id:
+        await reply_text(message, f"{E.ERROR} You cannot mute yourself.",
             parse_mode=ParseMode.HTML)
         return
 
-    if target_user.id == context.bot.id:
-        await update.message.reply_text(f"{E.ERROR} I cannot mute myself.",
+    if target_user.id == bot.id:
+        await reply_text(message, f"{E.ERROR} I cannot mute myself.",
             parse_mode=ParseMode.HTML)
         return
 
-    duration, reason = parse_duration_reason(action_args(update, context))
+    duration, reason = parse_duration_reason(action_args(message, args))
 
     ok, detail = await execute_action(
-        update, context, target_user.id, WarningAction.MUTE, duration, reason
+        message, bot, target_user.id, WarningAction.MUTE, duration, reason
     )
     if ok:
         try:
             from bot.database import db as _pdb
-            chat_id = update.effective_chat.id
+            chat_id = message.chat.id
             _pdb.bump_mod_actions(chat_id, 1)
             _pdb.record_reputation_event(target_user.id, "restriction", 1)
         except Exception:
             pass
-    reply_text = moderation_card(
-        WarningAction.MUTE, target_user, update.effective_user, reason,
+    card_text = moderation_card(
+        WarningAction.MUTE, target_user, message.from_user, reason,
         duration=duration, ok=ok, detail=detail,
     )
-    await reply_card(update.message, reply_text, user=target_user)
+    await reply_card(message, card_text, user=target_user)
 
 
-async def dmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def dmute_command(message: Message, bot: Bot, args: list):
     """Handle /dmute command - mute and delete message."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.")
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command can only be used in groups.")
         return
 
-    if not await is_admin(update, context):
-        await update.message.reply_text(
+    if not await is_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} You don't have permission to mute users.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    if not await is_bot_admin(update, context):
-        await update.message.reply_text(
+    if not await is_bot_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} I don't have permission to mute users.",
             parse_mode=ParseMode.HTML,
         )
@@ -524,18 +523,18 @@ async def dmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_user = None
     message_deleted = False
 
-    if update.message.reply_to_message:
-        target_user = update.message.reply_to_message.from_user
+    if message.reply_to_message:
+        target_user = message.reply_to_message.from_user
         try:
-            await update.message.reply_to_message.delete()
+            await message.reply_to_message.delete()
             message_deleted = True
         except Exception:
             pass
     else:
-        target_user = await get_target_user(update, context)
+        target_user = await get_target_user(message, bot, args)
 
     if not target_user:
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.ERROR} Please reply to a message or specify a user.\n\n"
             "<b>Usage:</b>\n"
             "• Reply to a message with /dmute [period] [reason]\n"
@@ -544,84 +543,84 @@ async def dmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if target_user.id == update.effective_user.id:
-        await update.message.reply_text(f"{E.ERROR} You cannot mute yourself.")
+    if target_user.id == message.from_user.id:
+        await reply_text(message, f"{E.ERROR} You cannot mute yourself.")
         return
 
-    if target_user.id == context.bot.id:
-        await update.message.reply_text(f"{E.ERROR} I cannot mute myself.")
+    if target_user.id == bot.id:
+        await reply_text(message, f"{E.ERROR} I cannot mute myself.")
         return
 
-    duration, reason = parse_duration_reason(action_args(update, context))
+    duration, reason = parse_duration_reason(action_args(message, args))
 
     ok, detail = await execute_action(
-        update, context, target_user.id, WarningAction.MUTE, duration, reason
+        message, bot, target_user.id, WarningAction.MUTE, duration, reason
     )
     extras = []
     if message_deleted:
         extras.append(field_extra(E.CROSS, "Message", "Deleted"))
-    reply_text = moderation_card(
-        WarningAction.MUTE, target_user, update.effective_user, reason,
+    card_text = moderation_card(
+        WarningAction.MUTE, target_user, message.from_user, reason,
         duration=duration, extra_fields=extras, ok=ok, detail=detail,
     )
-    await reply_card(update.message, reply_text, user=target_user)
+    await reply_card(message, card_text, user=target_user)
 
 
-async def smute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def smute_command(message: Message, bot: Bot, args: list):
     """Handle /smute command - silent mute."""
-    if update.effective_chat.type == "private":
+    if message.chat.type == "private":
         return
 
-    if not await is_admin(update, context):
+    if not await is_admin(message, bot):
         return
 
-    if not await is_bot_admin(update, context):
+    if not await is_bot_admin(message, bot):
         return
 
-    target_user = await get_target_user(update, context)
+    target_user = await get_target_user(message, bot, args)
 
-    if not target_user or target_user.id == update.effective_user.id:
+    if not target_user or target_user.id == message.from_user.id:
         return
 
-    if target_user.id == context.bot.id:
+    if target_user.id == bot.id:
         return
 
-    duration, reason = parse_duration_reason(action_args(update, context))
+    duration, reason = parse_duration_reason(action_args(message, args))
 
     await execute_action(
-        update, context, target_user.id, WarningAction.MUTE, duration, reason
+        message, bot, target_user.id, WarningAction.MUTE, duration, reason
     )
 
     try:
-        await update.message.delete()
+        await message.delete()
     except Exception:
         pass
 
 
-async def tmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def tmute_command(message: Message, bot: Bot, args: list):
     """Handle /tmute command - temporary mute."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.")
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command can only be used in groups.")
         return
 
-    if not await is_admin(update, context):
-        await update.message.reply_text(
+    if not await is_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} You don't have permission to mute users.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    if not await is_bot_admin(update, context):
-        await update.message.reply_text(
+    if not await is_bot_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} I don't have permission to mute users.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    target_user = await get_target_user(update, context)
+    target_user = await get_target_user(message, bot, args)
 
     if not target_user:
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.ERROR} Please specify a user to mute.\n\n"
             "<b>Usage:</b> /tmute @user &lt;period&gt; [reason]\n"
             "<b>Example:</b> /tmute @user 1h Spamming",
@@ -629,25 +628,25 @@ async def tmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if target_user.id == update.effective_user.id:
-        await update.message.reply_text(f"{E.ERROR} You cannot mute yourself.")
+    if target_user.id == message.from_user.id:
+        await reply_text(message, f"{E.ERROR} You cannot mute yourself.")
         return
 
-    if target_user.id == context.bot.id:
-        await update.message.reply_text(f"{E.ERROR} I cannot mute myself.")
+    if target_user.id == bot.id:
+        await reply_text(message, f"{E.ERROR} I cannot mute myself.")
         return
 
-    remaining = action_args(update, context)
+    remaining = action_args(message, args)
     duration, reason = parse_duration_reason(remaining)
 
     if not duration and remaining:
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.ERROR} Invalid duration format. Use: 30s, 5m, 1h, 2d, or 1w"
         )
         return
 
     if not duration:
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.ERROR} Duration is required for temporary mute.\n\n"
             "<b>Usage:</b> /tmute @user &lt;period&gt; [reason]\n"
             "<b>Example:</b> /tmute @user 1h Spamming",
@@ -656,42 +655,42 @@ async def tmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     ok, detail = await execute_action(
-        update, context, target_user.id, WarningAction.MUTE, duration, reason
+        message, bot, target_user.id, WarningAction.MUTE, duration, reason
     )
     unmute_time = datetime.now() + duration
-    reply_text = moderation_card(
-        WarningAction.MUTE, target_user, update.effective_user, reason,
+    card_text = moderation_card(
+        WarningAction.MUTE, target_user, message.from_user, reason,
         duration=duration,
         extra_fields=[field_extra(E.TIME, "Auto-unmute", unmute_time.strftime("%Y-%m-%d %H:%M:%S"))],
         ok=ok, detail=detail,
     )
-    await reply_card(update.message, reply_text, user=target_user)
+    await reply_card(message, card_text, user=target_user)
 
 
-async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def unmute_command(message: Message, bot: Bot, args: list):
     """Handle /unmute command."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.")
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command can only be used in groups.")
         return
 
-    if not await is_admin(update, context):
-        await update.message.reply_text(
+    if not await is_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} You don't have permission to unmute users.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    if not await is_bot_admin(update, context):
-        await update.message.reply_text(
+    if not await is_bot_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} I don't have permission to unmute users.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    target_user = await get_target_user(update, context)
+    target_user = await get_target_user(message, bot, args)
 
     if not target_user:
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.ERROR} Please specify a user to unmute.\n\n"
             "<b>Usage:</b> /unmute @username or user ID",
             parse_mode=ParseMode.HTML,
@@ -715,23 +714,23 @@ async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             can_pin_messages=True,
             can_manage_topics=True,
         )
-        await context.bot.restrict_chat_member(
-            update.effective_chat.id, target_user.id, permissions
+        await bot.restrict_chat_member(
+            message.chat.id, target_user.id, permissions
         )
         await reply_card(
-            update.message,
+            message,
             action_card(
                 "Unmute Successful",
                 [
                     field_user(target_user),
-                    field_by(update.effective_user, "Unmuted By"),
+                    field_by(message.from_user, "Unmuted By"),
                 ],
                 icon=E.MUTE,
             ),
             user=target_user,
         )
     except Exception as e:
-        await update.message.reply_text(plain_error(f"Failed to unmute user: {str(e)}"))
+        await reply_text(message, plain_error(f"Failed to unmute user: {str(e)}"))
 
 
 # ============================================
@@ -739,32 +738,32 @@ async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================
 
 
-async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def ban_command(message: Message, bot: Bot, args: list):
     """Handle /ban command."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.")
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command can only be used in groups.")
         return
 
-    if not await is_admin(update, context):
-        await update.message.reply_text(
+    if not await is_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} You don't have permission to ban users.\n"
             "Required permission: <b>Can Ban Members</b>",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    if not await is_bot_admin(update, context):
-        await update.message.reply_text(
+    if not await is_bot_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} I don't have permission to ban users.\n"
             "Please make sure I have the <b>Can Ban Members</b> permission.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    target_user = await get_target_user(update, context)
+    target_user = await get_target_user(message, bot, args)
 
     if not target_user:
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.ERROR} Please specify a user to ban.\n\n"
             "<b>Usage:</b>\n"
             "• /ban @user [period] [reason]\n"
@@ -773,65 +772,65 @@ async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if target_user.id == update.effective_user.id:
-        await update.message.reply_text(f"{E.ERROR} You cannot ban yourself.")
+    if target_user.id == message.from_user.id:
+        await reply_text(message, f"{E.ERROR} You cannot ban yourself.")
         return
 
-    if target_user.id == context.bot.id:
-        await update.message.reply_text(f"{E.ERROR} I cannot ban myself.")
+    if target_user.id == bot.id:
+        await reply_text(message, f"{E.ERROR} I cannot ban myself.")
         return
 
     try:
-        target_member = await context.bot.get_chat_member(
-            update.effective_chat.id, target_user.id
+        target_member = await bot.get_chat_member(
+            message.chat.id, target_user.id
         )
-        if target_member.status in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]:
-            sender_member = await context.bot.get_chat_member(
-                update.effective_chat.id, update.effective_user.id
+        if target_member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]:
+            sender_member = await bot.get_chat_member(
+                message.chat.id, message.from_user.id
             )
-            if sender_member.status != ChatMember.OWNER:
-                await update.message.reply_text(
+            if sender_member.status != ChatMemberStatus.CREATOR:
+                await reply_text(message, 
                     f"{E.ERROR} You cannot ban a user with equal or higher permissions."
                 )
                 return
     except Exception:
         pass
 
-    duration, reason = parse_duration_reason(action_args(update, context))
+    duration, reason = parse_duration_reason(action_args(message, args))
 
     ok, detail = await execute_action(
-        update, context, target_user.id, WarningAction.BAN, duration, reason
+        message, bot, target_user.id, WarningAction.BAN, duration, reason
     )
     if ok:
         try:
             from bot.database import db as _pdb
-            chat_id = update.effective_chat.id
+            chat_id = message.chat.id
             _pdb.bump_mod_actions(chat_id, 1)
             _pdb.record_reputation_event(target_user.id, "restriction", 1)
         except Exception:
             pass
-    reply_text = moderation_card(
-        WarningAction.BAN, target_user, update.effective_user, reason,
+    card_text = moderation_card(
+        WarningAction.BAN, target_user, message.from_user, reason,
         duration=duration, ok=ok, detail=detail,
     )
-    await reply_card(update.message, reply_text, user=target_user)
+    await reply_card(message, card_text, user=target_user)
 
 
-async def dban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def dban_command(message: Message, bot: Bot, args: list):
     """Handle /dban command - ban and delete message."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.")
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command can only be used in groups.")
         return
 
-    if not await is_admin(update, context):
-        await update.message.reply_text(
+    if not await is_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} You don't have permission to ban users.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    if not await is_bot_admin(update, context):
-        await update.message.reply_text(
+    if not await is_bot_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} I don't have permission to ban users.",
             parse_mode=ParseMode.HTML,
         )
@@ -840,18 +839,18 @@ async def dban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_user = None
     message_deleted = False
 
-    if update.message.reply_to_message:
-        target_user = update.message.reply_to_message.from_user
+    if message.reply_to_message:
+        target_user = message.reply_to_message.from_user
         try:
-            await update.message.reply_to_message.delete()
+            await message.reply_to_message.delete()
             message_deleted = True
         except Exception:
             pass
     else:
-        target_user = await get_target_user(update, context)
+        target_user = await get_target_user(message, bot, args)
 
     if not target_user:
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.ERROR} Please reply to a message or specify a user.\n\n"
             "<b>Usage:</b>\n"
             "• Reply to a message with /dban [period] [reason]\n"
@@ -860,84 +859,84 @@ async def dban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if target_user.id == update.effective_user.id:
-        await update.message.reply_text(f"{E.ERROR} You cannot ban yourself.")
+    if target_user.id == message.from_user.id:
+        await reply_text(message, f"{E.ERROR} You cannot ban yourself.")
         return
 
-    if target_user.id == context.bot.id:
-        await update.message.reply_text(f"{E.ERROR} I cannot ban myself.")
+    if target_user.id == bot.id:
+        await reply_text(message, f"{E.ERROR} I cannot ban myself.")
         return
 
-    duration, reason = parse_duration_reason(action_args(update, context))
+    duration, reason = parse_duration_reason(action_args(message, args))
 
     ok, detail = await execute_action(
-        update, context, target_user.id, WarningAction.BAN, duration, reason
+        message, bot, target_user.id, WarningAction.BAN, duration, reason
     )
     extras = []
     if message_deleted:
         extras.append(field_extra(E.CROSS, "Message", "Deleted"))
-    reply_text = moderation_card(
-        WarningAction.BAN, target_user, update.effective_user, reason,
+    card_text = moderation_card(
+        WarningAction.BAN, target_user, message.from_user, reason,
         duration=duration, extra_fields=extras, ok=ok, detail=detail,
     )
-    await reply_card(update.message, reply_text, user=target_user)
+    await reply_card(message, card_text, user=target_user)
 
 
-async def sban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def sban_command(message: Message, bot: Bot, args: list):
     """Handle /sban command - silent ban."""
-    if update.effective_chat.type == "private":
+    if message.chat.type == "private":
         return
 
-    if not await is_admin(update, context):
+    if not await is_admin(message, bot):
         return
 
-    if not await is_bot_admin(update, context):
+    if not await is_bot_admin(message, bot):
         return
 
-    target_user = await get_target_user(update, context)
+    target_user = await get_target_user(message, bot, args)
 
-    if not target_user or target_user.id == update.effective_user.id:
+    if not target_user or target_user.id == message.from_user.id:
         return
 
-    if target_user.id == context.bot.id:
+    if target_user.id == bot.id:
         return
 
-    duration, reason = parse_duration_reason(action_args(update, context))
+    duration, reason = parse_duration_reason(action_args(message, args))
 
     await execute_action(
-        update, context, target_user.id, WarningAction.BAN, duration, reason
+        message, bot, target_user.id, WarningAction.BAN, duration, reason
     )
 
     try:
-        await update.message.delete()
+        await message.delete()
     except Exception:
         pass
 
 
-async def tban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def tban_command(message: Message, bot: Bot, args: list):
     """Handle /tban command - temporary ban."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.")
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command can only be used in groups.")
         return
 
-    if not await is_admin(update, context):
-        await update.message.reply_text(
+    if not await is_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} You don't have permission to ban users.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    if not await is_bot_admin(update, context):
-        await update.message.reply_text(
+    if not await is_bot_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} I don't have permission to ban users.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    target_user = await get_target_user(update, context)
+    target_user = await get_target_user(message, bot, args)
 
     if not target_user:
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.ERROR} Please specify a user to ban.\n\n"
             "<b>Usage:</b> /tban @user &lt;period&gt; [reason]\n"
             "<b>Example:</b> /tban @user 7d Spamming",
@@ -945,25 +944,25 @@ async def tban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if target_user.id == update.effective_user.id:
-        await update.message.reply_text(f"{E.ERROR} You cannot ban yourself.")
+    if target_user.id == message.from_user.id:
+        await reply_text(message, f"{E.ERROR} You cannot ban yourself.")
         return
 
-    if target_user.id == context.bot.id:
-        await update.message.reply_text(f"{E.ERROR} I cannot ban myself.")
+    if target_user.id == bot.id:
+        await reply_text(message, f"{E.ERROR} I cannot ban myself.")
         return
 
-    remaining = action_args(update, context)
+    remaining = action_args(message, args)
     duration, reason = parse_duration_reason(remaining)
 
     if not duration and remaining:
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.ERROR} Invalid duration format. Use: 30s, 5m, 1h, 2d, or 1w"
         )
         return
 
     if not duration:
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.ERROR} Duration is required for temporary ban.\n\n"
             "<b>Usage:</b> /tban @user &lt;period&gt; [reason]\n"
             "<b>Example:</b> /tban @user 7d Spamming",
@@ -972,42 +971,42 @@ async def tban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     ok, detail = await execute_action(
-        update, context, target_user.id, WarningAction.BAN, duration, reason
+        message, bot, target_user.id, WarningAction.BAN, duration, reason
     )
     unban_time = datetime.now() + duration
-    reply_text = moderation_card(
-        WarningAction.BAN, target_user, update.effective_user, reason,
+    card_text = moderation_card(
+        WarningAction.BAN, target_user, message.from_user, reason,
         duration=duration,
         extra_fields=[field_extra(E.TIME, "Auto-unban", unban_time.strftime("%Y-%m-%d %H:%M:%S"))],
         ok=ok, detail=detail,
     )
-    await reply_card(update.message, reply_text, user=target_user)
+    await reply_card(message, card_text, user=target_user)
 
 
-async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def unban_command(message: Message, bot: Bot, args: list):
     """Handle /unban command."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.")
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command can only be used in groups.")
         return
 
-    if not await is_admin(update, context):
-        await update.message.reply_text(
+    if not await is_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} You don't have permission to unban users.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    if not await is_bot_admin(update, context):
-        await update.message.reply_text(
+    if not await is_bot_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} I don't have permission to unban users.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    target_user = await get_target_user(update, context)
+    target_user = await get_target_user(message, bot, args)
 
     if not target_user:
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.ERROR} Please specify a user to unban.\n\n"
             "<b>Usage:</b> /unban @user or user ID",
             parse_mode=ParseMode.HTML,
@@ -1015,21 +1014,21 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        await context.bot.unban_chat_member(update.effective_chat.id, target_user.id)
+        await bot.unban_chat_member(message.chat.id, target_user.id)
         await reply_card(
-            update.message,
+            message,
             action_card(
                 "Unban Successful",
                 [
                     field_user(target_user),
-                    field_by(update.effective_user, "UNBANNED BY"),
+                    field_by(message.from_user, "UNBANNED BY"),
                 ],
                 icon=E.UNBAN,
             ),
             user=target_user,
         )
     except Exception as e:
-        await update.message.reply_text(plain_error(f"Failed to unban user: {str(e)}"))
+        await reply_text(message, plain_error(f"Failed to unban user: {str(e)}"))
 
 
 # ============================================
@@ -1037,32 +1036,32 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================
 
 
-async def kick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def kick_command(message: Message, bot: Bot, args: list):
     """Handle /kick command."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.")
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command can only be used in groups.")
         return
 
-    if not await is_admin(update, context):
-        await update.message.reply_text(
+    if not await is_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} You don't have permission to kick users.\n"
             "Required permission: <b>Can Ban Members</b>",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    if not await is_bot_admin(update, context):
-        await update.message.reply_text(
+    if not await is_bot_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} I don't have permission to kick users.\n"
             "Please make sure I have the <b>Can Ban Members</b> permission.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    target_user = await get_target_user(update, context)
+    target_user = await get_target_user(message, bot, args)
 
     if not target_user:
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.ERROR} Please specify a user to kick.\n\n"
             "<b>Usage:</b>\n"
             "• /kick @user [reason]\n"
@@ -1071,65 +1070,65 @@ async def kick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if target_user.id == update.effective_user.id:
-        await update.message.reply_text(f"{E.ERROR} You cannot kick yourself.")
+    if target_user.id == message.from_user.id:
+        await reply_text(message, f"{E.ERROR} You cannot kick yourself.")
         return
 
-    if target_user.id == context.bot.id:
-        await update.message.reply_text(f"{E.ERROR} I cannot kick myself.")
+    if target_user.id == bot.id:
+        await reply_text(message, f"{E.ERROR} I cannot kick myself.")
         return
 
     try:
-        target_member = await context.bot.get_chat_member(
-            update.effective_chat.id, target_user.id
+        target_member = await bot.get_chat_member(
+            message.chat.id, target_user.id
         )
-        if target_member.status in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]:
-            sender_member = await context.bot.get_chat_member(
-                update.effective_chat.id, update.effective_user.id
+        if target_member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]:
+            sender_member = await bot.get_chat_member(
+                message.chat.id, message.from_user.id
             )
-            if sender_member.status != ChatMember.OWNER:
-                await update.message.reply_text(
+            if sender_member.status != ChatMemberStatus.CREATOR:
+                await reply_text(message, 
                     f"{E.ERROR} You cannot kick a user with equal or higher permissions."
                 )
                 return
     except Exception:
         pass
 
-    reason = " ".join(action_args(update, context)) or DEFAULT_REASON
+    reason = " ".join(action_args(message, args)) or DEFAULT_REASON
 
     ok, detail = await execute_action(
-        update, context, target_user.id, WarningAction.KICK, reason=reason
+        message, bot, target_user.id, WarningAction.KICK, reason=reason
     )
     if ok:
         try:
             from bot.database import db as _pdb
-            chat_id = update.effective_chat.id
+            chat_id = message.chat.id
             _pdb.bump_mod_actions(chat_id, 1)
             _pdb.record_reputation_event(target_user.id, "restriction", 1)
         except Exception:
             pass
-    reply_text = moderation_card(
-        WarningAction.KICK, target_user, update.effective_user, reason,
+    card_text = moderation_card(
+        WarningAction.KICK, target_user, message.from_user, reason,
         ok=ok, detail=detail,
     )
-    await reply_card(update.message, reply_text, user=target_user)
+    await reply_card(message, card_text, user=target_user)
 
 
-async def dkick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def dkick_command(message: Message, bot: Bot, args: list):
     """Handle /dkick command - kick and delete message."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.")
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command can only be used in groups.")
         return
 
-    if not await is_admin(update, context):
-        await update.message.reply_text(
+    if not await is_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} You don't have permission to kick users.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    if not await is_bot_admin(update, context):
-        await update.message.reply_text(
+    if not await is_bot_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} I don't have permission to kick users.",
             parse_mode=ParseMode.HTML,
         )
@@ -1138,18 +1137,18 @@ async def dkick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_user = None
     message_deleted = False
 
-    if update.message.reply_to_message:
-        target_user = update.message.reply_to_message.from_user
+    if message.reply_to_message:
+        target_user = message.reply_to_message.from_user
         try:
-            await update.message.reply_to_message.delete()
+            await message.reply_to_message.delete()
             message_deleted = True
         except Exception:
             pass
     else:
-        target_user = await get_target_user(update, context)
+        target_user = await get_target_user(message, bot, args)
 
     if not target_user:
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.ERROR} Please reply to a message or specify a user.\n\n"
             "<b>Usage:</b>\n"
             "• Reply to a message with /dkick [reason]\n"
@@ -1158,56 +1157,56 @@ async def dkick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if target_user.id == update.effective_user.id:
-        await update.message.reply_text(f"{E.ERROR} You cannot kick yourself.")
+    if target_user.id == message.from_user.id:
+        await reply_text(message, f"{E.ERROR} You cannot kick yourself.")
         return
 
-    if target_user.id == context.bot.id:
-        await update.message.reply_text(f"{E.ERROR} I cannot kick myself.")
+    if target_user.id == bot.id:
+        await reply_text(message, f"{E.ERROR} I cannot kick myself.")
         return
 
-    reason = " ".join(action_args(update, context)) or DEFAULT_REASON
+    reason = " ".join(action_args(message, args)) or DEFAULT_REASON
 
     ok, detail = await execute_action(
-        update, context, target_user.id, WarningAction.KICK, reason=reason
+        message, bot, target_user.id, WarningAction.KICK, reason=reason
     )
     extras = []
     if message_deleted:
         extras.append(field_extra(E.CROSS, "Message", "Deleted"))
-    reply_text = moderation_card(
-        WarningAction.KICK, target_user, update.effective_user, reason,
+    card_text = moderation_card(
+        WarningAction.KICK, target_user, message.from_user, reason,
         extra_fields=extras, ok=ok, detail=detail,
     )
-    await reply_card(update.message, reply_text, user=target_user)
+    await reply_card(message, card_text, user=target_user)
 
 
-async def skick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def skick_command(message: Message, bot: Bot, args: list):
     """Handle /skick command - silent kick."""
-    if update.effective_chat.type == "private":
+    if message.chat.type == "private":
         return
 
-    if not await is_admin(update, context):
+    if not await is_admin(message, bot):
         return
 
-    if not await is_bot_admin(update, context):
+    if not await is_bot_admin(message, bot):
         return
 
-    target_user = await get_target_user(update, context)
+    target_user = await get_target_user(message, bot, args)
 
-    if not target_user or target_user.id == update.effective_user.id:
+    if not target_user or target_user.id == message.from_user.id:
         return
 
-    if target_user.id == context.bot.id:
+    if target_user.id == bot.id:
         return
 
-    reason = " ".join(action_args(update, context)) or DEFAULT_REASON
+    reason = " ".join(action_args(message, args)) or DEFAULT_REASON
 
     await execute_action(
-        update, context, target_user.id, WarningAction.KICK, reason=reason
+        message, bot, target_user.id, WarningAction.KICK, reason=reason
     )
 
     try:
-        await update.message.delete()
+        await message.delete()
     except Exception:
         pass
 
@@ -1217,23 +1216,23 @@ async def skick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================
 
 
-async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def warn_command(message: Message, bot: Bot, args: list):
     """Handle /warn command."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.")
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command can only be used in groups.")
         return
 
-    if not await is_admin(update, context):
-        await update.message.reply_text(
+    if not await is_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} You don't have permission to warn users.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    target_user = await get_target_user(update, context)
+    target_user = await get_target_user(message, bot, args)
 
     if not target_user:
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.ERROR} Please specify a user to warn.\n\n"
             "<b>Usage:</b>\n"
             "• /warn @user [reason]\n"
@@ -1242,17 +1241,17 @@ async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if target_user.id == update.effective_user.id:
-        await update.message.reply_text(f"{E.ERROR} You cannot warn yourself.")
+    if target_user.id == message.from_user.id:
+        await reply_text(message, f"{E.ERROR} You cannot warn yourself.")
         return
 
-    if target_user.id == context.bot.id:
-        await update.message.reply_text(f"{E.ERROR} I cannot warn myself.")
+    if target_user.id == bot.id:
+        await reply_text(message, f"{E.ERROR} I cannot warn myself.")
         return
 
-    reason = " ".join(action_args(update, context)) or DEFAULT_REASON
+    reason = " ".join(action_args(message, args)) or DEFAULT_REASON
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     settings = await get_chat_settings(chat_id)
 
     warning_count = await add_warning(chat_id, target_user.id, reason)
@@ -1268,7 +1267,7 @@ async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         duration = settings.get("warn_mode_duration")
 
         ok, detail = await execute_action(
-            update, context, target_user.id, action, duration, reason
+            message, bot, target_user.id, action, duration, reason
         )
         action_name = {
             WarningAction.MUTE: "Mute",
@@ -1276,29 +1275,29 @@ async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             WarningAction.BAN: "Ban",
             WarningAction.TIMEOUT: "Timeout",
         }.get(action, action.value.capitalize())
-        reply_text = warn_card(
-            target_user, update.effective_user, reason,
+        card_text = warn_card(
+            target_user, message.from_user, reason,
             warning_count, settings["warn_limit"],
             triggered=f"{action_name} ({detail})" if ok else f"Failed ({detail})",
         )
         await reset_warnings(chat_id, target_user.id)
     else:
-        reply_text = warn_card(
-            target_user, update.effective_user, reason,
+        card_text = warn_card(
+            target_user, message.from_user, reason,
             warning_count, settings["warn_limit"],
         )
 
-    await reply_card(update.message, reply_text, user=target_user)
+    await reply_card(message, card_text, user=target_user)
 
 
-async def dwarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def dwarn_command(message: Message, bot: Bot, args: list):
     """Handle /dwarn command - warn and delete message."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.")
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command can only be used in groups.")
         return
 
-    if not await is_admin(update, context):
-        await update.message.reply_text(
+    if not await is_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} You don't have permission to warn users.",
             parse_mode=ParseMode.HTML,
         )
@@ -1307,18 +1306,18 @@ async def dwarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_user = None
     message_deleted = False
 
-    if update.message.reply_to_message:
-        target_user = update.message.reply_to_message.from_user
+    if message.reply_to_message:
+        target_user = message.reply_to_message.from_user
         try:
-            await update.message.reply_to_message.delete()
+            await message.reply_to_message.delete()
             message_deleted = True
         except Exception:
             pass
     else:
-        target_user = await get_target_user(update, context)
+        target_user = await get_target_user(message, bot, args)
 
     if not target_user:
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.ERROR} Please reply to a message or specify a user.\n\n"
             "<b>Usage:</b>\n"
             "• Reply to a message with /dwarn [reason]\n"
@@ -1327,17 +1326,17 @@ async def dwarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if target_user.id == update.effective_user.id:
-        await update.message.reply_text(f"{E.ERROR} You cannot warn yourself.")
+    if target_user.id == message.from_user.id:
+        await reply_text(message, f"{E.ERROR} You cannot warn yourself.")
         return
 
-    if target_user.id == context.bot.id:
-        await update.message.reply_text(f"{E.ERROR} I cannot warn myself.")
+    if target_user.id == bot.id:
+        await reply_text(message, f"{E.ERROR} I cannot warn myself.")
         return
 
-    reason = " ".join(action_args(update, context)) or DEFAULT_REASON
+    reason = " ".join(action_args(message, args)) or DEFAULT_REASON
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     settings = await get_chat_settings(chat_id)
 
     warning_count = await add_warning(chat_id, target_user.id, reason)
@@ -1353,7 +1352,7 @@ async def dwarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         duration = settings.get("warn_mode_duration")
 
         ok, detail = await execute_action(
-            update, context, target_user.id, action, duration, reason
+            message, bot, target_user.id, action, duration, reason
         )
         action_name = {
             WarningAction.MUTE: "Mute",
@@ -1364,8 +1363,8 @@ async def dwarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         extras = []
         if message_deleted:
             extras.append(field_extra(E.CROSS, "Message", "Deleted"))
-        reply_text = warn_card(
-            target_user, update.effective_user, reason,
+        card_text = warn_card(
+            target_user, message.from_user, reason,
             warning_count, settings["warn_limit"],
             triggered=f"{action_name} ({detail})" if ok else f"Failed ({detail})",
             extra_fields=extras,
@@ -1375,37 +1374,37 @@ async def dwarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         extras = []
         if message_deleted:
             extras.append(field_extra(E.CROSS, "Message", "Deleted"))
-        reply_text = warn_card(
-            target_user, update.effective_user, reason,
+        card_text = warn_card(
+            target_user, message.from_user, reason,
             warning_count, settings["warn_limit"],
             extra_fields=extras,
         )
 
-    await reply_card(update.message, reply_text, user=target_user)
+    await reply_card(message, card_text, user=target_user)
 
 
-async def swarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def swarn_command(message: Message, bot: Bot, args: list):
     """Handle /swarn command - silent warn."""
-    if update.effective_chat.type == "private":
+    if message.chat.type == "private":
         return
 
-    if not await is_admin(update, context):
+    if not await is_admin(message, bot):
         return
 
-    target_user = await get_target_user(update, context)
+    target_user = await get_target_user(message, bot, args)
 
     if not target_user:
         return
 
-    if target_user.id == update.effective_user.id:
+    if target_user.id == message.from_user.id:
         return
 
-    if target_user.id == context.bot.id:
+    if target_user.id == bot.id:
         return
 
-    reason = " ".join(action_args(update, context)) or DEFAULT_REASON
+    reason = " ".join(action_args(message, args)) or DEFAULT_REASON
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     settings = await get_chat_settings(chat_id)
 
     warning_count = await add_warning(chat_id, target_user.id, reason)
@@ -1419,26 +1418,26 @@ async def swarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if warning_count >= settings["warn_limit"]:
         action = settings["warn_mode"]
         duration = settings.get("warn_mode_duration")
-        await execute_action(update, context, target_user.id, action, duration, reason)
+        await execute_action(message, bot, target_user.id, action, duration, reason)
         await reset_warnings(chat_id, target_user.id)
 
     try:
-        await update.message.delete()
+        await message.delete()
     except Exception:
         pass
 
 
-async def warns_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def warns_command(message: Message, bot: Bot, args: list):
     """Handle /warns command - show user warnings."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.")
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command can only be used in groups.")
         return
 
-    target_user = await get_target_user(update, context)
+    target_user = await get_target_user(message, bot, args)
     if not target_user:
-        target_user = update.effective_user
+        target_user = message.from_user
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     settings = await get_chat_settings(chat_id)
     warnings = await get_warnings(chat_id, target_user.id)
 
@@ -1456,7 +1455,7 @@ async def warns_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for w in warnings
             ]
         )
-        reply_text = action_card(
+        card_text = action_card(
             "Active Warnings",
             [
                 field_user(target_user),
@@ -1466,39 +1465,39 @@ async def warns_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             icon=E.WARN,
         )
     else:
-        reply_text = action_card(
+        card_text = action_card(
             "No Active Warnings",
             [field_user(target_user)],
             icon=E.CHECK,
         )
 
-    await reply_card(update.message, reply_text, user=target_user)
+    await reply_card(message, card_text, user=target_user)
 
 
-async def rmwarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def rmwarn_command(message: Message, bot: Bot, args: list):
     """Handle /rmwarn command - remove latest warning."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.")
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command can only be used in groups.")
         return
 
-    if not await is_admin(update, context):
-        await update.message.reply_text(
+    if not await is_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} You don't have permission to manage warnings.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    target_user = await get_target_user(update, context)
+    target_user = await get_target_user(message, bot, args)
 
     if not target_user:
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.ERROR} Please specify a user.\n\n"
             "<b>Usage:</b> /rmwarn @user",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     settings = await get_chat_settings(chat_id)
 
     success = await remove_latest_warning(chat_id, target_user.id)
@@ -1510,49 +1509,49 @@ async def rmwarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _pdb.record_reputation_event(target_user.id, "positive", 1)
         except Exception:
             pass
-        reply_text = action_card(
+        card_text = action_card(
             "Warning Removed",
             [
                 field_user(target_user),
-                field_by(update.effective_user, "REMOVED BY"),
+                field_by(message.from_user, "REMOVED BY"),
                 field_count(len(warnings), settings["warn_limit"]),
             ],
             icon=E.CHECK,
         )
     else:
-        reply_text = action_card(
+        card_text = action_card(
             "No Warning To Remove",
             [field_user(target_user)],
             icon=E.WARNING,
         )
 
-    await reply_card(update.message, reply_text, user=target_user)
+    await reply_card(message, card_text, user=target_user)
 
 
-async def resetwarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def resetwarn_command(message: Message, bot: Bot, args: list):
     """Handle /resetwarn command - clear all warnings for user."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.")
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command can only be used in groups.")
         return
 
-    if not await is_admin(update, context):
-        await update.message.reply_text(
+    if not await is_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} You don't have permission to manage warnings.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    target_user = await get_target_user(update, context)
+    target_user = await get_target_user(message, bot, args)
 
     if not target_user:
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.ERROR} Please specify a user.\n\n"
             "<b>Usage:</b> /resetwarn @user",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     settings = await get_chat_settings(chat_id)
 
     count = await reset_warnings(chat_id, target_user.id)
@@ -1563,59 +1562,59 @@ async def resetwarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _pdb.record_reputation_event(target_user.id, "positive", count)
         except Exception:
             pass
-        reply_text = action_card(
+        card_text = action_card(
             "Warnings Cleared",
             [
                 field_user(target_user),
-                field_by(update.effective_user, "CLEARED BY"),
+                field_by(message.from_user, "CLEARED BY"),
                 field_count(0, settings["warn_limit"]),
                 field_extra(E.INFO, "Removed", str(count)),
             ],
             icon=E.CHECK,
         )
     else:
-        reply_text = action_card(
+        card_text = action_card(
             "No Warnings To Clear",
             [field_user(target_user)],
             icon=E.WARNING,
         )
 
-    await reply_card(update.message, reply_text, user=target_user)
+    await reply_card(message, card_text, user=target_user)
 
 
-async def resetallwarns_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def resetallwarns_command(message: Message, bot: Bot):
     """Handle /resetallwarns command - clear all warnings in chat."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.")
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command can only be used in groups.")
         return
 
-    if not await is_admin(update, context):
-        await update.message.reply_text(
+    if not await is_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} You don't have permission to reset all warnings.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     count = await reset_all_warnings(chat_id)
 
     if count > 0:
-        reply_text = action_card(
+        card_text = action_card(
             "All Warnings Cleared",
             [
-                field_by(update.effective_user, "CLEARED BY"),
+                field_by(message.from_user, "CLEARED BY"),
                 field_extra(E.WARN, "Removed", str(count)),
             ],
             icon=E.CHECK,
         )
     else:
-        reply_text = action_card(
+        card_text = action_card(
             "No Active Warnings",
-            [field_extra(E.INFO, "Chat", escape(update.effective_chat.title or ""))],
+            [field_extra(E.INFO, "Chat", escape(message.chat.title or ""))],
             icon=E.INFO,
         )
 
-    await reply_card(update.message, reply_text)
+    await reply_card(message, card_text)
 
 
 # ============================================
@@ -1623,34 +1622,34 @@ async def resetallwarns_command(update: Update, context: ContextTypes.DEFAULT_TY
 # ============================================
 
 
-async def warnlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def warnlimit_command(message: Message, bot: Bot, args: list):
     """Handle /warnlimit command."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.")
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command can only be used in groups.")
         return
 
-    if not await is_admin(update, context):
-        await update.message.reply_text(
+    if not await is_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} You don't have permission to change warning settings.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    if not context.args:
-        chat_id = update.effective_chat.id
+    if not args:
+        chat_id = message.chat.id
         settings = await get_chat_settings(chat_id)
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.SETTINGS} Current warning limit: <b>{settings['warn_limit']}</b>",
             parse_mode=ParseMode.HTML,
         )
         return
 
     try:
-        limit = int(context.args[0])
+        limit = int(args[0])
         if limit < 1:
             raise ValueError
     except ValueError:
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.ERROR} Please provide a valid number.\n\n"
             "<b>Usage:</b> /warnlimit &lt;number&gt;\n"
             "<b>Example:</b> /warnlimit 3",
@@ -1658,17 +1657,17 @@ async def warnlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     settings = await get_chat_settings(chat_id)
     settings["warn_limit"] = limit
     settings_db[chat_id] = settings
 
     await reply_card(
-        update.message,
+        message,
         action_card(
             "Warn Limit Updated",
             [
-                field_by(update.effective_user, "Updated By"),
+                field_by(message.from_user, "Updated By"),
                 field_extra(E.WARN, "Limit", str(limit)),
                 field_extra(E.INFO, "Triggers On", get_ordinal(limit)),
             ],
@@ -1677,33 +1676,33 @@ async def warnlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def warnmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def warnmode_command(message: Message, bot: Bot, args: list):
     """Handle /warnmode command."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.")
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command can only be used in groups.")
         return
 
-    if not await is_admin(update, context):
-        await update.message.reply_text(
+    if not await is_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} You don't have permission to change warning settings.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    if not context.args:
-        chat_id = update.effective_chat.id
+    if not args:
+        chat_id = message.chat.id
         settings = await get_chat_settings(chat_id)
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.SETTINGS} Current warning mode: <b>{settings['warn_mode'].value}</b>",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    mode_str = context.args[0].lower()
+    mode_str = args[0].lower()
     try:
         mode = WarningAction(mode_str)
     except ValueError:
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.ERROR} Invalid warning mode. Choose from: <b>mute</b>, <b>kick</b>, <b>ban</b>, <b>timeout</b>\n\n"
             "<b>Usage:</b> /warnmode &lt;action&gt; [duration]\n"
             "<b>Example:</b> /warnmode mute 1d",
@@ -1712,15 +1711,15 @@ async def warnmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     duration = None
-    if len(context.args) > 1:
-        duration = parse_duration(context.args[1])
+    if len(args) > 1:
+        duration = parse_duration(args[1])
         if not duration:
-            await update.message.reply_text(
+            await reply_text(message, 
                 f"{E.ERROR} Invalid duration format. Use: 30s, 5m, 1h, 2d, or 1w"
             )
             return
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     settings = await get_chat_settings(chat_id)
     settings["warn_mode"] = mode
     settings["warn_mode_duration"] = duration
@@ -1733,10 +1732,10 @@ async def warnmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         WarningAction.TIMEOUT: "Restrict the user temporarily",
     }
 
-    reply_text = action_card(
+    card_text = action_card(
         "Warn Mode Updated",
         [
-            field_by(update.effective_user, "Updated By"),
+            field_by(message.from_user, "Updated By"),
             field_extra(E.SETTINGS, "Mode", str(mode.value).capitalize()),
             field_duration(str(duration) if duration else None),
             field_extra(E.INFO, "Effect", mode_descriptions[mode]),
@@ -1744,64 +1743,64 @@ async def warnmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         icon=E.SETTINGS,
     )
 
-    await reply_card(update.message, reply_text)
+    await reply_card(message, card_text)
 
 
-async def warntime_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def warntime_command(message: Message, bot: Bot, args: list):
     """Handle /warntime command."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.",
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command can only be used in groups.",
             parse_mode=ParseMode.HTML)
         return
 
-    if not await is_admin(update, context):
-        await update.message.reply_text(
+    if not await is_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} You don't have permission to change warning settings.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    if not context.args:
-        chat_id = update.effective_chat.id
+    if not args:
+        chat_id = message.chat.id
         settings = await get_chat_settings(chat_id)
         if settings["warn_time"]:
-            await update.message.reply_text(
+            await reply_text(message, 
                 f"{E.TIME} Warning expiration: <b>{settings['warn_time']}</b>",
                 parse_mode=ParseMode.HTML,
             )
         else:
-            await update.message.reply_text(
+            await reply_text(message, 
                 f"{E.TIME} Warning expiration: <b>Disabled</b> (warnings stay forever)",
                 parse_mode=ParseMode.HTML,
             )
         return
 
-    if context.args[0].lower() == "off":
-        chat_id = update.effective_chat.id
+    if args[0].lower() == "off":
+        chat_id = message.chat.id
         settings = await get_chat_settings(chat_id)
         settings["warn_time"] = None
         settings_db[chat_id] = settings
 
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.SETTINGS} Warning expiration disabled.\n"
             "Warnings will stay forever until cleared."
         )
         return
 
-    duration = parse_duration(context.args[0])
+    duration = parse_duration(args[0])
     if not duration:
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.ERROR} Invalid duration format. Use: 30s, 5m, 1h, 2d, 1w, or <b>off</b>",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     settings = await get_chat_settings(chat_id)
     settings["warn_time"] = duration
     settings_db[chat_id] = settings
 
-    await update.message.reply_text(
+    await reply_text(message, 
         f"{E.TIME} Warning expiration set to: <b>{duration}</b>\n"
         f"Warnings older than {duration} will stop counting.",
         parse_mode=ParseMode.HTML,
@@ -1813,12 +1812,12 @@ async def warntime_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================
 
 
-async def rules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def rules_command(message: Message):
     """Handle /rules command."""
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
 
     if chat_id not in rules_db or not rules_db[chat_id].get("text"):
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.BOOKMARK} No rules have been set for this chat yet.\n"
             "Admins can use /setrules to configure them."
         )
@@ -1828,43 +1827,43 @@ async def rules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rules = rules_db[chat_id]
 
     if settings.get("private_rules"):
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.BOOKMARK} Rules for this chat\n\n"
             "Click the button below to view the rules in a private message.",
         )
         return
 
-    reply_text = f"{E.BOOKMARK} Rules\n\n{rules['text']}"
-    await update.message.reply_text(reply_text, parse_mode=ParseMode.HTML)
+    card_text = f"{E.BOOKMARK} Rules\n\n{rules['text']}"
+    await reply_text(message, card_text, parse_mode=ParseMode.HTML)
 
 
-async def setrules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def setrules_command(message: Message, bot: Bot, args: list):
     """Handle /setrules command."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.",
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command can only be used in groups.",
             parse_mode=ParseMode.HTML)
         return
 
-    if not await is_admin(update, context):
-        await update.message.reply_text(
+    if not await is_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} You don't have permission to set rules.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    if update.message.reply_to_message:
-        replied_text = update.message.reply_to_message.text
+    if message.reply_to_message:
+        replied_text = message.reply_to_message.text
         if replied_text:
-            chat_id = update.effective_chat.id
+            chat_id = message.chat.id
             rules_db[chat_id] = {"text": replied_text}
-            await update.message.reply_text(
+            await reply_text(message, 
                 f"{E.CHECK} Rules copied from the replied message!\n\n"
                 f"<b>Preview:</b>\n{replied_text[:500]}{'...' if len(replied_text) > 500 else ''}"
             )
             return
 
-    if not context.args:
-        await update.message.reply_text(
+    if not args:
+        await reply_text(message, 
             f"{E.ERROR} Please provide the rules text.\n\n"
             "<b>Usage:</b> /setrules &lt;text&gt;\n\n"
             "Or reply to a message with /setrules to copy its content.",
@@ -1872,76 +1871,76 @@ async def setrules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    rules_text = " ".join(context.args)
-    chat_id = update.effective_chat.id
+    rules_text = " ".join(args)
+    chat_id = message.chat.id
     rules_db[chat_id] = {"text": rules_text}
 
-    await update.message.reply_text(
+    await reply_text(message, 
         f"{E.CHECK} Rules updated successfully!\n\n"
         f"<b>Preview:</b>\n{rules_text[:500]}{'...' if len(rules_text) > 500 else ''}"
     )
 
 
-async def resetrules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def resetrules_command(message: Message, bot: Bot):
     """Handle /resetrules command."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.",
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command can only be used in groups.",
             parse_mode=ParseMode.HTML)
         return
 
-    if not await is_admin(update, context):
-        await update.message.reply_text(
+    if not await is_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} You don't have permission to reset rules.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
 
     if chat_id in rules_db and rules_db[chat_id].get("text"):
         del rules_db[chat_id]
-        await update.message.reply_text(f"{E.CHECK} Rules have been cleared for this chat.",
+        await reply_text(message, f"{E.CHECK} Rules have been cleared for this chat.",
             parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text(f"{E.WARNING} No rules are currently set for this chat.",
+        await reply_text(message, f"{E.WARNING} No rules are currently set for this chat.",
             parse_mode=ParseMode.HTML)
 
 
-async def privaterules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def privaterules_command(message: Message, bot: Bot, args: list):
     """Handle /privaterules command."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.",
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command can only be used in groups.",
             parse_mode=ParseMode.HTML)
         return
 
-    if not await is_admin(update, context):
-        await update.message.reply_text(
+    if not await is_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} You don't have permission to change this setting.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    if not context.args or context.args[0].lower() not in ["on", "off"]:
-        await update.message.reply_text(
+    if not args or args[0].lower() not in ["on", "off"]:
+        await reply_text(message, 
             f'{E.ERROR} Please specify "on" or "off".\n\n'
             "<b>Usage:</b> /privaterules &lt;on|off&gt;",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    enabled = context.args[0].lower() == "on"
-    chat_id = update.effective_chat.id
+    enabled = args[0].lower() == "on"
+    chat_id = message.chat.id
     settings = await get_chat_settings(chat_id)
     settings["private_rules"] = enabled
     settings_db[chat_id] = settings
 
     if enabled:
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.SETTINGS} Private rules enabled.\n"
             "/rules will now send a button that DMs the rules instead of replying inline."
         )
     else:
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.SETTINGS} Private rules disabled.\n"
             "/rules will now reply with the rules inline."
         )
@@ -1952,53 +1951,53 @@ async def privaterules_command(update: Update, context: ContextTypes.DEFAULT_TYP
 # ============================================
 
 
-def setup(app: Application) -> list[str]:
+def setup() -> list[str]:
     """Register this module's handlers. Returns route descriptions for the log."""
     handlers = []
 
     # Mute commands
-    app.add_handler(CommandHandler("mute", mute_command))
-    app.add_handler(CommandHandler("dmute", dmute_command))
-    app.add_handler(CommandHandler("smute", smute_command))
-    app.add_handler(CommandHandler("tmute", tmute_command))
-    app.add_handler(CommandHandler("unmute", unmute_command))
+    on("message", mute_command, flt=cmd("mute"))
+    on("message", dmute_command, flt=cmd("dmute"))
+    on("message", smute_command, flt=cmd("smute"))
+    on("message", tmute_command, flt=cmd("tmute"))
+    on("message", unmute_command, flt=cmd("unmute"))
     handlers.extend(["/mute", "/dmute", "/smute", "/tmute", "/unmute"])
 
     # Ban commands
-    app.add_handler(CommandHandler("ban", ban_command))
-    app.add_handler(CommandHandler("dban", dban_command))
-    app.add_handler(CommandHandler("sban", sban_command))
-    app.add_handler(CommandHandler("tban", tban_command))
-    app.add_handler(CommandHandler("unban", unban_command))
+    on("message", ban_command, flt=cmd("ban"))
+    on("message", dban_command, flt=cmd("dban"))
+    on("message", sban_command, flt=cmd("sban"))
+    on("message", tban_command, flt=cmd("tban"))
+    on("message", unban_command, flt=cmd("unban"))
     handlers.extend(["/ban", "/dban", "/sban", "/tban", "/unban"])
 
     # Kick commands
-    app.add_handler(CommandHandler("kick", kick_command))
-    app.add_handler(CommandHandler("dkick", dkick_command))
-    app.add_handler(CommandHandler("skick", skick_command))
+    on("message", kick_command, flt=cmd("kick"))
+    on("message", dkick_command, flt=cmd("dkick"))
+    on("message", skick_command, flt=cmd("skick"))
     handlers.extend(["/kick", "/dkick", "/skick"])
 
     # Warning commands
-    app.add_handler(CommandHandler("warn", warn_command))
-    app.add_handler(CommandHandler("dwarn", dwarn_command))
-    app.add_handler(CommandHandler("swarn", swarn_command))
-    app.add_handler(CommandHandler("warns", warns_command))
-    app.add_handler(CommandHandler("rmwarn", rmwarn_command))
-    app.add_handler(CommandHandler("resetwarn", resetwarn_command))
-    app.add_handler(CommandHandler("resetallwarns", resetallwarns_command))
+    on("message", warn_command, flt=cmd("warn"))
+    on("message", dwarn_command, flt=cmd("dwarn"))
+    on("message", swarn_command, flt=cmd("swarn"))
+    on("message", warns_command, flt=cmd("warns"))
+    on("message", rmwarn_command, flt=cmd("rmwarn"))
+    on("message", resetwarn_command, flt=cmd("resetwarn"))
+    on("message", resetallwarns_command, flt=cmd("resetallwarns"))
     handlers.extend(["/warn", "/dwarn", "/swarn", "/warns", "/rmwarn", "/resetwarn", "/resetallwarns"])
 
     # Warning configuration
-    app.add_handler(CommandHandler("warnlimit", warnlimit_command))
-    app.add_handler(CommandHandler("warnmode", warnmode_command))
-    app.add_handler(CommandHandler("warntime", warntime_command))
+    on("message", warnlimit_command, flt=cmd("warnlimit"))
+    on("message", warnmode_command, flt=cmd("warnmode"))
+    on("message", warntime_command, flt=cmd("warntime"))
     handlers.extend(["/warnlimit", "/warnmode", "/warntime"])
 
     # Rules commands
-    app.add_handler(CommandHandler("rules", rules_command))
-    app.add_handler(CommandHandler("setrules", setrules_command))
-    app.add_handler(CommandHandler("resetrules", resetrules_command))
-    app.add_handler(CommandHandler("privaterules", privaterules_command))
+    on("message", rules_command, flt=cmd("rules"))
+    on("message", setrules_command, flt=cmd("setrules"))
+    on("message", resetrules_command, flt=cmd("resetrules"))
+    on("message", privaterules_command, flt=cmd("privaterules"))
     handlers.extend(["/rules", "/setrules", "/resetrules", "/privaterules"])
 
     return handlers

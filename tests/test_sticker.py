@@ -14,11 +14,15 @@ No network: pure helpers are called directly; handlers run against
 fakes and the MTProto client seam (``_mtproto_client``) is patched, so
 no Telegram or ffmpeg call ever happens. The one real dependency is
 PIL, used by the resize round-trip test.
+
+Handlers are aiogram-era: ``await call(fn, event, bot=...)`` passes
+only the deps each real signature declares.
 """
 
 from __future__ import annotations
 
 import atexit
+import inspect
 import os
 import shutil
 import sys
@@ -40,6 +44,8 @@ os.environ["LOCALAPPDATA"] = _TEST_DIR
 atexit.register(shutil.rmtree, _TEST_DIR, ignore_errors=True)
 
 # ── Imports (after env) ───────────────────────────────────────────
+from aiofakes import call, command_filters  # noqa: E402
+from bot import pipeline  # noqa: E402
 from bot.constants import HELP_MENU  # noqa: E402
 from bot.modules import sticker as sm  # noqa: E402
 
@@ -71,13 +77,18 @@ class _Prog:
 
 
 class _Msg:
-    """Command message — records every reply_* call."""
+    """Command message — records every reply_* call (bot.reply helpers)."""
 
-    def __init__(self, text: str = "/kang", reply=None, entities=None):
+    def __init__(self, text: str = "/kang", reply=None, entities=None,
+                 user_id=USER_ID):
         self.text = text
         self.reply_to_message = reply
         self.entities = entities or []
         self.chat = SimpleNamespace(id=1, type="private")
+        self.from_user = (
+            None if user_id is None
+            else SimpleNamespace(id=user_id, username=None, first_name="Lewin")
+        )
         self.replies: list = []          # reply_text kwargs dicts
         self.prog = None               # last progress message (edits live here)
         self.documents: list = []        # reply_document kwargs
@@ -85,26 +96,45 @@ class _Msg:
         self.videos: list = []
         self.stickers_sent: list = []
 
-    async def reply_text(self, text, **kw):
+    # reply_text → answer (private chat) / reply (group) — bot.reply semantics
+    async def _record_text(self, text, **kw):
         self.replies.append({"text": text, **kw})
         self.prog = _Prog()
         return self.prog
 
-    async def reply_document(self, document=None, **kw):
+    async def answer(self, text, **kw):
+        return await self._record_text(text, **kw)
+
+    async def reply(self, text, **kw):
+        return await self._record_text(text, **kw)
+
+    async def answer_document(self, document=None, **kw):
         self.documents.append({"document": document, **kw})
         return SimpleNamespace(message_id=2)
 
-    async def reply_animation(self, animation=None, **kw):
+    async def reply_document(self, document=None, **kw):
+        return await self.answer_document(document, **kw)
+
+    async def answer_animation(self, animation=None, **kw):
         self.animations.append({"animation": animation, **kw})
         return SimpleNamespace(message_id=2)
 
-    async def reply_video(self, video=None, **kw):
+    async def reply_animation(self, animation=None, **kw):
+        return await self.answer_animation(animation, **kw)
+
+    async def answer_video(self, video=None, **kw):
         self.videos.append({"video": video, **kw})
         return SimpleNamespace(message_id=2)
 
-    async def reply_sticker(self, sticker=None, **kw):
+    async def reply_video(self, video=None, **kw):
+        return await self.answer_video(video, **kw)
+
+    async def answer_sticker(self, sticker=None, **kw):
         self.stickers_sent.append({"sticker": sticker, **kw})
         return SimpleNamespace(message_id=2)
+
+    async def reply_sticker(self, sticker=None, **kw):
+        return await self.answer_sticker(sticker, **kw)
 
     @property
     def last(self):
@@ -129,17 +159,6 @@ class _FakeBot:
         self.calls.append(("delete_message", chat_id, message_id))
 
 
-def _update(msg: _Msg, user_id=USER_ID, username=None):
-    user = None if user_id is None else SimpleNamespace(
-        id=user_id, username=username, first_name="Lewin"
-    )
-    return SimpleNamespace(effective_message=msg, effective_user=user, message=msg)
-
-
-def _ctx():
-    return SimpleNamespace(bot=_FakeBot(), args=[])
-
-
 def _sticker(file_id="STFILE", set_name="a_42_by_PiModulerBot", emoji="🔥",
              animated=False, video=False, file_name="sticker.webp",
              unique="UNIQUE1", date=None):
@@ -162,6 +181,10 @@ def _no_mtproto():
     async def _none():
         return None
     return mock.patch.object(sm, "_mtproto_client", _none)
+
+
+def _style(btn):
+    return getattr(btn, "style", None)
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -413,25 +436,25 @@ class TestResizeImage(unittest.TestCase):
 
 class TestKangValidation(unittest.IsolatedAsyncioTestCase):
     async def test_anonymous_user_refused(self):
-        msg = _Msg(text="/kang")
-        await sm.kang_command(_update(msg, user_id=None), _ctx())
+        msg = _Msg(text="/kang", user_id=None)
+        await call(sm.kang_command, msg, bot=_FakeBot())
         self.assertIn("anonymously", msg.last["text"])
 
     async def test_no_reply_no_url_shows_usage(self):
         msg = _Msg(text="/kang")
-        await sm.kang_command(_update(msg), _ctx())
+        await call(sm.kang_command, msg, bot=_FakeBot())
         self.assertIn("/kang", msg.last["text"])
         self.assertIn("reply", msg.last["text"].lower())
 
     async def test_non_media_reply_refused(self):
         msg = _Msg(text="/kang", reply=_reply())
-        await sm.kang_command(_update(msg), _ctx())
+        await call(sm.kang_command, msg, bot=_FakeBot())
         self.assertIn("Unable to kang", msg.last["text"])
 
     async def test_photo_reply_mtproto_off_error(self):
         msg = _Msg(text="/kang", reply=_reply(photo=[SimpleNamespace(file_id="P")]))
         with _no_mtproto():
-            await sm.kang_command(_update(msg), _ctx())
+            await call(sm.kang_command, msg, bot=_FakeBot())
         self.assertIn("Processing", msg.replies[0]["text"])
         # the failure was edited onto the progress message, not re-sent
         self.assertEqual(len(msg.replies), 1)
@@ -447,7 +470,7 @@ class TestKangValidation(unittest.IsolatedAsyncioTestCase):
             return None
 
         with mock.patch.object(sm, "_mtproto_client", _rec):
-            await sm.kang_command(_update(msg), _ctx())
+            await call(sm.kang_command, msg, bot=_FakeBot())
         self.assertTrue(seen.get("hit"))
         self.assertIn("Processing", msg.replies[0]["text"])
         self.assertIn("MTProto", msg.prog.last["text"])
@@ -511,16 +534,17 @@ class _FakeMtClient:
 
 
 class _WorkingBot(_FakeBot):
-    """get_file that writes a real image instead of raising."""
+    """Bot API seam: get_file + download_file write a real image."""
 
     async def get_file(self, file_id):
         self.calls.append(("get_file", file_id))
+        return SimpleNamespace(file_id=file_id, file_path=f"path/{file_id}")
 
-        class _F:
-            async def download_to_drive(self, dest):
-                Image.new("RGB", (64, 64), (10, 20, 30)).save(dest, "PNG")
-
-        return _F()
+    async def download_file(self, file_path, destination=None, *a, **k):
+        self.calls.append(("download_file", file_path))
+        if destination:
+            Image.new("RGB", (64, 64), (10, 20, 30)).save(destination, "PNG")
+        return b""
 
 
 class TestKangOwnerResolution(unittest.IsolatedAsyncioTestCase):
@@ -570,7 +594,7 @@ class TestKangOwnerResolution(unittest.IsolatedAsyncioTestCase):
             return client
 
         with mock.patch.object(sm, "_mtproto_client", _give):
-            await sm.kang_command(_update(msg), _ctx_working())
+            await call(sm.kang_command, msg, bot=_WorkingBot())
         self.assertIsNotNone(client.created)
         owner = client.created.user_id
         self.assertIsInstance(owner, InputUser)
@@ -585,7 +609,7 @@ class TestKangOwnerResolution(unittest.IsolatedAsyncioTestCase):
         markup = msg.prog.last.get("reply_markup")
         self.assertIsNotNone(markup)
         view_btn = markup.inline_keyboard[0][0]
-        self.assertEqual(view_btn.api_kwargs.get("style"), "success")
+        self.assertEqual(_style(view_btn), "success")
         # log-channel source upload cleaned up
         self.assertIn(("delete_messages", sm.LOG_CHANNEL_ID, (7,)),
                       client.requests)
@@ -600,17 +624,12 @@ class TestKangOwnerResolution(unittest.IsolatedAsyncioTestCase):
 
         with mock.patch.object(sm, "_mtproto_client", _give), \
                 mock.patch.object(sm, "_OWNER_RETRY_WAIT", 0):
-            await sm.kang_command(_update(msg), _ctx_working())
+            await call(sm.kang_command, msg, bot=_WorkingBot())
         self.assertIsNone(client.created)            # create never attempted
         self.assertEqual(len(client.resolve_calls), 2)  # one wait-retry
         last = msg.prog.last["text"]
         self.assertIn("resolve your account", last)
         self.assertIn("@username", last)
-
-
-def _ctx_working():
-    """Context whose bot can actually 'download' (writes a real image)."""
-    return SimpleNamespace(bot=_WorkingBot(), args=[])
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -620,31 +639,31 @@ def _ctx_working():
 class TestUnkangValidation(unittest.IsolatedAsyncioTestCase):
     async def test_no_reply_usage(self):
         msg = _Msg(text="/unkang")
-        await sm.unkang_command(_update(msg), _ctx())
+        await call(sm.unkang_command, msg, bot=_FakeBot())
         self.assertIn("Reply to the sticker", msg.last["text"])
 
     async def test_reply_without_sticker_usage(self):
         msg = _Msg(text="/unkang", reply=_reply())
-        await sm.unkang_command(_update(msg), _ctx())
+        await call(sm.unkang_command, msg, bot=_FakeBot())
         self.assertIn("Reply to the sticker", msg.last["text"])
 
     async def test_foreign_pack_refused(self):
         msg = _Msg(text="/unkang", reply=_reply(
             sticker=_sticker(set_name="a_999_by_OtherBot")
         ))
-        await sm.unkang_command(_update(msg), _ctx())
+        await call(sm.unkang_command, msg, bot=_FakeBot())
         self.assertIn("isn't in your pack", msg.last["text"])
         # refused BEFORE any MTProto call — the seam must not be touched
         with mock.patch.object(
             sm, "_mtproto_client",
             mock.AsyncMock(side_effect=AssertionError("should not be called")),
         ):
-            await sm.unkang_command(_update(msg), _ctx())
+            await call(sm.unkang_command, msg, bot=_FakeBot())
 
     async def test_own_pack_mtproto_off(self):
         msg = _Msg(text="/unkang", reply=_reply(sticker=_sticker()))
         with _no_mtproto():
-            await sm.unkang_command(_update(msg), _ctx())
+            await call(sm.unkang_command, msg, bot=_FakeBot())
         self.assertIn("Removing", msg.replies[0]["text"])
         self.assertEqual(len(msg.replies), 1)
         self.assertIn("MTProto", msg.prog.last["text"])
@@ -657,41 +676,41 @@ class TestUnkangValidation(unittest.IsolatedAsyncioTestCase):
 class TestGetSticker(unittest.IsolatedAsyncioTestCase):
     async def test_no_reply_usage(self):
         msg = _Msg(text="/getsticker")
-        await sm.getsticker_command(_update(msg), _ctx())
+        await call(sm.getsticker_command, msg, bot=_FakeBot())
         self.assertIn("Reply to a sticker", msg.last["text"])
 
     async def test_animated_refused(self):
         msg = _Msg(text="/getsticker", reply=_reply(sticker=_sticker(animated=True)))
-        await sm.getsticker_command(_update(msg), _ctx())
+        await call(sm.getsticker_command, msg, bot=_FakeBot())
         self.assertIn("Animated", msg.last["text"])
 
     async def test_video_hint(self):
         msg = _Msg(text="/getsticker", reply=_reply(sticker=_sticker(video=True)))
-        await sm.getsticker_command(_update(msg), _ctx())
+        await call(sm.getsticker_command, msg, bot=_FakeBot())
         self.assertIn("/getvidsticker", msg.last["text"])
 
 
 class TestGetVidSticker(unittest.IsolatedAsyncioTestCase):
     async def test_no_reply_usage(self):
         msg = _Msg(text="/getvidsticker")
-        await sm.getvidsticker_command(_update(msg), _ctx())
+        await call(sm.getvidsticker_command, msg, bot=_FakeBot())
         self.assertIn("Reply to a video sticker", msg.last["text"])
 
     async def test_static_hint(self):
         msg = _Msg(text="/getvidsticker", reply=_reply(sticker=_sticker()))
-        await sm.getvidsticker_command(_update(msg), _ctx())
+        await call(sm.getvidsticker_command, msg, bot=_FakeBot())
         self.assertIn("/getsticker", msg.last["text"])
 
 
 class TestGetVideo(unittest.IsolatedAsyncioTestCase):
     async def test_no_reply_usage(self):
         msg = _Msg(text="/getvideo")
-        await sm.getvideo_command(_update(msg), _ctx())
+        await call(sm.getvideo_command, msg, bot=_FakeBot())
         self.assertIn("Reply to a GIF", msg.last["text"])
 
     async def test_sticker_reply_refused(self):
         msg = _Msg(text="/getvideo", reply=_reply(sticker=_sticker()))
-        await sm.getvideo_command(_update(msg), _ctx())
+        await call(sm.getvideo_command, msg, bot=_FakeBot())
         self.assertIn("Reply to a GIF", msg.last["text"])
 
 
@@ -702,12 +721,12 @@ class TestGetVideo(unittest.IsolatedAsyncioTestCase):
 class TestStickerId(unittest.IsolatedAsyncioTestCase):
     async def test_no_reply_usage(self):
         msg = _Msg(text="/stickerid")
-        await sm.stickerid_command(_update(msg), _ctx())
+        await call(sm.stickerid_command, msg)
         self.assertIn("Reply to a sticker", msg.last["text"])
 
     async def test_shows_file_id_card(self):
         msg = _Msg(text="/stickerid", reply=_reply(sticker=_sticker(file_id="AAA BBB")))
-        await sm.stickerid_command(_update(msg), _ctx())
+        await call(sm.stickerid_command, msg)
         text = msg.last["text"]
         self.assertIn("Sticker ID", text)
         self.assertIn("<code>AAA BBB</code>", text)  # escaped & wrapped
@@ -716,12 +735,12 @@ class TestStickerId(unittest.IsolatedAsyncioTestCase):
 class TestStickerInfo(unittest.IsolatedAsyncioTestCase):
     async def test_no_reply_usage(self):
         msg = _Msg(text="/stickerinfo")
-        await sm.stickerinfo_command(_update(msg), _ctx())
+        await call(sm.stickerinfo_command, msg)
         self.assertIn("Reply to a sticker", msg.last["text"])
 
     async def test_full_card_with_pack_button(self):
         msg = _Msg(text="/stinfo", reply=_reply(sticker=_sticker()))
-        await sm.stickerinfo_command(_update(msg), _ctx())
+        await call(sm.stickerinfo_command, msg)
         text = msg.last["text"]
         self.assertIn("Sticker information", text)
         self.assertIn("Static", text)
@@ -732,12 +751,11 @@ class TestStickerInfo(unittest.IsolatedAsyncioTestCase):
         urls = [b.url for row in markup.inline_keyboard for b in row]
         self.assertIn("https://t.me/addstickers/a_42_by_PiModulerBot", urls)
         # colored pack button (primary/blue on info cards)
-        self.assertEqual(
-            markup.inline_keyboard[0][0].api_kwargs.get("style"), "primary")
+        self.assertEqual(_style(markup.inline_keyboard[0][0]), "primary")
 
     async def test_animated_type_shown(self):
         msg = _Msg(text="/stickerinfo", reply=_reply(sticker=_sticker(animated=True)))
-        await sm.stickerinfo_command(_update(msg), _ctx())
+        await call(sm.stickerinfo_command, msg)
         self.assertIn("Animated", msg.last["text"])
 
 
@@ -748,29 +766,29 @@ class TestStickerInfo(unittest.IsolatedAsyncioTestCase):
 class TestMmfValidation(unittest.IsolatedAsyncioTestCase):
     async def test_no_reply_usage(self):
         msg = _Msg(text="/mmf hello")
-        await sm.mmf_command(_update(msg), _ctx())
+        await call(sm.mmf_command, msg, bot=_FakeBot())
         self.assertIn("Reply to an image", msg.last["text"])
 
     async def test_reply_without_media_usage(self):
         msg = _Msg(text="/mmf hello", reply=_reply())
-        await sm.mmf_command(_update(msg), _ctx())
+        await call(sm.mmf_command, msg, bot=_FakeBot())
         self.assertIn("memify", msg.last["text"])
 
     async def test_animated_sticker_refused(self):
         msg = _Msg(text="/mmf hello", reply=_reply(sticker=_sticker(animated=True)))
-        await sm.mmf_command(_update(msg), _ctx())
+        await call(sm.mmf_command, msg, bot=_FakeBot())
         self.assertIn("Animated", msg.last["text"])
 
     async def test_missing_text_usage(self):
         reply = _reply(photo=[SimpleNamespace(file_id="P")])
         msg = _Msg(text="/mmf", reply=reply)
-        await sm.mmf_command(_update(msg), _ctx())
+        await call(sm.mmf_command, msg, bot=_FakeBot())
         self.assertIn("Provide some text", msg.last["text"])
 
     async def test_back_only_usage(self):
         reply = _reply(photo=[SimpleNamespace(file_id="P")])
         msg = _Msg(text="/mmf -back red", reply=reply)
-        await sm.mmf_command(_update(msg), _ctx())
+        await call(sm.mmf_command, msg, bot=_FakeBot())
         self.assertIn("Provide some text", msg.last["text"])
 
 
@@ -778,37 +796,30 @@ class TestMmfValidation(unittest.IsolatedAsyncioTestCase):
 # Registration + help menu
 # ═════════════════════════════════════════════════════════════════
 
-class _FakeApp:
-    def __init__(self) -> None:
-        self.handlers: list = []
-
-    def add_handler(self, handler, group=0):
-        self.handlers.append((group, handler))
-
-
 class TestSetup(unittest.TestCase):
     def test_registers_all_commands(self):
-        app = _FakeApp()
-        routes = sm.setup(app)
+        pipeline.clear()
+        routes = sm.setup()
+        entries = pipeline.snapshot()
         commands = set()
-        for _, handler in app.handlers:
-            cmds = getattr(handler, "commands", None) or getattr(handler, "command", None)
-            if cmds:
-                commands.update(cmds)
+        for entry in entries:
+            for cf in command_filters(entry.flt):
+                commands.update(cf.commands)
         for expected in (
             "kang", "unkang", "getsticker", "getvidsticker",
             "getvideo", "stickerid", "stickerinfo", "stinfo", "mmf", "memify",
         ):
             self.assertIn(expected, commands, expected)
-        self.assertEqual(len(app.handlers), 8)
+        self.assertEqual(len(entries), 8)
         self.assertEqual(len(routes), 8)
         self.assertTrue(all(r.startswith("/") for r in routes))
 
     def test_callbacks_are_async_handlers(self):
-        app = _FakeApp()
-        sm.setup(app)
-        for _, handler in app.handlers:
-            self.assertTrue(callable(handler.callback))
+        pipeline.clear()
+        sm.setup()
+        for entry in pipeline.snapshot():
+            self.assertTrue(callable(entry.fn))
+            self.assertTrue(inspect.iscoroutinefunction(entry.fn))
 
 
 class TestHelpEntry(unittest.TestCase):

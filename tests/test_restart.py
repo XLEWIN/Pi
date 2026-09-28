@@ -38,6 +38,8 @@ os.environ["LOCALAPPDATA"] = _TEST_DIR
 atexit.register(shutil.rmtree, _TEST_DIR, ignore_errors=True)
 
 # ── Imports (after env) ───────────────────────────────────────────
+from aiofakes import call, command_filters  # noqa: E402
+from bot import pipeline  # noqa: E402
 from bot.constants import HELP_MENU  # noqa: E402
 from bot.modules import restart as rm  # noqa: E402
 
@@ -62,30 +64,30 @@ class _Prog:
 
 
 class _Msg:
-    def __init__(self, text: str = "/restart") -> None:
+    """Group command message — ``reply_text`` lands in .replies and
+    returns the progress message the handler edits afterwards."""
+
+    def __init__(self, text: str = "/restart", user_id: int | None = OWNER_ID) -> None:
         self.text = text
+        self.chat = SimpleNamespace(id=-100999, type="supergroup", title="T")
+        self.from_user = (
+            None if user_id is None
+            else SimpleNamespace(id=user_id, username=None, first_name="Lewin")
+        )
         self.replies: list = []
         self.prog: _Prog | None = None
 
-    async def reply_text(self, text, **kw):
+    async def reply(self, text, **kw):
         self.replies.append({"text": text, **kw})
         self.prog = _Prog()
         return self.prog
 
+    async def answer(self, text, **kw):
+        return await self.reply(text, **kw)
+
     @property
     def last(self):
         return self.replies[-1] if self.replies else None
-
-
-def _update(msg: _Msg, user_id=OWNER_ID):
-    user = None if user_id is None else SimpleNamespace(
-        id=user_id, username=None, first_name="Lewin"
-    )
-    return SimpleNamespace(effective_message=msg, effective_user=user, message=msg)
-
-
-def _ctx():
-    return SimpleNamespace(bot=None, args=[])
 
 
 @contextmanager
@@ -122,28 +124,28 @@ class TestRestartArgv(unittest.TestCase):
 
 class TestOwnerGate(unittest.IsolatedAsyncioTestCase):
     async def test_non_owner_denied_without_exec(self):
-        msg = _Msg()
+        msg = _Msg(user_id=99)
         with _deny_case() as ex:
-            await rm.restart_command(_update(msg, user_id=99), _ctx())
+            await call(rm.restart_command, msg)
         self.assertIn("Only the bot owner", msg.last["text"])
         self.assertIn("restart me", msg.last["text"])
         ex.assert_not_called()
 
     async def test_missing_user_denied(self):
-        msg = _Msg()
+        msg = _Msg(user_id=None)
         with _deny_case() as ex:
-            await rm.restart_command(_update(msg, user_id=None), _ctx())
+            await call(rm.restart_command, msg)
         self.assertIn("Only the bot owner", msg.last["text"])
         ex.assert_not_called()
 
     async def test_unconfigured_owner_id_denies_everyone(self):
         """OWNER_ID unset (0) → nobody may restart, not even id 0."""
-        msg = _Msg()
+        msg = _Msg(user_id=0)
         with mock.patch.object(rm, "settings", SimpleNamespace(owner_id=0)), \
                 mock.patch.object(
                     rm.os, "execvp",
                     side_effect=AssertionError("exec must not run")) as ex:
-            await rm.restart_command(_update(msg, user_id=0), _ctx())
+            await call(rm.restart_command, msg)
         self.assertIn("Only the bot owner", msg.last["text"])
         ex.assert_not_called()
 
@@ -161,7 +163,7 @@ class TestOwnerRestart(unittest.IsolatedAsyncioTestCase):
                 mock.patch.object(rm, "logger"), \
                 mock.patch.object(rm.os, "execvp",
                                   side_effect=RuntimeError("nope")) as ex:
-            await rm.restart_command(_update(msg, user_id=OWNER_ID), _ctx())
+            await call(rm.restart_command, msg)
 
         # notice sent first, with the branded card
         self.assertEqual(len(msg.replies), 1)
@@ -189,7 +191,7 @@ class TestOwnerRestart(unittest.IsolatedAsyncioTestCase):
                 mock.patch.object(rm, "_NOTICE_WAIT", 0), \
                 mock.patch.object(rm, "logger"), \
                 mock.patch.object(rm.os, "execvp", return_value=None):
-            await rm.restart_command(_update(msg, user_id=OWNER_ID), _ctx())
+            await call(rm.restart_command, msg)
         self.assertIn("Restart failed", msg.prog.last["text"])
         self.assertIn("still running", msg.prog.last["text"])
 
@@ -221,7 +223,7 @@ class TestFlushBeforeExec(unittest.IsolatedAsyncioTestCase):
                 mock.patch.object(bdb, "db", fake_db), \
                 mock.patch.object(at, "flush_now", fake_at.flush_now), \
                 mock.patch.object(rm.os, "execvp", side_effect=_exec):
-            await rm.restart_command(_update(msg, user_id=OWNER_ID), _ctx())
+            await call(rm.restart_command, msg)
 
         self.assertEqual(events, ["db", "activity", "exec"])
         self.assertIn("Restart failed", msg.prog.last["text"])
@@ -250,7 +252,7 @@ class TestFlushBeforeExec(unittest.IsolatedAsyncioTestCase):
                 mock.patch.object(at, "flush_now",
                                   lambda: events.append("activity")), \
                 mock.patch.object(rm.os, "execvp", side_effect=_exec):
-            await rm.restart_command(_update(msg, user_id=OWNER_ID), _ctx())
+            await call(rm.restart_command, msg)
 
         # db flush blew up, activity flush + exec still ran
         self.assertEqual(events, ["db", "activity", "exec"])
@@ -264,22 +266,17 @@ class TestFlushBeforeExec(unittest.IsolatedAsyncioTestCase):
 
 class TestWiring(unittest.TestCase):
     def test_setup_registers_restart_and_reboot(self):
-        from telegram.ext import CommandHandler as PTBCommandHandler
-
-        class _App:
-            def __init__(self):
-                self.handlers = []
-
-            def add_handler(self, handler, group=0):
-                self.handlers.append(handler)
-
-        app = _App()
-        routes = rm.setup(app)
+        pipeline.clear()
+        routes = rm.setup()
         self.assertEqual(routes, ["/restart", "/reboot"])
-        cmds = [h for h in app.handlers
-                if isinstance(h, PTBCommandHandler)]
+        entries = pipeline.snapshot()
+        cmds = [e for e in entries if command_filters(e.flt)]
         self.assertEqual(len(cmds), 1)
-        self.assertEqual(sorted(cmds[0].commands), ["reboot", "restart"])
+        self.assertEqual(cmds[0].event, "message")
+        self.assertEqual(cmds[0].group, 0)
+        self.assertEqual(cmds[0].key, "bot.modules.restart.restart_command")
+        self.assertEqual(sorted(command_filters(cmds[0].flt)[0].commands),
+                         ["reboot", "restart"])
 
     def test_help_documents_restart(self):
         general = next(m for m in HELP_MENU if m["key"] == "general")

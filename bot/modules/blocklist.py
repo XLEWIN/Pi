@@ -5,16 +5,14 @@ Uses SQLite database for storage.
 
 import logging
 
-from telegram import Update, ChatPermissions
-from telegram.ext import (
-    Application,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
-from telegram.constants import ParseMode
+from aiogram import Bot, F
+from aiogram.enums import ParseMode
+from aiogram.filters.logic import and_f
+from aiogram.types import ChatPermissions, Message
 
-from bot.command_handler import COMMAND, CommandHandler
+from bot.command_handler import COMMAND
+from bot.pipeline import GROUPS, cmd, on
+from bot.reply import reply_text
 from bot.database import db
 from bot.emojis import E
 
@@ -22,34 +20,34 @@ logger = logging.getLogger(__name__)
 
 
 # ── Helpers ──────────────────────────────────────────────
-async def _is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
+async def _is_admin(message: Message, bot: Bot) -> bool:
+    user_id = message.from_user.id
+    chat_id = message.chat.id
     try:
-        member = await context.bot.get_chat_member(chat_id, user_id)
+        member = await bot.get_chat_member(chat_id, user_id)
         return member.status in ["administrator", "creator"]
     except Exception:
         return False
 
 
 async def _take_action(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    message: Message,
+    bot: Bot,
     user_id: int,
     action: str,
     reason: str,
 ):
     """Execute blocklist action on a user."""
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
 
     try:
         if action == "delete":
-            await update.message.delete()
+            await message.delete()
             return
 
         elif action == "warn":
-            await update.message.delete()
-            await context.bot.send_message(
+            await message.delete()
+            await bot.send_message(
                 chat_id,
                 f"{E.WARN} <a href='tg://user?id={user_id}'>{user_id}</a> used a blocked word.\n"
                 f"<b>Action:</b> Warning issued.\n<b>Reason:</b> {reason}",
@@ -58,10 +56,10 @@ async def _take_action(
             return
 
         elif action == "mute":
-            await update.message.delete()
+            await message.delete()
             permissions = ChatPermissions(can_send_messages=False)
-            await context.bot.restrict_chat_member(chat_id, user_id, permissions)
-            await context.bot.send_message(
+            await bot.restrict_chat_member(chat_id, user_id, permissions)
+            await bot.send_message(
                 chat_id,
                 f"{E.MUTE} <a href='tg://user?id={user_id}'>{user_id}</a> muted for using a blocked word.\n"
                 f"<b>Reason:</b> {reason}",
@@ -70,10 +68,10 @@ async def _take_action(
             return
 
         elif action == "kick":
-            await update.message.delete()
-            await context.bot.ban_chat_member(chat_id, user_id)
-            await context.bot.unban_chat_member(chat_id, user_id)
-            await context.bot.send_message(
+            await message.delete()
+            await bot.ban_chat_member(chat_id, user_id)
+            await bot.unban_chat_member(chat_id, user_id)
+            await bot.send_message(
                 chat_id,
                 f"{E.KICK} <a href='tg://user?id={user_id}'>{user_id}</a> kicked for using a blocked word.\n"
                 f"<b>Reason:</b> {reason}",
@@ -82,9 +80,9 @@ async def _take_action(
             return
 
         elif action == "ban":
-            await update.message.delete()
-            await context.bot.ban_chat_member(chat_id, user_id)
-            await context.bot.send_message(
+            await message.delete()
+            await bot.ban_chat_member(chat_id, user_id)
+            await bot.send_message(
                 chat_id,
                 f"{E.BAN} <a href='tg://user?id={user_id}'>{user_id}</a> banned for using a blocked word.\n"
                 f"<b>Reason:</b> {reason}",
@@ -97,20 +95,20 @@ async def _take_action(
 
 
 # ── Command handlers ─────────────────────────────────────
-async def add_blocklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def add_blocklist(message: Message, bot: Bot, args: list):
     """Handle /blocklist — add words to the blocklist."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command only works in groups.",
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command only works in groups.",
             parse_mode=ParseMode.HTML)
         return
 
-    if not await _is_admin(update, context):
-        await update.message.reply_text(f"{E.ERROR} You need admin rights to manage the blocklist.",
+    if not await _is_admin(message, bot):
+        await reply_text(message, f"{E.ERROR} You need admin rights to manage the blocklist.",
             parse_mode=ParseMode.HTML)
         return
 
-    if not context.args:
-        await update.message.reply_text(
+    if not args:
+        await reply_text(message,
             f"{E.INFO} <b>Usage:</b>\n"
             "• /blocklist &lt;word1&gt; &lt;word2&gt; ... — Add words\n"
             "• /unblocklist &lt;word1&gt; &lt;word2&gt; ... — Remove words\n"
@@ -122,13 +120,13 @@ async def add_blocklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
 
     # Get current action/reason from first word or use defaults
     action = "delete"
     reason = "Blocked word"
 
-    words = {w.lower() for w in context.args}
+    words = {w.lower() for w in args}
     added = []
     for word in words:
         if db.add_blocklist_word(chat_id, word, action, reason):
@@ -136,30 +134,30 @@ async def add_blocklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if added:
         word_list = ", ".join(f"<code>{w}</code>" for w in sorted(added))
-        await update.message.reply_text(f"{E.CHECK} Added to blocklist: {word_list}", parse_mode=ParseMode.HTML)
+        await reply_text(message, f"{E.CHECK} Added to blocklist: {word_list}", parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text(f"{E.ERROR} Failed to add words.",
+        await reply_text(message, f"{E.ERROR} Failed to add words.",
             parse_mode=ParseMode.HTML)
 
 
-async def remove_blocklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def remove_blocklist(message: Message, bot: Bot, args: list):
     """Handle /unblocklist — remove words from the blocklist."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command only works in groups.",
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command only works in groups.",
             parse_mode=ParseMode.HTML)
         return
 
-    if not await _is_admin(update, context):
-        await update.message.reply_text(f"{E.ERROR} You need admin rights to manage the blocklist.",
+    if not await _is_admin(message, bot):
+        await reply_text(message, f"{E.ERROR} You need admin rights to manage the blocklist.",
             parse_mode=ParseMode.HTML)
         return
 
-    if not context.args:
-        await update.message.reply_text(f"{E.INFO} Usage: /unblocklist &lt;word1&gt; &lt;word2&gt; ...", parse_mode=ParseMode.HTML)
+    if not args:
+        await reply_text(message, f"{E.INFO} Usage: /unblocklist &lt;word1&gt; &lt;word2&gt; ...", parse_mode=ParseMode.HTML)
         return
 
-    chat_id = update.effective_chat.id
-    words = {w.lower() for w in context.args}
+    chat_id = message.chat.id
+    words = {w.lower() for w in args}
     removed = []
     for word in words:
         if db.remove_blocklist_word(chat_id, word):
@@ -167,104 +165,104 @@ async def remove_blocklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if removed:
         word_list = ", ".join(f"<code>{w}</code>" for w in sorted(removed))
-        await update.message.reply_text(f"{E.CHECK} Removed from blocklist: {word_list}", parse_mode=ParseMode.HTML)
+        await reply_text(message, f"{E.CHECK} Removed from blocklist: {word_list}", parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text(f"{E.ERROR} None of those words were in the blocklist.",
+        await reply_text(message, f"{E.ERROR} None of those words were in the blocklist.",
             parse_mode=ParseMode.HTML)
 
 
-async def view_blocklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def view_blocklist(message: Message):
     """Handle /blocklistview — view blocked words."""
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     blocklist = db.get_blocklist(chat_id)
 
     if not blocklist:
-        await update.message.reply_text(f"{E.INFO} No blocked words in this chat.",
+        await reply_text(message, f"{E.INFO} No blocked words in this chat.",
             parse_mode=ParseMode.HTML)
         return
 
     word_list = "\n".join([f"• <code>{b['word']}</code> ({b['action']})" for b in blocklist])
-    await update.message.reply_text(
+    await reply_text(message,
         f"{E.ALERT} <b>Blocked Words ({len(blocklist)}):</b>\n{word_list}",
         parse_mode=ParseMode.HTML,
     )
 
 
-async def clear_blocklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def clear_blocklist(message: Message, bot: Bot):
     """Handle /unblocklistall — clear all blocked words."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command only works in groups.",
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command only works in groups.",
             parse_mode=ParseMode.HTML)
         return
 
-    if not await _is_admin(update, context):
-        await update.message.reply_text(f"{E.ERROR} You need admin rights.",
+    if not await _is_admin(message, bot):
+        await reply_text(message, f"{E.ERROR} You need admin rights.",
             parse_mode=ParseMode.HTML)
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     count = db.clear_blocklist(chat_id)
     if count > 0:
-        await update.message.reply_text(f"{E.CHECK} Cleared {count} blocked words.",
+        await reply_text(message, f"{E.CHECK} Cleared {count} blocked words.",
             parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text(f"{E.INFO} No blocklist found.",
+        await reply_text(message, f"{E.INFO} No blocklist found.",
             parse_mode=ParseMode.HTML)
 
 
-async def set_blocklist_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def set_blocklist_action(message: Message, bot: Bot, args: list):
     """Handle /setblocklistaction — set the action for blocked words."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command only works in groups.",
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command only works in groups.",
             parse_mode=ParseMode.HTML)
         return
 
-    if not await _is_admin(update, context):
-        await update.message.reply_text(f"{E.ERROR} You need admin rights.",
+    if not await _is_admin(message, bot):
+        await reply_text(message, f"{E.ERROR} You need admin rights.",
             parse_mode=ParseMode.HTML)
         return
 
-    if not context.args or context.args[0].lower() not in ["delete", "warn", "mute", "kick", "ban"]:
-        await update.message.reply_text(
+    if not args or args[0].lower() not in ["delete", "warn", "mute", "kick", "ban"]:
+        await reply_text(message,
             f"{E.ERROR} Choose action: <b>delete</b>, <b>warn</b>, <b>mute</b>, <b>kick</b>, <b>ban</b>",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    chat_id = update.effective_chat.id
-    db.set_blocklist_action(chat_id, context.args[0].lower())
-    await update.message.reply_text(f"{E.CHECK} Blocklist action set to: <b>{context.args[0].lower()}</b>", parse_mode=ParseMode.HTML)
+    chat_id = message.chat.id
+    db.set_blocklist_action(chat_id, args[0].lower())
+    await reply_text(message, f"{E.CHECK} Blocklist action set to: <b>{args[0].lower()}</b>", parse_mode=ParseMode.HTML)
 
 
-async def set_blocklist_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def set_blocklist_reason(message: Message, bot: Bot, args: list):
     """Handle /blocklistreason — set the reason for blocked words."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command only works in groups.",
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command only works in groups.",
             parse_mode=ParseMode.HTML)
         return
 
-    if not await _is_admin(update, context):
-        await update.message.reply_text(f"{E.ERROR} You need admin rights.",
+    if not await _is_admin(message, bot):
+        await reply_text(message, f"{E.ERROR} You need admin rights.",
             parse_mode=ParseMode.HTML)
         return
 
-    if not context.args:
-        await update.message.reply_text(f"{E.INFO} Usage: /blocklistreason &lt;reason&gt;", parse_mode=ParseMode.HTML)
+    if not args:
+        await reply_text(message, f"{E.INFO} Usage: /blocklistreason &lt;reason&gt;", parse_mode=ParseMode.HTML)
         return
 
-    chat_id = update.effective_chat.id
-    reason = " ".join(context.args)
+    chat_id = message.chat.id
+    reason = " ".join(args)
     db.set_blocklist_reason(chat_id, reason)
-    await update.message.reply_text(f"{E.CHECK} Blocklist reason set to: <b>{reason}</b>", parse_mode=ParseMode.HTML)
+    await reply_text(message, f"{E.CHECK} Blocklist reason set to: <b>{reason}</b>", parse_mode=ParseMode.HTML)
 
 
-async def blocklist_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def blocklist_check(message: Message, bot: Bot):
     """Check incoming messages against blocklist."""
-    if not update.message or update.effective_chat.type == "private":
+    if not message or message.chat.type == "private":
         return
 
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
+    chat_id = message.chat.id
+    user_id = message.from_user.id
 
     # Check exemptions
     if db.is_blocklist_exempt(chat_id, user_id):
@@ -274,7 +272,7 @@ async def blocklist_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not blocklist:
         return
 
-    text = (update.message.text or update.message.caption or "").lower()
+    text = (message.text or message.caption or "").lower()
 
     # Get the action/reason from the first entry (they're all the same per chat)
     action = blocklist[0]["action"]
@@ -291,19 +289,19 @@ async def blocklist_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             import asyncio
             asyncio.get_running_loop().run_in_executor(None, _count_spam)
-            await _take_action(update, context, user_id, action, reason)
+            await _take_action(message, bot, user_id, action, reason)
             return
 
 
 # ── Module setup ─────────────────────────────────────────
-def setup(app: Application) -> list:
+def setup() -> list:
     """Register blocklist commands and message handler."""
-    app.add_handler(CommandHandler("blocklist", add_blocklist, filters=filters.ChatType.GROUPS))
-    app.add_handler(CommandHandler("unblocklist", remove_blocklist, filters=filters.ChatType.GROUPS))
-    app.add_handler(CommandHandler("blocklistview", view_blocklist, filters=filters.ChatType.GROUPS))
-    app.add_handler(CommandHandler("unblocklistall", clear_blocklist, filters=filters.ChatType.GROUPS))
-    app.add_handler(CommandHandler("setblocklistaction", set_blocklist_action, filters=filters.ChatType.GROUPS))
-    app.add_handler(CommandHandler("blocklistreason", set_blocklist_reason, filters=filters.ChatType.GROUPS))
-    app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~COMMAND, blocklist_check), group=2)
+    on("message", add_blocklist, flt=and_f(cmd("blocklist"), GROUPS))
+    on("message", remove_blocklist, flt=and_f(cmd("unblocklist"), GROUPS))
+    on("message", view_blocklist, flt=and_f(cmd("blocklistview"), GROUPS))
+    on("message", clear_blocklist, flt=and_f(cmd("unblocklistall"), GROUPS))
+    on("message", set_blocklist_action, flt=and_f(cmd("setblocklistaction"), GROUPS))
+    on("message", set_blocklist_reason, flt=and_f(cmd("blocklistreason"), GROUPS))
+    on("message", blocklist_check, group=2, flt=and_f(F.text | F.caption, ~COMMAND))
 
     return ["blocklist", "unblocklist", "blocklistview", "unblocklistall", "setblocklistaction", "blocklistreason"]

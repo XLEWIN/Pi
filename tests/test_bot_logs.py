@@ -10,7 +10,8 @@ Environment isolation (BEFORE any bot import):
       exits without one.
     * LOCALAPPDATA points at a temp dir so runtime files are isolated.
 
-No network: the handler runs against fake updates; send_log is patched.
+No network: the handler runs against a duck ChatMemberUpdated; send_log
+is patched.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ os.environ["LOCALAPPDATA"] = _TEST_DIR
 atexit.register(shutil.rmtree, _TEST_DIR, ignore_errors=True)
 
 # ── Imports (after env) ───────────────────────────────────────────
-from telegram import ChatMember  # noqa: E402
+from aiofakes import call  # noqa: E402
 
 from bot.modules import users as um  # noqa: E402
 
@@ -149,11 +150,13 @@ class TestChatLink(unittest.TestCase):
         )
 
 
-def _cmu(old, new, actor):
+def _cmu(old, new, actor, chat=None):
+    """Duck ChatMemberUpdated — statuses are Telegram's plain strings."""
     return SimpleNamespace(
+        chat=chat or _chat(),
+        from_user=actor,
         old_chat_member=SimpleNamespace(status=old),
         new_chat_member=SimpleNamespace(status=new),
-        from_user=actor,
     )
 
 
@@ -168,67 +171,57 @@ class _FakeBot:
         return self._count
 
 
-class _FakeContext:
-    def __init__(self, bot):
-        self.bot = bot
-
-
 class TestHandleBotMembership(unittest.IsolatedAsyncioTestCase):
-    def _update(self, cmu, chat=None):
-        return SimpleNamespace(
-            my_chat_member=cmu, effective_chat=chat or _chat()
-        )
-
-    async def _run(self, update, count=22, fail=False):
+    async def _run(self, event, count=22, fail=False):
         captured = []
 
-        async def fake_send_log(context, message):
+        async def fake_send_log(bot, message):
             captured.append(message)
 
-        ctx = _FakeContext(_FakeBot(count=count, fail=fail))
         with mock.patch.object(um, "send_log", fake_send_log):
-            await um.handle_bot_membership(update, ctx)
-            await asyncio.sleep(0)  # let the created task run
-            await asyncio.sleep(0)
+            await call(um.handle_bot_membership, event,
+                       bot=_FakeBot(count=count, fail=fail))
+            # let the created send_log task run
+            await asyncio.sleep(0.01)
         return captured
 
     async def test_left_to_member_sends_added(self):
-        cmu = _cmu(ChatMember.LEFT, ChatMember.MEMBER, _actor())
-        captured = await self._run(self._update(cmu))
+        cmu = _cmu("left", "member", _actor())
+        captured = await self._run(cmu)
         self.assertEqual(len(captured), 1)
         self.assertTrue(captured[0].startswith("#BOT_ADDED\n"))
         self.assertIn("ɢʀᴏᴜᴘ ᴍᴇᴍʙᴇʀs : 22", captured[0])
 
     async def test_member_to_banned_sends_removed_unknown(self):
-        cmu = _cmu(ChatMember.MEMBER, ChatMember.BANNED, _actor())
-        captured = await self._run(self._update(cmu))
+        cmu = _cmu("member", "kicked", _actor())
+        captured = await self._run(cmu)
         self.assertEqual(len(captured), 1)
         self.assertTrue(captured[0].startswith("#BOT_REMOVED\n"))
         self.assertIn("ɢʀᴏᴜᴘ ᴍᴇᴍʙᴇʀs : Unknown", captured[0])
 
     async def test_promotion_is_not_an_add(self):
-        cmu = _cmu(ChatMember.MEMBER, ChatMember.ADMINISTRATOR, _actor())
-        captured = await self._run(self._update(cmu))
+        cmu = _cmu("member", "administrator", _actor())
+        captured = await self._run(cmu)
         self.assertEqual(captured, [])
 
     async def test_demotion_is_not_a_remove(self):
-        cmu = _cmu(ChatMember.ADMINISTRATOR, ChatMember.MEMBER, _actor())
-        captured = await self._run(self._update(cmu))
+        cmu = _cmu("administrator", "member", _actor())
+        captured = await self._run(cmu)
         self.assertEqual(captured, [])
 
     async def test_count_failure_falls_back_to_unknown(self):
-        cmu = _cmu(ChatMember.LEFT, ChatMember.ADMINISTRATOR, _actor())
-        captured = await self._run(self._update(cmu), fail=True)
+        cmu = _cmu("left", "administrator", _actor())
+        captured = await self._run(cmu, fail=True)
         self.assertEqual(len(captured), 1)
         self.assertIn("ɢʀᴏᴜᴘ ᴍᴇᴍʙᴇʀs : Unknown", captured[0])
 
     async def test_missing_actor_skips(self):
-        cmu = _cmu(ChatMember.LEFT, ChatMember.MEMBER, None)
-        captured = await self._run(self._update(cmu))
+        cmu = _cmu("left", "member", None)
+        captured = await self._run(cmu)
         self.assertEqual(captured, [])
 
     async def test_no_my_chat_member_is_ignored(self):
-        captured = await self._run(SimpleNamespace(my_chat_member=None))
+        captured = await self._run(None)
         self.assertEqual(captured, [])
 
 

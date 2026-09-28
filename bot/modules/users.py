@@ -5,26 +5,23 @@ Tracks all users in groups and DMs, logs activity to SQLite.
 
 import asyncio
 import logging
+import re
 from datetime import datetime
 from html import escape
 from typing import Optional
 
-from telegram import Update, ChatMember, User
-from telegram.ext import (
-    Application,
-    MessageHandler,
-    ContextTypes,
-    ChatMemberHandler,
-    CallbackQueryHandler,
-    filters,
-)
-from telegram.constants import ParseMode
+from aiogram import Bot, F
+from aiogram.enums import ChatMemberStatus, ParseMode
+from aiogram.filters.logic import and_f
+from aiogram.types import CallbackQuery, ChatMemberUpdated, Message, User
 
-from bot.command_handler import COMMAND, CommandHandler
+from bot.command_handler import COMMAND
 from bot.database import db
 from bot.modules.start import send_log, format_user_log
 from bot.emojis import E, EID, custom_emoji
 from bot.keyboards.colored import btn_danger, btn_primary, build_keyboard
+from bot.pipeline import on, cmd
+from bot.reply import reply_text
 from bot.responses import action_card, field_extra, rank_value
 
 logger = logging.getLogger(__name__)
@@ -37,7 +34,7 @@ def get_user_display(user: User) -> str:
     return user.first_name or str(user.id)
 
 
-async def register_user(user: User, context: ContextTypes.DEFAULT_TYPE,
+async def register_user(user: User, bot: Bot,
                         chat_id: int = None, chat_title: str = None,
                         action: str = "joined"):
     """Register a user and log the activity (never blocks the caller for long)."""
@@ -70,26 +67,26 @@ async def register_user(user: User, context: ContextTypes.DEFAULT_TYPE,
     # Off the event loop so join events cannot stall command replies.
     asyncio.get_running_loop().run_in_executor(None, _db_work)
     # Soft log — timeout + HTML-safe payload already inside send_log/format_user_log.
-    asyncio.create_task(send_log(context, log_message))
+    asyncio.create_task(send_log(bot, log_message))
     logger.info(f"User {user.id} ({get_user_display(user)}) {action}")
 
 
-async def register_group_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def register_group_members(message: Message, bot: Bot, bot_data: dict):
     """Register all members when bot is added to a group."""
-    if not update.message or not update.message.new_chat_members:
+    if not message or not message.new_chat_members:
         return
 
-    chat = update.effective_chat
+    chat = message.chat
     chat_id = chat.id
     chat_title = chat.title or chat.first_name or "Unknown"
 
     # Check if bot was added
-    bot_added = any(member.id == context.bot.id for member in update.message.new_chat_members)
+    bot_added = any(member.id == bot.id for member in message.new_chat_members)
 
     if bot_added:
         def _db_work() -> None:
             try:
-                bot_user = context.bot_data.get("_me")
+                bot_user = bot_data.get("_me")
                 # Fallback identity is filled below if missing; group rows only need chat.
                 db.add_group(chat_id, str(chat_title))
                 if bot_user:
@@ -105,8 +102,8 @@ async def register_group_members(update: Update, context: ContextTypes.DEFAULT_T
 
         # Keep identity in bot_data for background DB work.
         try:
-            bot_user = await context.bot.get_me()
-            context.bot_data["_me"] = {
+            bot_user = await bot.get_me()
+            bot_data["_me"] = {
                 "id": bot_user.id,
                 "username": bot_user.username,
                 "first_name": bot_user.first_name,
@@ -123,11 +120,11 @@ async def register_group_members(update: Update, context: ContextTypes.DEFAULT_T
         logger.info(f"Bot added to group {chat_title} ({chat_id})")
 
     # Register other new members without blocking this handler.
-    for member in update.message.new_chat_members:
+    for member in message.new_chat_members:
         if not member.is_bot:
             asyncio.create_task(
                 register_user(
-                    member, context,
+                    member, bot,
                     chat_id=chat_id,
                     chat_title=chat_title,
                     action=f"joined {chat_title}",
@@ -194,7 +191,7 @@ def format_bot_log(kind: str, chat, actor, member_count: str) -> str:
     return f"{header}\n\n{chat_block}\n{actor_block}\n{tail}"
 
 
-async def handle_bot_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_bot_membership(chat_member: ChatMemberUpdated, bot: Bot):
     """Send #BOT_ADDED / #BOT_REMOVED when THIS bot's status changes.
 
     my_chat_member is the authoritative signal: it fires regardless of
@@ -202,16 +199,16 @@ async def handle_bot_membership(update: Update, context: ContextTypes.DEFAULT_TY
     when it is removed (no service message can reach a removed bot).
     Promotions/demotions are ignored — only real add/remove transitions.
     """
-    if not update.my_chat_member:
+    if not chat_member:
         return
-    cmu = update.my_chat_member
+    cmu = chat_member
     old = cmu.old_chat_member.status
     new = cmu.new_chat_member.status
-    added = old in (ChatMember.LEFT, ChatMember.BANNED) and new in (
-        ChatMember.MEMBER, ChatMember.ADMINISTRATOR,
+    added = old in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED) and new in (
+        ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR,
     )
-    removed = new in (ChatMember.LEFT, ChatMember.BANNED) and old not in (
-        ChatMember.LEFT, ChatMember.BANNED,
+    removed = new in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED) and old not in (
+        ChatMemberStatus.LEFT, ChatMemberStatus.KICKED,
     )
     if not (added or removed):
         return  # promote/demote/restrict — not an add/remove event
@@ -221,11 +218,11 @@ async def handle_bot_membership(update: Update, context: ContextTypes.DEFAULT_TY
         logger.warning("my_chat_member without actor — bot log skipped")
         return
 
-    chat = update.effective_chat
+    chat = chat_member.chat
     if added:
         try:
             n = await asyncio.wait_for(
-                context.bot.get_chat_member_count(chat.id), timeout=5
+                bot.get_chat_member_count(chat.id), timeout=5
             )
             member_count = f"{n:,}"
         except Exception:
@@ -235,7 +232,7 @@ async def handle_bot_membership(update: Update, context: ContextTypes.DEFAULT_TY
 
     asyncio.create_task(
         send_log(
-            context,
+            bot,
             format_bot_log("added" if added else "removed", chat, actor, member_count),
         )
     )
@@ -245,39 +242,39 @@ async def handle_bot_membership(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
-async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_new_member(chat_member: ChatMemberUpdated, bot: Bot):
     """Handle new members joining a chat."""
-    if not update.chat_member:
+    if not chat_member:
         return
 
-    chat_member_update = update.chat_member
+    chat_member_update = chat_member
     new_member = chat_member_update.new_chat_member
     old_member = chat_member_update.old_chat_member
     user = chat_member_update.from_user
 
-    chat = update.effective_chat
+    chat = chat_member.chat
     chat_id = chat.id
     chat_title = chat.title or chat.first_name
 
     # Check if this is a new member joining
-    if (new_member.status in [ChatMember.MEMBER, ChatMember.RESTRICTED] and
-            old_member.status in [ChatMember.LEFT, ChatMember.BANNED]):
+    if (new_member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED] and
+            old_member.status in [ChatMemberStatus.LEFT, ChatMemberStatus.KICKED]):
 
         await register_user(
-            user, context,
+            user, bot,
             chat_id=chat_id,
             chat_title=chat_title,
             action=f"joined {chat_title}"
         )
 
 
-async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def track_message(message: Message):
     """Track messages to register active users (DB work runs in the background)."""
-    if not update.message or not update.effective_user:
+    if not message or not message.from_user:
         return
 
-    user = update.effective_user
-    chat = update.effective_chat
+    user = message.from_user
+    chat = message.chat
 
     if user.is_bot:
         return
@@ -305,10 +302,10 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.get_running_loop().run_in_executor(None, _db_work)
 
 
-async def userstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def userstats_command(message: Message):
     """Handle /userstats — show bot statistics."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.",
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command can only be used in groups.",
             parse_mode=ParseMode.HTML)
         return
 
@@ -325,7 +322,7 @@ async def userstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Use /myinfo to see your info.
 Use /recentactivity to see recent activity."""
 
-    await update.message.reply_text(stats_text, parse_mode=ParseMode.HTML)
+    await reply_text(message, stats_text, parse_mode=ParseMode.HTML)
 
 
 async def _build_info_text(bot, target, chat_id: Optional[int] = None) -> str:
@@ -433,26 +430,25 @@ def info_keyboard():
     )
 
 
-def _chat_scope_id(update) -> Optional[int]:
+def _chat_scope_id(message) -> Optional[int]:
     """Group chat id for rank lookups, or None in private chats."""
-    chat = getattr(update, "effective_chat", None)
+    chat = getattr(message, "chat", None)
     if chat is None or getattr(chat, "type", None) in (None, "private"):
         return None
     return getattr(chat, "id", None)
 
 
-async def _send_info(update: Update, context: ContextTypes.DEFAULT_TYPE, target) -> None:
-    text = await _build_info_text(context.bot, target, chat_id=_chat_scope_id(update))
-    await update.message.reply_text(
-        text, parse_mode=ParseMode.HTML, reply_markup=info_keyboard()
+async def _send_info(message: Message, bot: Bot, target) -> None:
+    text = await _build_info_text(bot, target, chat_id=_chat_scope_id(message))
+    await reply_text(
+        message, text, parse_mode=ParseMode.HTML, reply_markup=info_keyboard()
     )
 
 
 async def _resolve_info_target(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, *, default_self: bool
+    message: Message, bot: Bot, args: list, *, default_self: bool
 ):
     """Reply → @mention → numeric ID → (default_self ? self : None)."""
-    message = update.message
     if (
         message is not None
         and message.reply_to_message
@@ -460,12 +456,12 @@ async def _resolve_info_target(
     ):
         return message.reply_to_message.from_user
 
-    if context.args:
-        arg = context.args[0]
+    if args:
+        arg = args[0]
         if arg.startswith("@"):
             try:
-                member = await context.bot.get_chat_member(
-                    update.effective_chat.id, arg
+                member = await bot.get_chat_member(
+                    message.chat.id, arg
                 )
                 if member and member.user:
                     return member.user
@@ -476,24 +472,25 @@ async def _resolve_info_target(
             uid = int(arg)
         except ValueError:
             return None
-        if uid == update.effective_user.id:
-            return update.effective_user
+        if uid == message.from_user.id:
+            return message.from_user
         try:
-            chat = await context.bot.get_chat(uid)
+            chat = await bot.get_chat(uid)
             if getattr(chat, "type", None) != "private":
                 return None
             return chat
         except Exception:
             return None
 
-    return update.effective_user if default_self else None
+    return message.from_user if default_self else None
 
 
-async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def info_command(message: Message, bot: Bot, args: list):
     """Handle /info — full user-info card (self when no target given)."""
-    target = await _resolve_info_target(update, context, default_self=True)
+    target = await _resolve_info_target(message, bot, args, default_self=True)
     if target is None:
-        await update.message.reply_text(
+        await reply_text(
+            message,
             f"{E.ERROR} Could not find that user.\n\n"
             "<b>Usage:</b>\n"
             "• /info — your own info\n"
@@ -502,19 +499,20 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
         return
-    await _send_info(update, context, target)
+    await _send_info(message, bot, target)
 
 
-async def myinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def myinfo_command(message: Message, bot: Bot):
     """Handle /myinfo — the sender's own info card."""
-    await _send_info(update, context, update.effective_user)
+    await _send_info(message, bot, message.from_user)
 
 
-async def userinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def userinfo_command(message: Message, bot: Bot, args: list):
     """Handle /userinfo @user — another user's info card (target required)."""
-    target = await _resolve_info_target(update, context, default_self=False)
+    target = await _resolve_info_target(message, bot, args, default_self=False)
     if target is None:
-        await update.message.reply_text(
+        await reply_text(
+            message,
             f"{E.ERROR} Please specify a user.\n\n"
             "<b>Usage:</b>\n"
             "• /userinfo @user or /userinfo USER_ID\n"
@@ -522,12 +520,12 @@ async def userinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
         return
-    await _send_info(update, context, target)
+    await _send_info(message, bot, target)
 
 
-async def info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def info_callback(callback_query: CallbackQuery, bot: Bot):
     """Handle info:* callbacks — My Info (re-render for clicker) / Close."""
-    query = update.callback_query
+    query = callback_query
     if query is None or not (query.data or "").startswith("info:"):
         return
     action = query.data.split(":", 1)[1]
@@ -538,7 +536,7 @@ async def info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.delete()
         except Exception:
             try:
-                await query.edit_message_reply_markup(reply_markup=None)
+                await query.message.edit_reply_markup(reply_markup=None)
             except Exception:
                 pass
         return
@@ -551,8 +549,8 @@ async def info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cb_chat_id = None
             if cb_chat is not None and getattr(cb_chat, "type", None) not in (None, "private"):
                 cb_chat_id = getattr(cb_chat, "id", None)
-            text = await _build_info_text(context.bot, query.from_user, chat_id=cb_chat_id)
-            await query.edit_message_text(
+            text = await _build_info_text(bot, query.from_user, chat_id=cb_chat_id)
+            await query.message.edit_text(
                 text, parse_mode=ParseMode.HTML, reply_markup=info_keyboard()
             )
         except Exception as e:
@@ -562,16 +560,16 @@ async def info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer("Unknown option", show_alert=True)
 
 
-async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def id_command(message: Message):
     """Handle /id — chat ID and your user ID (plus reply target if any)."""
-    chat = update.effective_chat
-    user = update.effective_user
+    chat = message.chat
+    user = message.from_user
     fields = [
         field_extra(E.FOLDER, "Chat ID", f"<code>{chat.id}</code>"),
         field_extra(E.USER, "Your ID", f"<code>{user.id}</code>"),
     ]
 
-    reply = update.message.reply_to_message if update.message else None
+    reply = message.reply_to_message if message else None
     if reply and reply.from_user:
         target = reply.from_user
         target_name = escape(target.full_name or str(target.id))
@@ -580,38 +578,39 @@ async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             field_extra(E.WATCH, "Target", f"<code>{target.id}</code> · {mention}")
         )
 
-    await update.message.reply_text(
+    await reply_text(
+        message,
         action_card("ID", fields, icon=E.INFO),
         parse_mode=ParseMode.HTML,
     )
 
 
-async def recentactivity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def recentactivity_command(message: Message, bot: Bot):
     """Handle /recentactivity — show recent activity."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command can only be used in groups.",
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command can only be used in groups.",
             parse_mode=ParseMode.HTML)
         return
 
     # Check if user is admin
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
+    user_id = message.from_user.id
+    chat_id = message.chat.id
 
     try:
-        member = await context.bot.get_chat_member(chat_id, user_id)
-        if member.status not in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]:
-            await update.message.reply_text(f"{E.ERROR} You need admin permissions to use this command.",
+        member = await bot.get_chat_member(chat_id, user_id)
+        if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]:
+            await reply_text(message, f"{E.ERROR} You need admin permissions to use this command.",
             parse_mode=ParseMode.HTML)
             return
     except Exception:
-        await update.message.reply_text(f"{E.ERROR} Error checking permissions.",
+        await reply_text(message, f"{E.ERROR} Error checking permissions.",
             parse_mode=ParseMode.HTML)
         return
 
     activity = db.get_recent_activity(limit=5)
 
     if not activity:
-        await update.message.reply_text(f"{E.INFO} No recent activity.",
+        await reply_text(message, f"{E.INFO} No recent activity.",
             parse_mode=ParseMode.HTML)
         return
 
@@ -622,7 +621,7 @@ async def recentactivity_command(update: Update, context: ContextTypes.DEFAULT_T
         activity_text += f"• {act['action']} by {username}\n"
         activity_text += f"  📅 {act['timestamp']}\n\n"
 
-    await update.message.reply_text(activity_text, parse_mode=ParseMode.HTML)
+    await reply_text(message, activity_text, parse_mode=ParseMode.HTML)
 
 
 # ============================================
@@ -630,37 +629,33 @@ async def recentactivity_command(update: Update, context: ContextTypes.DEFAULT_T
 # ============================================
 
 
-def setup(app: Application) -> list[str]:
+def setup() -> list[str]:
     """Register this module's handlers. Returns route descriptions for the log."""
     handlers = []
 
     # Track new members joining
-    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, register_group_members))
+    on("message", register_group_members, flt=F.new_chat_members)
 
     # Track chat member updates (for privacy mode)
-    app.add_handler(ChatMemberHandler(handle_new_member, ChatMemberHandler.CHAT_MEMBER))
+    on("chat_member", handle_new_member)
 
     # Own membership — #BOT_ADDED / #BOT_REMOVED logs. Different update
     # type from CHAT_MEMBER above, so group 0 is fine.
-    app.add_handler(
-        ChatMemberHandler(handle_bot_membership, ChatMemberHandler.MY_CHAT_MEMBER)
-    )
+    on("my_chat_member", handle_bot_membership)
 
     # Track all messages to register active users. Own group (19): PTB
     # runs max ONE handler per group — in group 0 it was shadowed by
     # antispam/chatstats for every plain group message.
-    app.add_handler(
-        MessageHandler(filters.ALL & ~COMMAND, track_message), group=19
-    )
+    on("message", track_message, group=19, flt=and_f(~COMMAND))
 
     # Commands
-    app.add_handler(CommandHandler("userstats", userstats_command))
-    app.add_handler(CommandHandler("info", info_command))
-    app.add_handler(CommandHandler("id", id_command))
-    app.add_handler(CommandHandler("myinfo", myinfo_command))
-    app.add_handler(CommandHandler("userinfo", userinfo_command))
-    app.add_handler(CommandHandler("recentactivity", recentactivity_command))
-    app.add_handler(CallbackQueryHandler(info_callback, pattern=r"^info:"))
+    on("message", userstats_command, flt=cmd("userstats"))
+    on("message", info_command, flt=cmd("info"))
+    on("message", id_command, flt=cmd("id"))
+    on("message", myinfo_command, flt=cmd("myinfo"))
+    on("message", userinfo_command, flt=cmd("userinfo"))
+    on("message", recentactivity_command, flt=cmd("recentactivity"))
+    on("callback_query", info_callback, flt=F.data.regexp(re.compile(r"^info:")))
 
     handlers.extend([
         "new_chat_members tracker",

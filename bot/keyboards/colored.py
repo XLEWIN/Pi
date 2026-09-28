@@ -1,6 +1,7 @@
-"""Colored inline keyboards (Bot API 9.4+ style via api_kwargs).
+"""Colored inline keyboards (Bot API 9.4+ style buttons).
 
-Uses Telegram's native button styling:
+Uses Telegram's native button styling via direct model fields
+(aiogram TelegramObject passes unknown fields through to the API):
 - primary  → Blue
 - success  → Green
 - danger   → Red
@@ -8,17 +9,20 @@ Uses Telegram's native button styling:
 Also supports icon_custom_emoji_id for custom emoji icons on buttons.
 """
 
+from __future__ import annotations
+
 from typing import List, Optional
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
-# ── Button builders ──────────────────────────────────────
+# ── Button builders ──────────────────────────────────────────────
 def btn_primary(text: str, data: str, icon_emoji_id: Optional[str] = None) -> InlineKeyboardButton:
     """Blue/primary colored button."""
     kwargs = {"style": "primary"}
     if icon_emoji_id:
         kwargs["icon_custom_emoji_id"] = icon_emoji_id
-    return InlineKeyboardButton(text, callback_data=data, api_kwargs=kwargs)
+    return InlineKeyboardButton(text=text, callback_data=data, **kwargs)
 
 
 def btn_success(text: str, data: str, icon_emoji_id: Optional[str] = None) -> InlineKeyboardButton:
@@ -26,7 +30,7 @@ def btn_success(text: str, data: str, icon_emoji_id: Optional[str] = None) -> In
     kwargs = {"style": "success"}
     if icon_emoji_id:
         kwargs["icon_custom_emoji_id"] = icon_emoji_id
-    return InlineKeyboardButton(text, callback_data=data, api_kwargs=kwargs)
+    return InlineKeyboardButton(text=text, callback_data=data, **kwargs)
 
 
 def btn_danger(text: str, data: str, icon_emoji_id: Optional[str] = None) -> InlineKeyboardButton:
@@ -34,7 +38,7 @@ def btn_danger(text: str, data: str, icon_emoji_id: Optional[str] = None) -> Inl
     kwargs = {"style": "danger"}
     if icon_emoji_id:
         kwargs["icon_custom_emoji_id"] = icon_emoji_id
-    return InlineKeyboardButton(text, callback_data=data, api_kwargs=kwargs)
+    return InlineKeyboardButton(text=text, callback_data=data, **kwargs)
 
 
 def btn_default(text: str, data: str, icon_emoji_id: Optional[str] = None) -> InlineKeyboardButton:
@@ -42,7 +46,7 @@ def btn_default(text: str, data: str, icon_emoji_id: Optional[str] = None) -> In
     kwargs = {}
     if icon_emoji_id:
         kwargs["icon_custom_emoji_id"] = icon_emoji_id
-    return InlineKeyboardButton(text, callback_data=data, api_kwargs=kwargs if kwargs else None)
+    return InlineKeyboardButton(text=text, callback_data=data, **kwargs)
 
 
 def btn_url(
@@ -57,20 +61,20 @@ def btn_url(
         kwargs["style"] = style
     if icon_emoji_id:
         kwargs["icon_custom_emoji_id"] = icon_emoji_id
-    return InlineKeyboardButton(text, url=url, api_kwargs=kwargs if kwargs else None)
+    return InlineKeyboardButton(text=text, url=url, **kwargs)
 
 
-# ── Keyboard builder ─────────────────────────────────────
+# ── Keyboard builder ─────────────────────────────────────────────
 def build_keyboard(
     rows: List[List[InlineKeyboardButton]],
 ) -> InlineKeyboardMarkup:
     """Build an InlineKeyboardMarkup from rows of buttons."""
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-# ── Convenience send helpers ─────────────────────────────
+# ── Convenience send helpers ─────────────────────────────────────
 async def send_colored_buttons(
-    context,
+    bot,
     chat_id: int,
     text: str,
     buttons: List[List[InlineKeyboardButton]],
@@ -81,7 +85,7 @@ async def send_colored_buttons(
     """Send a message with colored buttons via Bot API."""
     try:
         reply_markup = build_keyboard(buttons)
-        result = await context.bot.send_message(
+        result = await bot.send_message(
             chat_id=chat_id,
             text=text,
             reply_markup=reply_markup,
@@ -93,5 +97,5 @@ async def send_colored_buttons(
             except Exception:
                 pass
         return result
-    except Exception as e:
+    except Exception:
         return None

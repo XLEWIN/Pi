@@ -7,28 +7,27 @@ import json
 import logging
 from typing import Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
-from telegram.constants import ParseMode
+from aiogram import Bot, F
+from aiogram.enums import ParseMode
+from aiogram.filters.logic import and_f, or_f
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from bot.command_handler import COMMAND, CommandHandler
+from bot.command_handler import COMMAND
 from bot.database import db
 from bot.emojis import E
+from bot.pipeline import GROUPS, cmd, on
+from bot.reply import (reply_text, reply_photo, reply_document, reply_animation,
+                       reply_video, reply_sticker, reply_voice, reply_audio)
 
 logger = logging.getLogger(__name__)
 
 
 # ── Helpers ──────────────────────────────────────────────
-async def _is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
+async def _is_admin(message, bot) -> bool:
+    user_id = message.from_user.id
+    chat_id = message.chat.id
     try:
-        member = await context.bot.get_chat_member(chat_id, user_id)
+        member = await bot.get_chat_member(chat_id, user_id)
         return member.status in ["administrator", "creator"]
     except Exception:
         return False
@@ -45,32 +44,33 @@ def _get_reply_buttons(buttons_json: str) -> Optional[InlineKeyboardMarkup]:
         kb = []
         row = []
         for btn in buttons:
-            row.append(InlineKeyboardButton(btn["text"], url=btn["url"]))
+            row.append(InlineKeyboardButton(text=btn["text"], url=btn["url"]))
             if len(row) == 2:
                 kb.append(row)
                 row = []
         if row:
             kb.append(row)
-        return InlineKeyboardMarkup(kb)
+        return InlineKeyboardMarkup(inline_keyboard=kb)
     except Exception:
         return None
 
 
 # ── Command handlers ─────────────────────────────────────
-async def add_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def add_filter(message: Message, bot: Bot, args: list):
     """Handle /filter — add a new filter."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command only works in groups.",
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command only works in groups.",
             parse_mode=ParseMode.HTML)
         return
 
-    if not await _is_admin(update, context):
-        await update.message.reply_text(f"{E.ERROR} You need admin rights to manage filters.",
+    if not await _is_admin(message, bot):
+        await reply_text(message, f"{E.ERROR} You need admin rights to manage filters.",
             parse_mode=ParseMode.HTML)
         return
 
-    if not context.args or len(context.args) < 1:
-        await update.message.reply_text(
+    if not args or len(args) < 1:
+        await reply_text(
+            message,
             f"{E.INFO} <b>Usage:</b>\n"
             "• /filter &lt;trigger&gt; — Add filter with text reply\n"
             "• /filter &lt;trigger&gt; — Reply to a message to set as response\n"
@@ -79,17 +79,17 @@ async def add_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    trigger = context.args[0].lower()
-    chat_id = update.effective_chat.id
+    trigger = args[0].lower()
+    chat_id = message.chat.id
 
-    reply_text = None
+    reply_body = None
     buttons = []
     media_type = None
     media_id = None
 
-    if update.message.reply_to_message:
-        reply_msg = update.message.reply_to_message
-        reply_text = reply_msg.text or reply_msg.caption or ""
+    if message.reply_to_message:
+        reply_msg = message.reply_to_message
+        reply_body = reply_msg.text or reply_msg.caption or ""
 
         if reply_msg.photo:
             media_type = "photo"
@@ -118,81 +118,84 @@ async def add_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for btn in row:
                     if btn.url:
                         buttons.append({"text": btn.text, "url": btn.url})
-    elif len(context.args) > 1:
-        reply_text = " ".join(context.args[1:])
+    elif len(args) > 1:
+        reply_body = " ".join(args[1:])
     else:
-        await update.message.reply_text(
+        await reply_text(
+            message,
             f"{E.ERROR} Provide a trigger word and reply to a message, or add text after the trigger."
         )
         return
 
     buttons_json = json.dumps(buttons) if buttons else None
-    db.add_filter(chat_id, trigger, reply_text, buttons_json, media_type, media_id)
+    db.add_filter(chat_id, trigger, reply_body, buttons_json, media_type, media_id)
 
-    await update.message.reply_text(
+    await reply_text(
+        message,
         f"{E.CHECK} Filter set for <b>{trigger}</b>.",
         parse_mode=ParseMode.HTML,
     )
 
 
-async def stop_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stop_filter(message: Message, bot: Bot, args: list):
     """Handle /stop — remove a filter."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command only works in groups.",
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command only works in groups.",
             parse_mode=ParseMode.HTML)
         return
 
-    if not await _is_admin(update, context):
-        await update.message.reply_text(f"{E.ERROR} You need admin rights to manage filters.",
+    if not await _is_admin(message, bot):
+        await reply_text(message, f"{E.ERROR} You need admin rights to manage filters.",
             parse_mode=ParseMode.HTML)
         return
 
-    if not context.args:
-        await update.message.reply_text(f"{E.INFO} Usage: /stop &lt;trigger&gt;", parse_mode=ParseMode.HTML)
+    if not args:
+        await reply_text(message, f"{E.INFO} Usage: /stop &lt;trigger&gt;", parse_mode=ParseMode.HTML)
         return
 
-    trigger = context.args[0].lower()
-    chat_id = update.effective_chat.id
+    trigger = args[0].lower()
+    chat_id = message.chat.id
 
     if db.remove_filter(chat_id, trigger):
-        await update.message.reply_text(f"{E.CHECK} Filter <b>{trigger}</b> removed.", parse_mode=ParseMode.HTML)
+        await reply_text(message, f"{E.CHECK} Filter <b>{trigger}</b> removed.", parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text(f"{E.ERROR} Filter not found.",
+        await reply_text(message, f"{E.ERROR} Filter not found.",
             parse_mode=ParseMode.HTML)
 
 
-async def filters_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def filters_list(message: Message):
     """Handle /filters — list all filters in chat."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(f"{E.ERROR} This command only works in groups.")
+    if message.chat.type == "private":
+        await reply_text(message, f"{E.ERROR} This command only works in groups.")
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     filters_data = db.get_filters(chat_id)
 
     if not filters_data:
-        await update.message.reply_text(f"{E.INFO} No filters set in this chat.",
+        await reply_text(message, f"{E.INFO} No filters set in this chat.",
             parse_mode=ParseMode.HTML)
         return
 
     trigger_list = "\n".join([f"• <code>{f['trigger_word']}</code>" for f in filters_data])
-    await update.message.reply_text(
+    await reply_text(
+        message,
         f"{E.SETTINGS} <b>Active Filters ({len(filters_data)}):</b>\n{trigger_list}",
         parse_mode=ParseMode.HTML,
     )
 
 
-async def check_filters(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def check_filters(message: Message):
     """Check incoming messages against filters."""
-    if not update.message or update.effective_chat.type == "private":
+    if not message or message.chat.type == "private":
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     filters_data = db.get_filters(chat_id)
     if not filters_data:
         return
 
-    text = (update.message.text or update.message.caption or "").lower()
+    text = (message.text or message.caption or "").lower()
 
     for f in filters_data:
         trigger = f["trigger_word"]
@@ -200,38 +203,39 @@ async def check_filters(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup = _get_reply_buttons(f.get("buttons_json"))
             media_type = f.get("media_type")
             media_id = f.get("media_id")
-            reply_text = f.get("reply_text", "")
+            reply_body = f.get("reply_text", "")
 
             try:
                 if media_type == "photo":
-                    await update.message.reply_photo(photo=media_id, caption=reply_text, reply_markup=reply_markup)
+                    await reply_photo(message, photo=media_id, caption=reply_body, reply_markup=reply_markup)
                 elif media_type == "sticker":
-                    await update.message.reply_sticker(sticker=media_id)
-                    if reply_text:
-                        await update.message.reply_text(reply_text, reply_markup=reply_markup)
+                    await reply_sticker(message, sticker=media_id)
+                    if reply_body:
+                        await reply_text(message, reply_body, reply_markup=reply_markup)
                 elif media_type == "document":
-                    await update.message.reply_document(document=media_id, caption=reply_text, reply_markup=reply_markup)
+                    await reply_document(message, document=media_id, caption=reply_body, reply_markup=reply_markup)
                 elif media_type == "animation":
-                    await update.message.reply_animation(animation=media_id, caption=reply_text, reply_markup=reply_markup)
+                    await reply_animation(message, animation=media_id, caption=reply_body, reply_markup=reply_markup)
                 elif media_type == "video":
-                    await update.message.reply_video(video=media_id, caption=reply_text, reply_markup=reply_markup)
+                    await reply_video(message, video=media_id, caption=reply_body, reply_markup=reply_markup)
                 elif media_type == "voice":
-                    await update.message.reply_voice(voice=media_id, caption=reply_text, reply_markup=reply_markup)
+                    await reply_voice(message, voice=media_id, caption=reply_body, reply_markup=reply_markup)
                 elif media_type == "audio":
-                    await update.message.reply_audio(audio=media_id, caption=reply_text, reply_markup=reply_markup)
-                elif reply_text:
-                    await update.message.reply_text(reply_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+                    await reply_audio(message, audio=media_id, caption=reply_body, reply_markup=reply_markup)
+                elif reply_body:
+                    await reply_text(message, reply_body, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
             except Exception as e:
                 logger.warning(f"Filter reply error: {e}")
             break
 
 
 # ── Module setup ─────────────────────────────────────────
-def setup(app: Application) -> list:
+def setup() -> list:
     """Register filter commands and message handler."""
-    app.add_handler(CommandHandler("filter", add_filter, filters=filters.ChatType.GROUPS))
-    app.add_handler(CommandHandler("stop", stop_filter, filters=filters.ChatType.GROUPS))
-    app.add_handler(CommandHandler("filters", filters_list, filters=filters.ChatType.GROUPS))
-    app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~COMMAND, check_filters), group=1)
+    on("message", add_filter, flt=and_f(cmd("filter"), GROUPS))
+    on("message", stop_filter, flt=and_f(cmd("stop"), GROUPS))
+    on("message", filters_list, flt=and_f(cmd("filters"), GROUPS))
+    on("message", check_filters, group=1,
+       flt=and_f(or_f(F.text, F.caption), ~COMMAND))
 
     return ["filter", "stop", "filters"]

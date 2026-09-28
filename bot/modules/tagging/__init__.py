@@ -2,7 +2,7 @@
 plus Boa-style /tagall, /etagall, @all, @eall (Yumeko port).
 
 Auto-discovered by bot.loader as package `bot.modules.tagging`.
-setup(app) must live here so the top-level module exposes setup().
+setup() must live here so the top-level module exposes setup().
 
 Handler groups (see config.py for the full rationale):
     0   commands + tag:* callbacks + @all/@eall trigger
@@ -14,16 +14,14 @@ NEVER put join/leave handlers in group 0: this package loads
 alphabetically before `users`/`welcome` and would shadow them.
 """
 
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    ChatMemberHandler,
-    MessageHandler,
-    filters,
-)
+import re
 
-from bot.command_handler import COMMAND, CommandHandler
+from aiogram import F
+from aiogram.filters.logic import and_f
+
+from bot.command_handler import COMMAND, cmd
 from bot.logger import logger
+from bot.pipeline import GROUPS, SERVICE, on
 
 from . import database as tdb
 from .config import (
@@ -45,7 +43,7 @@ from .handler import (
 from .tagall import at_trigger, etagall_command, tagall_command
 
 
-def setup(app: Application) -> list[str]:
+def setup() -> list[str]:
     """Register tagging commands, callbacks and activity observers."""
     try:
         tdb.ensure_tables()
@@ -54,58 +52,46 @@ def setup(app: Application) -> list[str]:
         logger.warning(f"Tagging table init failed: {e}")
 
     # Commands + callbacks — default group 0 (no name collisions).
-    app.add_handler(CommandHandler("all", all_command))
-    app.add_handler(CommandHandler("tagabort", tagabort_command))
-    app.add_handler(CommandHandler("allsettings", allsettings_command))
-    app.add_handler(CommandHandler("tagstats", tagstats_command))
+    on("message", all_command, flt=cmd("all"))
+    on("message", tagabort_command, flt=cmd("tagabort"))
+    on("message", allsettings_command, flt=cmd("allsettings"))
+    on("message", tagstats_command, flt=cmd("tagstats"))
     # Boa-style tagall (Yumeko port): /cancel is boabot's stop command
     # and shares Pi's session — same handler as /tagabort.
-    app.add_handler(CommandHandler("tagall", tagall_command))
-    app.add_handler(CommandHandler("etagall", etagall_command))
-    app.add_handler(CommandHandler("cancel", tagabort_command))
-    app.add_handler(CallbackQueryHandler(tag_callback, pattern=r"^tag:"))
+    on("message", tagall_command, flt=cmd("tagall"))
+    on("message", etagall_command, flt=cmd("etagall"))
+    on("message", tagabort_command, flt=cmd("cancel"))
+    on("callback_query", tag_callback, flt=F.data.regexp(re.compile(r"^tag:")))
     # @all / @eall without a slash (boabot's second pattern). Regex is
     # narrow, so plain messages fall through to the other group-0
     # handlers exactly as before.
-    app.add_handler(
-        MessageHandler(
-            filters.Regex(r"^@(all|eall)(?:\s|$)") & filters.ChatType.GROUPS,
-            at_trigger,
-        )
+    on(
+        "message",
+        at_trigger,
+        flt=F.text.regexp(re.compile(r"^@(all|eall)(?:\s|$)")) & GROUPS,
     )
 
     # Message activity — own group so filters(1)/blocklist(2)/watch(3)
     # and analytics(7/13) keep their own matches (one handler per group).
-    app.add_handler(
-        MessageHandler(
-            filters.ChatType.GROUPS
-            & ~COMMAND
-            & ~filters.StatusUpdate.ALL,
-            activity_observer,
-        ),
+    on(
+        "message",
+        activity_observer,
         group=ACTIVITY_GROUP,
+        flt=and_f(GROUPS, ~COMMAND, ~SERVICE),
     )
 
     # Membership tracking — separate group (welcome uses 10, bind 11).
-    app.add_handler(
-        MessageHandler(
-            filters.StatusUpdate.NEW_CHAT_MEMBERS
-            | filters.StatusUpdate.LEFT_CHAT_MEMBER,
-            member_observer,
-        ),
+    on(
+        "message",
+        member_observer,
         group=MEMBER_GROUP,
+        flt=F.new_chat_members | F.left_chat_member,
     )
-    app.add_handler(
-        ChatMemberHandler(chat_member_observer, ChatMemberHandler.CHAT_MEMBER),
-        group=MEMBER_GROUP,
-    )
+    on("chat_member", chat_member_observer, group=MEMBER_GROUP)
 
     # Callback activity — catch-all in its own group (group 0 owns the
     # real tag: handling; this only records who pressed what).
-    app.add_handler(
-        CallbackQueryHandler(callback_activity_observer),
-        group=CALLBACK_ACTIVITY_GROUP,
-    )
+    on("callback_query", callback_activity_observer, group=CALLBACK_ACTIVITY_GROUP)
 
     # Optional MTROTO presence starts lazily: setup() runs before
     # run_polling creates the event loop, so handlers call

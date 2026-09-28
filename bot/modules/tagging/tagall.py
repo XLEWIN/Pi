@@ -27,11 +27,13 @@ import asyncio
 import random
 from html import escape
 
-from telegram import Update
-from telegram.ext import ContextTypes
+from aiogram import Bot
+from aiogram.exceptions import TelegramRetryAfter
+from aiogram.types import Message
 
 from bot.emojis import E, EMOJI_MAP
 from bot.logger import logger
+from bot.reply import reply_text
 from bot.responses import action_card, plain_error, plain_ok
 
 from . import (
@@ -45,7 +47,7 @@ from . import (
 )
 from .exceptions import AdminFetchError, NobodyToTagError, SessionCancelled
 from .presence import get_manager
-from .sender import _FloodExc, _SOFT_NET, failed_card, flood_seconds, nobody_card
+from .sender import _SOFT_NET, failed_card, flood_seconds, nobody_card
 from .utils import clean_display_name
 
 # Owner's custom emoji glyphs (unique, order-stable) for /etagall —
@@ -94,59 +96,57 @@ def parse_input(message) -> tuple[str, str]:
 
 # ── Commands ─────────────────────────────────────────────────────
 
-async def tagall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def tagall_command(message: Message, bot: Bot) -> None:
     """/tagall — mention everyone by name."""
-    await _start(update, context, emoji_mode=False)
+    await _start(message, bot, emoji_mode=False)
 
 
-async def etagall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def etagall_command(message: Message, bot: Bot) -> None:
     """/etagall — mention everyone with random custom emojis."""
-    await _start(update, context, emoji_mode=True)
+    await _start(message, bot, emoji_mode=True)
 
 
-async def at_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def at_trigger(message: Message, bot: Bot) -> None:
     """@all / @eall — same flows without a slash (boabot's second pattern)."""
-    msg = update.effective_message
-    if msg is None:
+    if not message:
         return
-    raw = (msg.text or "").strip()
+    raw = (message.text or "").strip()
     if not raw:
         return
     first = raw.split(None, 1)[0]
-    await _start(update, context, emoji_mode=(first == "@eall"))
+    await _start(message, bot, emoji_mode=(first == "@eall"))
 
 
-async def _start(update: Update, context: ContextTypes.DEFAULT_TYPE, *,
+async def _start(message: Message, bot: Bot, *,
                  emoji_mode: bool) -> None:
-    msg = update.effective_message
-    chat = update.effective_chat
-    user = update.effective_user
-    if msg is None or chat is None or user is None:
+    if message is None or message.chat is None or message.from_user is None:
         return
+    chat = message.chat
+    user = message.from_user
 
     if chat.type not in ("group", "supergroup"):
-        await msg.reply_text(plain_error(config.MSG_NOT_GROUP), parse_mode="HTML")
+        await reply_text(message, plain_error(config.MSG_NOT_GROUP), parse_mode="HTML")
         return
 
-    mode, text = parse_input(msg)
+    mode, text = parse_input(message)
     if mode == "one_arg":
-        await msg.reply_text(plain_error(config.MSG_TAGALL_ONE_ARG), parse_mode="HTML")
+        await reply_text(message, plain_error(config.MSG_TAGALL_ONE_ARG), parse_mode="HTML")
         return
     if mode == "no_input":
-        await msg.reply_text(plain_error(config.MSG_TAGALL_NO_INPUT), parse_mode="HTML")
+        await reply_text(message, plain_error(config.MSG_TAGALL_NO_INPUT), parse_mode="HTML")
         return
     if sess_mod.is_running(chat.id):
-        await msg.reply_text(plain_error(config.MSG_RUNNING), parse_mode="HTML")
+        await reply_text(message, plain_error(config.MSG_RUNNING), parse_mode="HTML")
         return
-    if not await permissions.is_admin(chat.id, user.id, context.bot):
-        await msg.reply_text(plain_error(config.MSG_NOT_ADMIN), parse_mode="HTML")
+    if not await permissions.is_admin(chat.id, user.id, bot):
+        await reply_text(message, plain_error(config.MSG_NOT_ADMIN), parse_mode="HTML")
         return
 
     # Authoritative admin exclusion — fetched fresh for every run.
     try:
-        admins = await permissions.admin_ids(chat.id, context.bot)
+        admins = await permissions.admin_ids(chat.id, bot)
     except AdminFetchError:
-        await msg.reply_text(plain_error(config.MSG_ADMIN_FETCH_FAIL), parse_mode="HTML")
+        await reply_text(message, plain_error(config.MSG_ADMIN_FETCH_FAIL), parse_mode="HTML")
         return
 
     # tagall is boabot's "everybody" flow: ignore the activity window
@@ -157,7 +157,7 @@ async def _start(update: Update, context: ContextTypes.DEFAULT_TYPE, *,
     st = settings_mod.get(chat.id).replace_(
         mode="all", window_hours=0, max_mentions=0, registry_mode="sync"
     )
-    source = msg.reply_to_message if mode == "reply" else msg
+    source = message.reply_to_message if mode == "reply" else message
 
     db_id = 0
     try:
@@ -169,7 +169,7 @@ async def _start(update: Update, context: ContextTypes.DEFAULT_TYPE, *,
             session_id=db_id,
             invoker_id=user.id,
             source_message=source,
-            status_message=msg,
+            status_message=message,
             settings=st,
             admin_ids=admins,
         )
@@ -180,7 +180,8 @@ async def _start(update: Update, context: ContextTypes.DEFAULT_TYPE, *,
                 tdb.finish_session(db_id, "failed", error="start")
             except Exception:
                 pass
-        await msg.reply_text(
+        await reply_text(
+            message,
             plain_error("Could not start tagging — try again."), parse_mode="HTML"
         )
         return
@@ -188,7 +189,7 @@ async def _start(update: Update, context: ContextTypes.DEFAULT_TYPE, *,
     session.task = asyncio.create_task(
         run(
             session,
-            context,
+            bot,
             text=text,
             reply_mode=(mode == "reply"),
             emoji_mode=emoji_mode,
@@ -198,7 +199,7 @@ async def _start(update: Update, context: ContextTypes.DEFAULT_TYPE, *,
 
 # ── Send helpers ─────────────────────────────────────────────────
 
-async def _send(context, s, text: str, *, reply_to_id: int = None) -> None:
+async def _send(bot, s, text: str, *, reply_to_id: int = None) -> None:
     """Flood-safe, cancel-aware send (boabot's plain send_message + Pi's rules)."""
     attempts = 0
     while True:
@@ -209,9 +210,9 @@ async def _send(context, s, text: str, *, reply_to_id: int = None) -> None:
                 kwargs["reply_to_message_id"] = reply_to_id
             elif s.thread_id:
                 kwargs["message_thread_id"] = s.thread_id
-            await context.bot.send_message(**kwargs)
+            await bot.send_message(**kwargs)
             return
-        except _FloodExc as e:
+        except TelegramRetryAfter as e:
             secs = flood_seconds(e)
             s.metrics.floodwaits += 1
             if secs > config.FLOOD_MAX:
@@ -230,7 +231,7 @@ async def _send(context, s, text: str, *, reply_to_id: int = None) -> None:
 async def _final_reply(s, text: str) -> None:
     """Terminal card as a fresh reply (never edits the invoker's message)."""
     try:
-        await s.status_message.reply_text(text, parse_mode="HTML")
+        await reply_text(s.status_message, text, parse_mode="HTML")
     except Exception as e:
         logger.warning(f"Tagall final reply failed chat={s.chat_id}: {e}")
 
@@ -274,7 +275,7 @@ def _registry_members(candidates, *, emoji_mode: bool):
 
 # ── Run loop ─────────────────────────────────────────────────────
 
-async def run(session, context, *, text: str = "", reply_mode: bool = False,
+async def run(session, bot, *, text: str = "", reply_mode: bool = False,
               emoji_mode: bool = False) -> None:
     """Execute one tagall session (always terminal-states itself).
 
@@ -331,7 +332,7 @@ async def run(session, context, *, text: str = "", reply_mode: bool = False,
             if safe_text and not reply_mode:
                 # Boabot: the provided text heads EVERY batch message.
                 body = f"{safe_text}\n{body}"
-            await _send(context, s, body, reply_to_id=reply_to_id)
+            await _send(bot, s, body, reply_to_id=reply_to_id)
             s.tagged += len(batch)
             s.metrics.record_send(len(batch))
             batch.clear()

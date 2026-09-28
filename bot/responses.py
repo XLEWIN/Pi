@@ -13,9 +13,10 @@ All HTML uses bot.emojis.E / custom <tg-emoji> — never stock foreign emoji.
 from __future__ import annotations
 
 from html import escape
-from typing import Any, Iterable, Optional, Sequence, Tuple, Union
+from typing import Any, Optional, Sequence, Tuple
 
 from bot.emojis import E
+from bot.reply import reply_text
 
 # (emoji_html, LABEL, value_html) — value already HTML-safe
 Field = Tuple[str, str, str]
@@ -195,7 +196,8 @@ def card_keyboard(user: Optional[UserLike] = None):
 
 async def reply_card(message, text: str, *, user: Optional[UserLike] = None):
     """Reply with a card body + its standard inline buttons."""
-    return await message.reply_text(
+    return await reply_text(
+        message,
         text,
         parse_mode="HTML",
         reply_markup=card_keyboard(user),

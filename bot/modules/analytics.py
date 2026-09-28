@@ -10,20 +10,16 @@ Tracking hooks (message hour + join/leave counters) run in low-priority groups.
 
 import asyncio
 import logging
-from datetime import date, timedelta
 from html import escape
-from typing import Optional
 
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from aiogram import Bot, F
+from aiogram.enums import ParseMode
+from aiogram.filters.logic import and_f
+from aiogram.types import Message
 
-from bot.command_handler import COMMAND, CommandHandler
+from bot.command_handler import COMMAND
+from bot.pipeline import GROUPS, SERVICE, cmd, on
+from bot.reply import reply_text
 from bot.database import db
 from bot.emojis import E
 from bot.responses import action_card, field_extra
@@ -34,10 +30,10 @@ logger = logging.getLogger(__name__)
 _PERIOD_DAYS = {"day": 1, "today": 1, "week": 7, "month": 30}
 
 
-async def _is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+async def _is_admin(message: Message, bot: Bot) -> bool:
     try:
-        member = await context.bot.get_chat_member(
-            update.effective_chat.id, update.effective_user.id
+        member = await bot.get_chat_member(
+            message.chat.id, message.from_user.id
         )
         return member.status in ("administrator", "creator")
     except Exception:
@@ -63,17 +59,17 @@ def _resolve_days(args, default: int = 1) -> int:
 # ── Tracking ────────────────────────────────────────────
 
 async def track_message_analytics(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+    message: Message
 ) -> None:
     """Increment daily + hourly message counters (off the hot path)."""
-    if not update.message or update.effective_chat.type == "private":
+    if not message or message.chat.type == "private":
         return
-    user = update.effective_user
+    user = message.from_user
     if not user or user.is_bot:
         return
 
-    chat_id = update.effective_chat.id
-    hour = update.message.date.hour if update.message.date else 0
+    chat_id = message.chat.id
+    hour = message.date.hour if message.date else 0
 
     def _db() -> None:
         try:
@@ -87,14 +83,14 @@ async def track_message_analytics(
 
 
 async def track_join(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+    message: Message, bot: Bot
 ) -> None:
-    if not update.message or not update.message.new_chat_members:
+    if not message or not message.new_chat_members:
         return
-    if update.effective_chat.type == "private":
+    if message.chat.type == "private":
         return
-    chat_id = update.effective_chat.id
-    n = sum(1 for m in update.message.new_chat_members if not m.is_bot and m.id != context.bot.id)
+    chat_id = message.chat.id
+    n = sum(1 for m in message.new_chat_members if not m.is_bot and m.id != bot.id)
     if n <= 0:
         return
 
@@ -109,16 +105,16 @@ async def track_join(
 
 
 async def track_leave(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+    message: Message, bot: Bot
 ) -> None:
-    if not update.message or not update.message.left_chat_member:
+    if not message or not message.left_chat_member:
         return
-    if update.effective_chat.type == "private":
+    if message.chat.type == "private":
         return
-    user = update.message.left_chat_member
-    if user.is_bot or user.id == context.bot.id:
+    user = message.left_chat_member
+    if user.is_bot or user.id == bot.id:
         return
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
 
     def _db() -> None:
         try:
@@ -132,23 +128,23 @@ async def track_leave(
 
 # ── Commands ────────────────────────────────────────────
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stats_command(message: Message, bot: Bot, args: list):
     """/stats — full analytics dashboard for this chat."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(
+    if message.chat.type == "private":
+        await reply_text(message,
             f"{E.INFO} This command only works in groups.", parse_mode=ParseMode.HTML
         )
         return
-    if not await _is_admin(update, context):
-        await update.message.reply_text(
+    if not await _is_admin(message, bot):
+        await reply_text(message,
             f"{E.ERROR} Only admins can view analytics.", parse_mode=ParseMode.HTML
         )
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     period = "day"
-    if context.args and context.args[0].lower() in _PERIOD_DAYS:
-        period = context.args[0].lower()
+    if args and args[0].lower() in _PERIOD_DAYS:
+        period = args[0].lower()
     days = _PERIOD_DAYS.get(period, 1)
 
     stats = db.get_daily_stats(chat_id, days=days)
@@ -189,25 +185,25 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         field_extra(E.WEB, "Bind Fails", str(stats.get("bind_fails", 0))),
     ]
     text = action_card("Analytics Dashboard", fields, icon=E.SETTINGS)
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    await reply_text(message, text, parse_mode=ParseMode.HTML)
 
 
-async def topactive_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(
+async def topactive_command(message: Message, bot: Bot, args: list):
+    if message.chat.type == "private":
+        await reply_text(message,
             f"{E.INFO} This command only works in groups.", parse_mode=ParseMode.HTML
         )
         return
-    if not await _is_admin(update, context):
-        await update.message.reply_text(
+    if not await _is_admin(message, bot):
+        await reply_text(message,
             f"{E.ERROR} Only admins can view analytics.", parse_mode=ParseMode.HTML
         )
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     period = "week"
-    if context.args and context.args[0].lower() in _PERIOD_DAYS:
-        period = context.args[0].lower()
+    if args and args[0].lower() in _PERIOD_DAYS:
+        period = args[0].lower()
 
     # Same IST windows as /rankings: day = today, week = Monday,
     # month = calendar month (all refresh on IST boundaries).
@@ -222,7 +218,7 @@ async def topactive_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.get_period_top, chat_id, since=since, limit=10
     )
     if not top:
-        await update.message.reply_text(
+        await reply_text(message,
             f"{E.INFO} No activity recorded yet.", parse_mode=ParseMode.HTML
         )
         return
@@ -234,32 +230,32 @@ async def topactive_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         medal = medals[i] if i < 3 else f"{i+1}."
         total = int(entry.get("total_messages") or 0)
         lines.append(f"{medal} <b>{escape(str(name))}</b> — {_fmt(total)}")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    await reply_text(message, "\n".join(lines), parse_mode=ParseMode.HTML)
 
 
-async def peakhours_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(
+async def peakhours_command(message: Message, bot: Bot, args: list):
+    if message.chat.type == "private":
+        await reply_text(message,
             f"{E.INFO} This command only works in groups.", parse_mode=ParseMode.HTML
         )
         return
-    if not await _is_admin(update, context):
-        await update.message.reply_text(
+    if not await _is_admin(message, bot):
+        await reply_text(message,
             f"{E.ERROR} Only admins can view analytics.", parse_mode=ParseMode.HTML
         )
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     days = 7
-    if context.args:
+    if args:
         try:
-            days = max(1, min(90, int(context.args[0])))
+            days = max(1, min(90, int(args[0])))
         except ValueError:
             pass
 
     peaks = db.get_peak_hours(chat_id, days=days, limit=5)
     if not peaks:
-        await update.message.reply_text(
+        await reply_text(message,
             f"{E.INFO} No hourly data yet.", parse_mode=ParseMode.HTML
         )
         return
@@ -269,41 +265,38 @@ async def peakhours_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         h = int(p["hour"])
         medal = [E.MEDAL_1, E.MEDAL_2, E.MEDAL_3][i] if i < 3 else f"{i+1}."
         lines.append(f"{medal} <code>{h:02d}:00</code> — {_fmt(int(p['messages']))} msgs")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    await reply_text(message, "\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 # ── Setup ───────────────────────────────────────────────
 
-def setup(app: Application) -> list:
-    group_filter = filters.ChatType.GROUPS
+def setup() -> list:
+    group_filter = GROUPS
 
-    app.add_handler(CommandHandler("stats", stats_command, filters=group_filter))
-    app.add_handler(CommandHandler("analytics", stats_command, filters=group_filter))
-    app.add_handler(CommandHandler("topactive", topactive_command, filters=group_filter))
-    app.add_handler(CommandHandler("peakhours", peakhours_command, filters=group_filter))
+    on("message", stats_command, flt=and_f(cmd("stats"), group_filter))
+    on("message", stats_command, flt=and_f(cmd("analytics"), group_filter))
+    on("message", topactive_command, flt=and_f(cmd("topactive"), group_filter))
+    on("message", peakhours_command, flt=and_f(cmd("peakhours"), group_filter))
 
     # Message hour counter — after leveling(5)/security(6) → group 7.
-    app.add_handler(
-        MessageHandler(
-            group_filter & ~COMMAND & ~filters.StatusUpdate.ALL,
-            track_message_analytics,
-        ),
+    on(
+        "message",
+        track_message_analytics,
         group=7,
+        flt=and_f(group_filter, ~COMMAND, ~SERVICE),
     )
     # Join/leave — after security joins(12) → group 13.
-    app.add_handler(
-        MessageHandler(
-            group_filter & filters.StatusUpdate.NEW_CHAT_MEMBERS,
-            track_join,
-        ),
+    on(
+        "message",
+        track_join,
         group=13,
+        flt=group_filter & F.new_chat_members,
     )
-    app.add_handler(
-        MessageHandler(
-            group_filter & filters.StatusUpdate.LEFT_CHAT_MEMBER,
-            track_leave,
-        ),
+    on(
+        "message",
+        track_leave,
         group=13,
+        flt=group_filter & F.left_chat_member,
     )
 
     return ["/stats", "/analytics", "/topactive", "/peakhours", "trackers"]

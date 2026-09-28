@@ -17,6 +17,7 @@ No network: handlers run against fakes that record replies.
 
 from __future__ import annotations
 
+import asyncio
 import atexit
 import os
 import shutil
@@ -37,6 +38,10 @@ os.environ["LOCALAPPDATA"] = _TEST_DIR
 atexit.register(shutil.rmtree, _TEST_DIR, ignore_errors=True)
 
 # ── Imports (after env) ───────────────────────────────────────────
+from aiogram.dispatcher.event.handler import FilterObject, HandlerObject  # noqa: E402
+
+from aiofakes import call, make_callback, make_message  # noqa: E402
+from bot import pipeline  # noqa: E402
 from bot.constants import (  # noqa: E402
     CHAT_RANK_MESSAGES,
     GLOBAL_RANK_MESSAGES,
@@ -89,41 +94,22 @@ def _seed(chat_id: int, user_id: int, n: int, day: str = TODAY) -> None:
     )
 
 
-class _Msg:
-    """Command message — records reply_text/reply_photo calls."""
-
-    def __init__(self, text: str = "/rank") -> None:
-        self.text = text
-        self.reply_to_message = None
-        self.replies: list = []
-
-    async def reply_text(self, text, **kw):
-        self.replies.append({"text": text, **kw})
-        return SimpleNamespace(message_id=1)
-
-    async def reply_photo(self, photo=None, **kw):
-        self.replies.append({"photo": photo, **kw})
-        return SimpleNamespace(message_id=1)
-
-    async def delete(self):
-        return None
-
-    @property
-    def last(self):
-        return self.replies[-1] if self.replies else None
-
-
-def _update(msg: _Msg, *, chat_id: int = CHAT, chat_type: str = "supergroup",
-            user_id: int = U1, first_name: str = "U1"):
-    chat = SimpleNamespace(id=chat_id, type=chat_type, title="Rank Group")
-    user = SimpleNamespace(
-        id=user_id, is_bot=False, first_name=first_name,
-        username=None, last_name=None,
+def _msg(text: str = "/rank", *, chat_id: int = CHAT,
+         chat_type: str = "supergroup", user_id: int = U1,
+         first_name: str = "U1", username=None, **kw):
+    """Command message — bot.reply helpers record into .calls as
+    ("reply", …) in group chats and ("answer", …) in private."""
+    msg = make_message(
+        text, chat_id=chat_id, chat_type=chat_type, title="Rank Group",
+        user_id=user_id, first_name=first_name, username=username, **kw,
     )
-    return SimpleNamespace(
-        message=msg, effective_message=msg, effective_chat=chat,
-        effective_user=user,
-    )
+    msg.from_user.last_name = None   # count_message registers the profile
+    return msg
+
+
+def _edits(msg):
+    """[{"text", **kw}] for every ("edit_text", …) record on msg."""
+    return [{"text": t, **kw} for (k, t, kw) in msg.calls if k == "edit_text"]
 
 
 class _Base(unittest.TestCase):
@@ -342,30 +328,31 @@ class TestCombinedAnnouncement(unittest.IsolatedAsyncioTestCase):
 
     async def test_milestone_and_rank_up_share_one_reply(self):
         _seed(CHAT, U1, 99)
-        msg = _Msg("the hundredth")
-        await cs.count_message(_update(msg), None)
+        msg = _msg("the hundredth")
+        await call(cs.count_message, msg)
 
-        self.assertEqual(len(msg.replies), 1, "one reply, not two")
-        text = msg.last["text"]
+        self.assertEqual(len(msg.sent_texts), 1, "one reply, not two")
+        self.assertEqual(msg.last[0], "reply")
+        text = msg.last[1]
         self.assertIn("Rank 2", text)                       # rank-up line
         self.assertIn("100 messages reached today!", text)   # milestone
-        self.assertEqual(msg.last.get("parse_mode"), "HTML")
+        self.assertEqual(msg.last[2].get("parse_mode"), "HTML")
 
     async def test_rank_up_only_no_milestone(self):
         _seed(CHAT, U1, 199)
-        msg = _Msg("two hundredth")
-        await cs.count_message(_update(msg), None)
+        msg = _msg("two hundredth")
+        await call(cs.count_message, msg)
 
-        self.assertEqual(len(msg.replies), 1)
-        text = msg.last["text"]
+        self.assertEqual(len(msg.sent_texts), 1)
+        text = msg.last[1]
         self.assertIn("Rank 3", text)  # 200//100 + 1
         self.assertNotIn("messages reached today", text)
 
     async def test_quiet_message_stays_silent(self):
         _seed(CHAT, U1, 151)
-        msg = _Msg("quiet")
-        await cs.count_message(_update(msg), None)
-        self.assertEqual(msg.replies, [])
+        msg = _msg("quiet")
+        await call(cs.count_message, msg)
+        self.assertEqual(msg.sent_texts, [])
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -381,10 +368,10 @@ class TestNextLevelCommand(unittest.IsolatedAsyncioTestCase):
 
     async def test_group_shows_both_ladders(self):
         _seed(CHAT, U1, 180)
-        msg = _Msg("/nextlevel")
-        await leveling.nextlevel_command(_update(msg), None)
+        msg = _msg("/nextlevel")
+        await call(leveling.nextlevel_command, msg)
 
-        text = msg.last["text"]
+        text = msg.last[1]
         self.assertIn("Rank Progress", text)
         # Chat ladder: 180//100+1 = 2 → 3, 20 msgs to go, 80/100 bar
         self.assertIn("Chat: <b>Rank 2 → 3</b>", text)
@@ -401,26 +388,25 @@ class TestNextLevelCommand(unittest.IsolatedAsyncioTestCase):
 
     async def test_dm_shows_global_only(self):
         _seed(CHAT2, U1, 250)
-        msg = _Msg("/nextlevel")
-        upd = _update(msg, chat_type="private", chat_id=U1)
-        await leveling.nextlevel_command(upd, None)
+        msg = _msg("/nextlevel", chat_type="private", chat_id=U1)
+        await call(leveling.nextlevel_command, msg)
 
-        text = msg.last["text"]
+        text = msg.last[1]
         self.assertIn("Global: <b>Rank 2 → 3</b>", text)
         self.assertNotIn("Chat:", text)
         self.assertIn("chat rank counts per group", text)
 
     async def test_reply_carries_colored_nextlevel_button(self):
-        msg = _Msg("/nextlevel")
-        await leveling.nextlevel_command(_update(msg), None)
+        msg = _msg("/nextlevel")
+        await call(leveling.nextlevel_command, msg)
 
-        markup = msg.last.get("reply_markup")
+        markup = msg.last[2].get("reply_markup")
         self.assertIsNotNone(markup, "button must be attached")
         btn = markup.inline_keyboard[0][0]
         self.assertEqual(btn.text, "My Next Level")
         self.assertEqual(btn.callback_data, "nextlevel:me")
-        self.assertEqual(btn.api_kwargs.get("style"), "primary")
-        self.assertEqual(btn.api_kwargs.get("icon_custom_emoji_id"), EID.FIRE)
+        self.assertEqual(btn.style, "primary")
+        self.assertEqual(btn.icon_custom_emoji_id, EID.FIRE)
 
 
 class TestLeaderboardCommand(unittest.IsolatedAsyncioTestCase):
@@ -433,10 +419,10 @@ class TestLeaderboardCommand(unittest.IsolatedAsyncioTestCase):
     async def test_lines_match_rankings_counts(self):
         _seed(CHAT, U1, 200)
         _seed(CHAT, U2, 150)
-        msg = _Msg("/leaderboard")
-        await leveling.leaderboard_command(_update(msg), None)
+        msg = _msg("/leaderboard")
+        await call(leveling.leaderboard_command, msg)
 
-        lines = msg.last["text"].splitlines()
+        lines = msg.last[1].splitlines()
         ranked = [ln for ln in lines if "msgs" in ln]
         self.assertEqual(len(ranked), 2)
         self.assertIn("Rank 3 · 200 msgs", ranked[0])
@@ -541,11 +527,10 @@ class TestProfileCommand(unittest.IsolatedAsyncioTestCase):
         from bot.modules import profile as profile_mod
 
         _seed(CHAT, U1, 150)
-        msg = _Msg("/profile")
-        ctx = SimpleNamespace(args=[], bot=_InfoBot())
-        await profile_mod.profile_command(_update(msg), ctx)
+        msg = _msg("/profile")
+        await call(profile_mod.profile_command, msg, bot=_InfoBot(), args=[])
 
-        text = msg.last["text"]
+        text = msg.last[1]
         self.assertIn("User Profile", text)
         self.assertIn("Reputation:", text)
         self.assertIn("Messages:", text)
@@ -557,12 +542,10 @@ class TestProfileCommand(unittest.IsolatedAsyncioTestCase):
         from bot.modules import profile as profile_mod
 
         _seed(CHAT, U1, 150)
-        msg = _Msg("/profile")
-        ctx = SimpleNamespace(args=[], bot=_InfoBot())
-        upd = _update(msg, chat_type="private", chat_id=U1)
-        await profile_mod.profile_command(upd, ctx)
+        msg = _msg("/profile", chat_type="private", chat_id=U1)
+        await call(profile_mod.profile_command, msg, bot=_InfoBot(), args=[])
 
-        text = msg.last["text"]
+        text = msg.last[1]
         self.assertNotIn("Chat Rank:", text)
         self.assertIn("Global Rank:", text)
 
@@ -585,21 +568,18 @@ class TestRankCardCaption(unittest.TestCase):
 
 class TestSeeRankButton(unittest.TestCase):
     def test_deep_link_opens_dm_and_starts_bot(self):
-        ctx = SimpleNamespace(
-            bot_data={"username": "PiModulerBot"}, bot=None
+        markup = leveling._see_rank_keyboard(
+            None, {"username": "PiModulerBot"}
         )
-        markup = leveling._see_rank_keyboard(ctx)
         btn = markup.inline_keyboard[0][0]
         self.assertEqual(btn.text, "See Your Rank")
         self.assertEqual(btn.url, "https://t.me/PiModulerBot?start=rank")
-        self.assertEqual(btn.api_kwargs.get("style"), "primary")
-        self.assertEqual(btn.api_kwargs.get("icon_custom_emoji_id"), EID.CROWN)
+        self.assertEqual(btn.style, "primary")
+        self.assertEqual(btn.icon_custom_emoji_id, EID.CROWN)
 
     def test_username_falls_back_to_bot(self):
-        ctx = SimpleNamespace(
-            bot_data={}, bot=SimpleNamespace(username="FallbackBot")
-        )
-        markup = leveling._see_rank_keyboard(ctx)
+        bot = SimpleNamespace(username="FallbackBot")
+        markup = leveling._see_rank_keyboard(bot, {})
         self.assertIn("t.me/FallbackBot", markup.inline_keyboard[0][0].url)
 
 
@@ -621,65 +601,68 @@ class TestNextLevelButton(unittest.IsolatedAsyncioTestCase):
         _cleanup()
 
     def _click(self, *, chat_id: int = CHAT, chat_type: str = "supergroup"):
-        original = _Msg()          # the bot message the button sits on
-        original.chat = SimpleNamespace(id=chat_id, type=chat_type)
+        original = _msg(            # the bot message the button sits on
+            "/nextlevel", chat_id=chat_id, chat_type=chat_type
+        )
         query = SimpleNamespace(
             message=original,
             from_user=SimpleNamespace(id=U1, first_name="U1"),
             answered=False,
         )
 
-        async def _answer():
+        async def _answer(*a, **kw):
             query.answered = True
 
         query.answer = _answer
-        update = SimpleNamespace(callback_query=query)
-        return update, query, original
+        return query, original
 
     async def test_click_replies_with_fresh_group_card(self):
         _seed(CHAT, U1, 180)
-        update, query, original = self._click()
-        await leveling.nextlevel_callback(update, None)
+        query, original = self._click()
+        await call(leveling.nextlevel_callback, query)
 
         self.assertTrue(query.answered)
-        self.assertEqual(len(original.replies), 1)
-        reply = original.replies[0]
-        self.assertIn("Rank Progress", reply["text"])
-        self.assertIn("Chat: <b>Rank 2 → 3</b>", reply["text"])
-        markup = reply.get("reply_markup")
+        self.assertEqual(len(original.sent_texts), 1)
+        reply = original.last[1]
+        self.assertIn("Rank Progress", reply)
+        self.assertIn("Chat: <b>Rank 2 → 3</b>", reply)
+        markup = original.last[2].get("reply_markup")
         self.assertEqual(markup.inline_keyboard[0][0].callback_data,
                          "nextlevel:me")
 
     async def test_click_in_dm_shows_global_only(self):
         _seed(CHAT2, U1, 250)
-        update, query, original = self._click(
+        query, original = self._click(
             chat_id=U1, chat_type="private"
         )
-        await leveling.nextlevel_callback(update, None)
+        await call(leveling.nextlevel_callback, query)
 
-        text = original.replies[0]["text"]
+        text = original.last[1]
         self.assertIn("Global: <b>Rank 2 → 3</b>", text)
         self.assertNotIn("Chat:", text)
 
 
 class TestLevelingWiring(unittest.TestCase):
     def test_nextlevel_callback_registered_with_pattern(self):
-        handlers = []
-        app = SimpleNamespace(
-            add_handler=lambda h, group=0: handlers.append(h)
-        )
-        leveling.setup(app)
+        pipeline.clear()
+        leveling.setup()
 
-        matches = [
-            h for h in handlers
-            if getattr(h, "callback", None) is leveling.nextlevel_callback
+        entries = [
+            e for e in pipeline.snapshot()
+            if e.fn is leveling.nextlevel_callback
         ]
-        self.assertEqual(len(matches), 1, "button handler must be registered")
-        pattern = matches[0].pattern
-        self.assertIsNotNone(pattern)
-        self.assertTrue(pattern.search("nextlevel:me"))
-        self.assertIsNone(pattern.search("nextlevel:other"))
-        self.assertIsNone(pattern.search("info:me"))
+        self.assertEqual(len(entries), 1, "button handler must be registered")
+
+        def matches(data):
+            handler = HandlerObject(
+                callback=entries[0].fn, filters=[FilterObject(entries[0].flt)]
+            )
+            ok, _ = asyncio.run(handler.check(make_callback(data)))
+            return ok
+
+        self.assertTrue(matches("nextlevel:me"))
+        self.assertFalse(matches("nextlevel:other"))
+        self.assertFalse(matches("info:me"))
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -716,40 +699,38 @@ class TestTemplateCommand(unittest.IsolatedAsyncioTestCase):
         from bot.modules import template as template_mod
 
         _seed(CHAT, U1, 150)
-        msg = _Msg("/template")
-        upd = _update(msg, chat_type="private", chat_id=U1)
-        await template_mod.template_command(upd, None)
+        msg = _msg("/template", chat_type="private", chat_id=U1)
+        await call(template_mod.template_command, msg)
 
-        text = msg.last["text"]
+        text = msg.last[1]
         self.assertIn("Rank Templates", text)
         self.assertIn("Active:", text)             # current selection
         self.assertIn("1. NEON CYBERPUNK", text)
         self.assertIn("6. PIRATE", text)
         self.assertIn("Usage:", text)
         self.assertIn("/template &lt;number&gt;", text)
-        self.assertNotIn("photo", msg.last, "/template must not send a picture")
+        self.assertNotIn("photo", msg.last[2],
+                         "/template must not send a picture")
 
-        markup = msg.last["reply_markup"]
+        markup = msg.last[2]["reply_markup"]
         flat = [b for row in markup.inline_keyboard for b in row]
         self.assertEqual(len(flat), 6)
         self.assertEqual(flat[0].callback_data, "template:1")
-        self.assertEqual(flat[0].api_kwargs.get("style"), "primary")
-        self.assertEqual(flat[1].api_kwargs.get("style"), "success")
-        self.assertEqual(flat[2].api_kwargs.get("style"), "danger")
+        self.assertEqual(flat[0].style, "primary")
+        self.assertEqual(flat[1].style, "success")
+        self.assertEqual(flat[2].style, "danger")
         for btn in flat:
-            self.assertEqual(btn.api_kwargs.get("icon_custom_emoji_id"),
-                             EID.SPARKLE)
+            self.assertEqual(btn.icon_custom_emoji_id, EID.SPARKLE)
 
     async def test_group_is_redirected_to_dm(self):
         from bot.modules import template as template_mod
 
-        msg = _Msg("/template")
-        upd = _update(msg, chat_type="supergroup", chat_id=CHAT)
-        await template_mod.template_command(upd, None)
+        msg = _msg("/template", chat_type="supergroup", chat_id=CHAT)
+        await call(template_mod.template_command, msg)
 
-        text = msg.last["text"]
+        text = msg.last[1]
         self.assertIn("DM", text)
-        self.assertNotIn("photo", msg.last)
+        self.assertNotIn("photo", msg.last[2])
 
 
 class TestTemplateCallback(unittest.IsolatedAsyncioTestCase):
@@ -763,30 +744,17 @@ class TestTemplateCallback(unittest.IsolatedAsyncioTestCase):
     async def test_selection_sets_template_and_styled_caption(self):
         from bot.modules import template as template_mod
 
-        edited = {}
-        answered = {}
-
-        async def _answer(text=None, show_alert=False):
-            answered["text"] = text
-
-        async def _edit(text=None, parse_mode=None):
-            edited["text"] = text
-
-        query = SimpleNamespace(
-            data="template:3",
-            from_user=SimpleNamespace(id=U1, first_name="U1"),
-            answer=_answer,
-            edit_message_text=_edit,
-        )
-        await template_mod.template_callback(
-            SimpleNamespace(callback_query=query), None
-        )
+        msg = _msg("original")
+        query = make_callback("template:3", message=msg, user_id=U1)
+        await call(template_mod.template_callback, query)
 
         self.assertEqual(db.get_user_rank_info(U1)["template"], 3)
-        self.assertIn("ICE FANTASY", answered["text"] or "")
-        self.assertIn("Template Selected", edited["text"])
-        self.assertIn("ICE FANTASY", edited["text"])
-        self.assertIn("Change anytime with /template", edited["text"])
+        self.assertIn("ICE FANTASY", query.answers[0]["text"] or "")
+        edits = _edits(msg)
+        self.assertEqual(len(edits), 1, "stale-tap-safe edit must be sent")
+        self.assertIn("Template Selected", edits[0]["text"])
+        self.assertIn("ICE FANTASY", edits[0]["text"])
+        self.assertIn("Change anytime with /template", edits[0]["text"])
 
 
 if __name__ == "__main__":

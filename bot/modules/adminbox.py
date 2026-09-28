@@ -35,22 +35,19 @@ recent message ids for /purge and consumes waiting-input text.
 
 from __future__ import annotations
 
+import re
 import time
 from collections import deque
 from html import escape
 
-from telegram import InlineKeyboardButton, Update
-from telegram.constants import ParseMode
-from telegram.error import TelegramError
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from aiogram import Bot, F
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramAPIError
+from aiogram.types import CallbackQuery, CopyTextButton, InlineKeyboardButton, Message
 
-from bot.command_handler import COMMAND, CommandHandler, parse_command
+from bot.command_handler import parse_command
+from bot.pipeline import cmd, on
+from bot.reply import reply_text
 from bot.emojis import E, EID
 from bot.keyboards.colored import (
     btn_danger,
@@ -163,7 +160,7 @@ def _member_label(member) -> str:
 async def _member(bot, chat_id: int, user_id: int):
     try:
         return await bot.get_chat_member(chat_id, user_id)
-    except TelegramError:
+    except TelegramAPIError:
         return None
 
 
@@ -175,16 +172,16 @@ async def _is_admin(bot, chat_id: int, user_id: int) -> bool:
 async def _answer(query, text: str | None = None, *, alert: bool = False) -> None:
     try:
         await query.answer(text or "", show_alert=alert)
-    except TelegramError:
+    except TelegramAPIError:
         pass
 
 
 async def _edit(query, text: str, markup=None) -> None:
     try:
-        await query.edit_message_text(
+        await query.message.edit_text(
             text, parse_mode=ParseMode.HTML, reply_markup=markup
         )
-    except TelegramError:
+    except TelegramAPIError:
         pass  # "message is not modified" and stale-tap races are fine
 
 
@@ -206,13 +203,13 @@ def _data(button) -> str:
 
 # ── Waiting-input state (chat_data, per pressing admin) ──────────
 
-def _wait_map(context) -> dict:
-    return context.chat_data.setdefault("abox_wait", {})
+def _wait_map(chat_data: dict) -> dict:
+    return chat_data.setdefault("abox_wait", {})
 
 
-def _set_waiting(context, user_id: int, action: str, mid: int,
+def _set_waiting(chat_data: dict, user_id: int, action: str, mid: int,
                  panel_mid: int) -> None:
-    _wait_map(context)[user_id] = {
+    _wait_map(chat_data)[user_id] = {
         "action": action,
         "mid": mid,
         "panel_mid": panel_mid,
@@ -220,8 +217,8 @@ def _set_waiting(context, user_id: int, action: str, mid: int,
     }
 
 
-def _pop_waiting(context, user_id: int) -> dict | None:
-    return _wait_map(context).pop(user_id, None)
+def _pop_waiting(chat_data: dict, user_id: int) -> dict | None:
+    return _wait_map(chat_data).pop(user_id, None)
 
 
 # ── Main panel ───────────────────────────────────────────────────
@@ -261,23 +258,21 @@ async def _render_main(bot, chat_id: int, user_id: int, mid: int):
     try:
         full = await bot.get_chat(chat_id)
         title = getattr(full, "title", None) or title
-    except TelegramError:
+    except TelegramAPIError:
         pass
 
     try:
         members = f"{await bot.get_chat_member_count(chat_id):,}"
-    except TelegramError:
+    except TelegramAPIError:
         members = "—"
 
-    owner = None
     try:
         admins = await bot.get_chat_administrators(chat_id)
         admin_n = len(admins)
         for entry in admins:
             if getattr(entry, "status", None) == "creator":
-                owner = entry
                 break
-    except TelegramError:
+    except TelegramAPIError:
         admin_n = 0
 
     you = await _member(bot, chat_id, user_id)
@@ -309,7 +304,7 @@ async def _render_main(bot, chat_id: int, user_id: int, mid: int):
 async def _view_admins(query, bot, chat_id: int, mid: int) -> None:
     try:
         admins = await bot.get_chat_administrators(chat_id)
-    except TelegramError:
+    except TelegramAPIError:
         admins = []
 
     rows: list[list[InlineKeyboardButton]] = []
@@ -406,7 +401,7 @@ async def _do_demote(query, bot, chat_id: int, presser_id: int,
             can_manage_video_chats=False,
             can_manage_topics=False,
         )
-    except TelegramError as exc:
+    except TelegramAPIError as exc:
         await _answer(
             query, f"Could not demote: {str(exc)[:120]}", alert=True
         )
@@ -420,9 +415,9 @@ async def _do_demote(query, bot, chat_id: int, presser_id: int,
 
 def _copy_btn(link: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(
-        "Copy Link",
+        text="Copy Link",
         callback_data=f"{CB}:noop",
-        api_kwargs={"copy_text": {"text": link}},
+        copy_text=CopyTextButton(text=link),
     )
 
 
@@ -431,7 +426,7 @@ async def _view_invite(query, bot, chat_id: int, mid: int) -> None:
     try:
         full = await bot.get_chat(chat_id)
         link = getattr(full, "invite_link", None)
-    except TelegramError:
+    except TelegramAPIError:
         pass
 
     link_value = f"<code>{escape(link)}</code>" if link else f"{E.INFO} None yet — tap Generate New"
@@ -463,7 +458,7 @@ async def _gen_invite(query, bot, chat_id: int, mid: int, *, request: bool) -> N
             )
         else:
             resp = await bot.create_chat_invite_link(chat_id, name="Admin Panel")
-    except TelegramError as exc:
+    except TelegramAPIError as exc:
         await _answer(query, f"Could not create link: {str(exc)[:120]}", alert=True)
         return
 
@@ -513,11 +508,11 @@ async def _view_info(query, bot, chat_id: int, mid: int) -> None:
     try:
         full = await bot.get_chat(chat_id)
         title = getattr(full, "title", None) or title
-    except TelegramError:
+    except TelegramAPIError:
         pass
     try:
         members = f"{await bot.get_chat_member_count(chat_id):,}"
-    except TelegramError:
+    except TelegramAPIError:
         members = "—"
 
     owner_name = "—"
@@ -529,7 +524,7 @@ async def _view_info(query, bot, chat_id: int, mid: int) -> None:
             if getattr(entry, "status", None) == "creator":
                 owner_name = _plain_name(getattr(entry, "user", None))
                 break
-    except TelegramError:
+    except TelegramAPIError:
         pass
 
     text = action_card(
@@ -651,7 +646,7 @@ async def _reply_op(query, bot, chat_id: int, action: str, target: int) -> None:
         else:  # del
             await bot.delete_message(chat_id, target)
             await _answer(query, "Message deleted.")
-    except TelegramError as exc:
+    except TelegramAPIError as exc:
         await _answer(query, str(exc)[:140], alert=True)
 
 
@@ -663,7 +658,7 @@ async def _do_purge(query, bot, chat_id: int, chat_data: dict) -> None:
         return
     try:
         await bot.delete_messages(chat_id, ids)
-    except TelegramError as exc:
+    except TelegramAPIError as exc:
         await _answer(query, str(exc)[:140], alert=True)
         return
     await _answer(query, f"Deleted {len(ids)} recent message(s).")
@@ -683,7 +678,7 @@ async def _view_settings(query, bot, chat_id: int, mid: int) -> None:
     full = None
     try:
         full = await bot.get_chat(chat_id)
-    except TelegramError:
+    except TelegramAPIError:
         pass
 
     slow = _slow_label(getattr(full, "slow_mode_delay", None))
@@ -724,7 +719,7 @@ async def _view_dperms(query, bot, chat_id: int, mid: int) -> None:
     try:
         full = await bot.get_chat(chat_id)
         perms = getattr(full, "permissions", None)
-    except TelegramError:
+    except TelegramAPIError:
         pass
 
     if perms is None:
@@ -778,30 +773,29 @@ async def _revert_panel(bot, chat_id: int, panel_mid: int,
             parse_mode=ParseMode.HTML,
             reply_markup=markup,
         )
-    except TelegramError:
+    except TelegramAPIError:
         pass
 
 
-async def _run_waiting(update: Update, context: ContextTypes.DEFAULT_TYPE,
+async def _run_waiting(message: Message, bot: Bot, chat_data: dict,
                        entry: dict, text: str) -> None:
     """Consume waiting input: set name / bio, or broadcast."""
-    message = update.message
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     action = entry["action"]
-    uid = update.effective_user.id
+    uid = message.from_user.id
 
     if action == "name":
         title = text.strip()
         if not (1 <= len(title) <= 128):
-            await message.reply_text(
+            await reply_text(message,
                 error_card("Group Name", "Name must be 1–128 characters."),
                 parse_mode=ParseMode.HTML,
             )
             return  # keep waiting — let them retry
         try:
-            await context.bot.set_chat_title(chat_id, title)
-        except TelegramError as exc:
-            await message.reply_text(
+            await bot.set_chat_title(chat_id, title)
+        except TelegramAPIError as exc:
+            await reply_text(message,
                 error_card("Group Name", str(exc)[:150]),
                 parse_mode=ParseMode.HTML,
             )
@@ -817,15 +811,15 @@ async def _run_waiting(update: Update, context: ContextTypes.DEFAULT_TYPE,
     elif action == "bio":
         description = text.strip()
         if len(description) > 255:
-            await message.reply_text(
+            await reply_text(message,
                 error_card("Group Bio", "Description must be ≤ 255 characters."),
                 parse_mode=ParseMode.HTML,
             )
             return
         try:
-            await context.bot.set_chat_description(chat_id, description)
-        except TelegramError as exc:
-            await message.reply_text(
+            await bot.set_chat_description(chat_id, description)
+        except TelegramAPIError as exc:
+            await reply_text(message,
                 error_card("Group Bio", str(exc)[:150]),
                 parse_mode=ParseMode.HTML,
             )
@@ -841,21 +835,21 @@ async def _run_waiting(update: Update, context: ContextTypes.DEFAULT_TYPE,
     else:  # bcast
         body = text.strip()
         if not body:
-            await message.reply_text(
+            await reply_text(message,
                 error_card("Broadcast", "Send non-empty text."),
                 parse_mode=ParseMode.HTML,
             )
             return
         if len(body) > 4096:
-            await message.reply_text(
+            await reply_text(message,
                 error_card("Broadcast", "Message must be ≤ 4096 characters."),
                 parse_mode=ParseMode.HTML,
             )
             return
         try:
-            await context.bot.send_message(chat_id, body)
-        except TelegramError as exc:
-            await message.reply_text(
+            await bot.send_message(chat_id, body)
+        except TelegramAPIError as exc:
+            await reply_text(message,
                 error_card("Broadcast", str(exc)[:150]),
                 parse_mode=ParseMode.HTML,
             )
@@ -869,11 +863,11 @@ async def _run_waiting(update: Update, context: ContextTypes.DEFAULT_TYPE,
         )
 
     # Success — retire the prompt and restore the panel.
-    _pop_waiting(context, uid)
+    _pop_waiting(chat_data, uid)
     await _revert_panel(
-        context.bot, chat_id, entry.get("panel_mid", 0), uid, entry.get("mid", 0)
+        bot, chat_id, entry.get("panel_mid", 0), uid, entry.get("mid", 0)
     )
-    await message.reply_text(
+    await reply_text(message,
         success,
         parse_mode=ParseMode.HTML,
         reply_markup=build_keyboard([
@@ -884,42 +878,41 @@ async def _run_waiting(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 # ── Handlers ─────────────────────────────────────────────────────
 
-async def adminbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def adminbox_command(message: Message, bot: Bot, chat_data: dict) -> None:
     """/adminbox — open the inline admin panel (groups, admins only)."""
-    message = update.message
-    chat = update.effective_chat
-    user = update.effective_user
+    chat = message.chat
+    user = message.from_user
     if chat.type == "private":
-        await message.reply_text(
+        await reply_text(message,
             f"{E.INFO} Open the panel in a group.", parse_mode=ParseMode.HTML
         )
         return
-    if not await _is_admin(context.bot, chat.id, user.id):
-        await message.reply_text(
+    if not await _is_admin(bot, chat.id, user.id):
+        await reply_text(message,
             f"{E.ERROR} Group admins only.", parse_mode=ParseMode.HTML
         )
         return
 
     # A fresh panel retires any stale prompt this admin had open.
-    _pop_waiting(context, user.id)
+    _pop_waiting(chat_data, user.id)
 
     reply = message.reply_to_message
     mid = reply.message_id if reply else 0
-    text, markup = await _render_main(context.bot, chat.id, user.id, mid)
-    await message.reply_text(
+    text, markup = await _render_main(bot, chat.id, user.id, mid)
+    await reply_text(message,
         text, reply_markup=markup, parse_mode=ParseMode.HTML
     )
 
 
-async def adminbox_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def adminbox_callback(callback_query: CallbackQuery, bot: Bot, chat_data: dict) -> None:
     """All ``abox:`` presses — admin status re-verified on every call."""
-    query = update.callback_query
+    query = callback_query
     data = query.data or ""
     if not data.startswith(f"{CB}:"):
         return
     parts = data.split(":")
     action = parts[1] if len(parts) > 1 else ""
-    chat = update.effective_chat
+    chat = query.message.chat if query.message else None
     user = query.from_user
     if chat is None or user is None:
         return
@@ -930,7 +923,7 @@ async def adminbox_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     # Spec: sensitive actions verify current admin status again here.
-    if not await _gate(query, context.bot, chat_id, uid):
+    if not await _gate(query, bot, chat_id, uid):
         return
 
     def _int_at(index: int, default: int = 0) -> int:
@@ -942,65 +935,64 @@ async def adminbox_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     mid = _int_at(2, 0)
 
     if action == "main":
-        text, markup = await _render_main(context.bot, chat_id, uid, mid)
+        text, markup = await _render_main(bot, chat_id, uid, mid)
         await _edit(query, text, markup)
     elif action == "admins":
-        await _view_admins(query, context.bot, chat_id, mid)
+        await _view_admins(query, bot, chat_id, mid)
     elif action == "demote":
-        await _do_demote(query, context.bot, chat_id, uid, _int_at(2, 0), _int_at(3, 0))
+        await _do_demote(query, bot, chat_id, uid, _int_at(2, 0), _int_at(3, 0))
     elif action in ("name", "bio", "bcast"):
         panel_mid = query.message.message_id if query.message else 0
-        _set_waiting(context, uid, action, mid, panel_mid)
+        _set_waiting(chat_data, uid, action, mid, panel_mid)
         await _edit(query, _prompt_text(action), _prompt_kb())
     elif action == "cancel":
-        entry = _pop_waiting(context, uid)
+        entry = _pop_waiting(chat_data, uid)
         back_mid = (entry or {}).get("mid", 0)
-        text, markup = await _render_main(context.bot, chat_id, uid, back_mid)
+        text, markup = await _render_main(bot, chat_id, uid, back_mid)
         await _edit(query, text, markup)
     elif action == "close":
-        _pop_waiting(context, uid)
+        _pop_waiting(chat_data, uid)
         if query.message:
             try:
                 await query.message.delete()
-            except TelegramError:
+            except TelegramAPIError:
                 pass
         await _answer(query, "Panel closed.")
     elif action == "backdel":
         if query.message:
             try:
                 await query.message.delete()
-            except TelegramError:
+            except TelegramAPIError:
                 pass
         await _answer(query)
     elif action == "invite":
-        await _view_invite(query, context.bot, chat_id, mid)
+        await _view_invite(query, bot, chat_id, mid)
     elif action == "invitegen":
-        await _gen_invite(query, context.bot, chat_id, mid, request=False)
+        await _gen_invite(query, bot, chat_id, mid, request=False)
     elif action == "joinlink":
-        await _gen_invite(query, context.bot, chat_id, mid, request=True)
+        await _gen_invite(query, bot, chat_id, mid, request=True)
     elif action == "info":
-        await _view_info(query, context.bot, chat_id, mid)
+        await _view_info(query, bot, chat_id, mid)
     elif action == "perms":
-        await _view_perms(query, context.bot, chat_id, uid, mid)
+        await _view_perms(query, bot, chat_id, uid, mid)
     elif action == "bot":
-        await _view_bot(query, context.bot, chat_id, mid)
+        await _view_bot(query, bot, chat_id, mid)
     elif action == "tools":
-        await _view_tools(query, context.bot, chat_id, mid)
+        await _view_tools(query, bot, chat_id, mid)
     elif action in ("pin", "unpin", "del"):
-        await _reply_op(query, context.bot, chat_id, action, mid)
+        await _reply_op(query, bot, chat_id, action, mid)
     elif action == "purge":
-        await _do_purge(query, context.bot, chat_id, context.chat_data)
+        await _do_purge(query, bot, chat_id, chat_data)
     elif action == "settings":
-        await _view_settings(query, context.bot, chat_id, mid)
+        await _view_settings(query, bot, chat_id, mid)
     elif action == "dperms":
-        await _view_dperms(query, context.bot, chat_id, mid)
+        await _view_dperms(query, bot, chat_id, mid)
     # unknown actions stay silent (stale taps)
 
 
-async def adminbox_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def adminbox_message(message: Message, bot: Bot, chat_data: dict) -> None:
     """Group message hook (group 21): purge tracking + waiting input."""
-    message = update.message
-    chat = update.effective_chat
+    chat = message.chat
     if not message or not chat or chat.type == "private":
         return
 
@@ -1009,17 +1001,17 @@ async def adminbox_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if sender and not sender.is_bot and not any(
         getattr(message, marker, None) for marker in _SERVICE_MARKERS
     ):
-        recent = context.chat_data.get("abox_recent")
+        recent = chat_data.get("abox_recent")
         if recent is None:
             recent = deque(maxlen=RECENT_CAP)
-            context.chat_data["abox_recent"] = recent
+            chat_data["abox_recent"] = recent
         recent.append(message.message_id)
 
     # 2) Waiting-input consumption.
-    wait_map = context.chat_data.get("abox_wait")
+    wait_map = chat_data.get("abox_wait")
     if not wait_map:
         return
-    user = update.effective_user
+    user = message.from_user
     if not user:
         return
     entry = wait_map.get(user.id)
@@ -1030,38 +1022,36 @@ async def adminbox_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # A new command abandons the prompt (the command re-opens cleanly).
     if parse_command(text):
-        _pop_waiting(context, user.id)
+        _pop_waiting(chat_data, user.id)
         await _revert_panel(
-            context.bot, chat.id, entry.get("panel_mid", 0), user.id,
+            bot, chat.id, entry.get("panel_mid", 0), user.id,
             entry.get("mid", 0),
         )
         return
 
     if time.time() > entry["expires"]:
-        _pop_waiting(context, user.id)
+        _pop_waiting(chat_data, user.id)
         await _revert_panel(
-            context.bot, chat.id, entry.get("panel_mid", 0), user.id,
+            bot, chat.id, entry.get("panel_mid", 0), user.id,
             entry.get("mid", 0),
         )
         return
 
     # Demoted while typing → prompt dies with the rights.
-    if not await _is_admin(context.bot, chat.id, user.id):
-        _pop_waiting(context, user.id)
+    if not await _is_admin(bot, chat.id, user.id):
+        _pop_waiting(chat_data, user.id)
         return
 
     if not text:
         return
-    await _run_waiting(update, context, entry, text)
+    await _run_waiting(message, bot, chat_data, entry, text)
 
 
 # ── Registration ─────────────────────────────────────────────────
 
-def setup(app: Application) -> list[str]:
+def setup() -> list[str]:
     """Register /adminbox, its callback grid and the message hook."""
-    app.add_handler(CommandHandler("adminbox", adminbox_command))
-    app.add_handler(CallbackQueryHandler(adminbox_callback, pattern=r"^abox:"))
-    app.add_handler(
-        MessageHandler(filters.ALL, adminbox_message), group=MESSAGE_GROUP
-    )
+    on("message", adminbox_command, flt=cmd("adminbox"))
+    on("callback_query", adminbox_callback, flt=F.data.regexp(re.compile(r"^abox:")))
+    on("message", adminbox_message, group=MESSAGE_GROUP)
     return ["/adminbox", "abox:* callbacks", f"message hook (group {MESSAGE_GROUP})"]

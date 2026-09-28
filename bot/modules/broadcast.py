@@ -21,18 +21,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import List, Tuple
 
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.error import RetryAfter, TelegramError
-from telegram.ext import Application, CallbackQueryHandler, ContextTypes
+from aiogram import Bot, F
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
+from aiogram.types import CallbackQuery, Message
 
-from bot.command_handler import CommandHandler
 from bot.config import settings
 from bot.database import db
 from bot.emojis import E, EID
 from bot.keyboards.colored import btn_danger, build_keyboard
+from bot.pipeline import cmd, on
+from bot.reply import reply_text
 
 logger = logging.getLogger(__name__)
 
@@ -99,11 +101,10 @@ async def _forward_once(bot, target_id: int, reply):
     )
 
 
-async def _run_broadcast(context, reply, groups: List[int],
+async def _run_broadcast(bot, reply, groups: List[int],
                          users: List[int], pin: bool,
                          target: str) -> Tuple[int, int, bool]:
     """Forward ``reply`` to every target; returns (users, groups, cancelled)."""
-    bot = context.bot
     user_count, group_count = 0, 0
 
     if target in ("all", "chat"):
@@ -118,20 +119,20 @@ async def _run_broadcast(context, reply, groups: List[int],
                             chat_id, sent.message_id,
                             disable_notification=False,
                         )
-                    except TelegramError as e:
+                    except TelegramAPIError as e:
                         logger.debug("broadcast pin failed in %s: %s",
                                      chat_id, e)
                 group_count += 1
                 await asyncio.sleep(_SEND_DELAY)
-            except RetryAfter as e:
+            except TelegramRetryAfter as e:
                 # FloodWait — wait it out, then retry this chat once.
                 await asyncio.sleep(e.retry_after)
                 try:
                     await _forward_once(bot, chat_id, reply)
                     group_count += 1
-                except TelegramError:
+                except TelegramAPIError:
                     pass
-            except TelegramError as e:
+            except TelegramAPIError as e:
                 logger.debug("broadcast skipped %s: %s", chat_id, e)
 
     if target in ("all", "user"):
@@ -142,14 +143,14 @@ async def _run_broadcast(context, reply, groups: List[int],
                 await _forward_once(bot, user_id, reply)
                 user_count += 1
                 await asyncio.sleep(_SEND_DELAY)
-            except RetryAfter as e:
+            except TelegramRetryAfter as e:
                 await asyncio.sleep(e.retry_after)
                 try:
                     await _forward_once(bot, user_id, reply)
                     user_count += 1
-                except TelegramError:
+                except TelegramAPIError:
                     pass
-            except TelegramError as e:
+            except TelegramAPIError as e:
                 logger.debug("broadcast skipped user %s: %s", user_id, e)
 
     return user_count, group_count, _cancel
@@ -157,16 +158,17 @@ async def _run_broadcast(context, reply, groups: List[int],
 
 # ── Handler ─────────────────────────────────────────────────────
 
-async def broadcast_command(update: Update,
-                            context: ContextTypes.DEFAULT_TYPE) -> None:
+async def broadcast_command(message: Message,
+                            bot: Bot, args: list) -> None:
     """/broadcast — owner-only forward of the replied message."""
     global _cancel
 
-    msg = update.effective_message
+    msg = message
     if msg is None:
         return
-    if not _is_owner(update.effective_user):
-        await msg.reply_text(
+    if not _is_owner(message.from_user):
+        await reply_text(
+            msg,
             f"{E.CROWN} Only the bot owner can broadcast.",
             parse_mode=ParseMode.HTML,
         )
@@ -174,12 +176,13 @@ async def broadcast_command(update: Update,
 
     reply = getattr(msg, "reply_to_message", None)
     if reply is None:
-        await msg.reply_text(
+        await reply_text(
+            msg,
             _usage_text(), parse_mode=ParseMode.HTML
         )
         return
 
-    args = list(context.args or [])
+    args = list(args or [])
     target = "all"
     if "-user" in args:
         target = "user"
@@ -195,20 +198,22 @@ async def broadcast_command(update: Update,
     if target in ("all", "user"):
         users = db.get_all_user_ids()
     if not groups and not users:
-        await msg.reply_text(
+        await reply_text(
+            msg,
             f"{E.WARN} No broadcast targets in the database yet.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    status = await msg.reply_text(
+    status = await reply_text(
+        msg,
         _progress_text(target),
         parse_mode=ParseMode.HTML,
         reply_markup=_progress_kb(),
     )
 
     user_count, group_count, cancelled = await _run_broadcast(
-        context, reply, groups, users, pin, target
+        bot, reply, groups, users, pin, target
     )
 
     try:
@@ -220,11 +225,10 @@ async def broadcast_command(update: Update,
         logger.warning("broadcast final edit failed: %s", e)
 
 
-async def broadcast_callback(update: Update,
-                             context: ContextTypes.DEFAULT_TYPE) -> None:
+async def broadcast_callback(callback_query: CallbackQuery) -> None:
     """broadcast:* — Cancel button (owner-only)."""
     global _cancel
-    query = update.callback_query
+    query = callback_query
     if query is None or not str(query.data or "").startswith(f"{_CB}:"):
         return
     if not _is_owner(query.from_user):
@@ -259,10 +263,11 @@ async def broadcast_callback(update: Update,
         pass
 
 
-def setup(app: Application) -> List[str]:
+def setup() -> List[str]:
     """Register /broadcast + its cancel callback."""
-    app.add_handler(CommandHandler(["broadcast", "bcast"], broadcast_command))
-    app.add_handler(
-        CallbackQueryHandler(broadcast_callback, pattern=rf"^{_CB}:")
+    on("message", broadcast_command, flt=cmd("broadcast", "bcast"))
+    on(
+        "callback_query", broadcast_callback,
+        flt=F.data.regexp(re.compile(rf"^{_CB}:")),
     )
     return ["/broadcast", "/bcast"]

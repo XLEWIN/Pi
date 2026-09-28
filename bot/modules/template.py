@@ -5,16 +5,18 @@ colored buttons; tapping one (or sending /template <number>) applies it.
 """
 
 import asyncio
+import re
 
-from telegram import Update
-from telegram.ext import Application, CallbackQueryHandler, ContextTypes
-from telegram.constants import ParseMode
+from aiogram import F
+from aiogram.enums import ParseMode
+from aiogram.types import CallbackQuery, Message
 
-from bot.command_handler import CommandHandler
 from bot.database import db
 from bot.emojis import E, EID
 from bot.keyboards.colored import btn_danger, btn_primary, btn_success, build_keyboard
+from bot.pipeline import cmd, on
 from bot.profile_templates import THEMES
+from bot.reply import reply_text
 
 
 def _build_template_buttons():
@@ -51,10 +53,11 @@ def _header(active_name: str, active_id: int) -> str:
     )
 
 
-async def template_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def template_command(message: Message):
     """Handle /template — list templates + inline selection (text only)."""
-    if update.effective_chat.type != "private":
-        await update.message.reply_text(
+    if message.chat.type != "private":
+        await reply_text(
+            message,
             f"{E.INFO} Use this command in my DM for privacy.",
             parse_mode=ParseMode.HTML,
         )
@@ -62,7 +65,7 @@ async def template_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Current selection — same source as /rank (user_level.template).
     info = await asyncio.to_thread(
-        db.get_user_rank_info, update.effective_user.id
+        db.get_user_rank_info, message.from_user.id
     )
     active_id = info["template"]
     active_name = THEMES.get(active_id, THEMES[1])["name"]
@@ -70,7 +73,8 @@ async def template_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     theme_lines = "\n".join(
         f"│  {line.strip()}" for line in get_theme_list().splitlines()
     )
-    await update.message.reply_text(
+    await reply_text(
+        message,
         f"{_header(active_name, active_id)}\n"
         f"├ {E.INFO} Styles: tap a button below\n"
         f"{theme_lines}\n"
@@ -81,9 +85,9 @@ async def template_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def template_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def template_callback(callback_query: CallbackQuery):
     """Handle template selection callback."""
-    query = update.callback_query
+    query = callback_query
     data = query.data
 
     if not data.startswith("template:"):
@@ -107,7 +111,7 @@ async def template_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Update the message with confirmation (it's a text message now —
     # edit_message_text, not edit_message_caption; stale taps stay silent).
     try:
-        await query.edit_message_text(
+        await query.message.edit_text(
             f"{E.CHECK} <b>Template Selected</b>\n"
             f"├ {E.SPARKLE} Style: <b>{theme_name}</b> (#{template_id})\n"
             f"├ {E.INFO} Applied to: your /rank card\n"
@@ -126,8 +130,9 @@ def get_theme_list():
     return "\n".join(lines)
 
 
-def setup(app: Application) -> list[str]:
+def setup() -> list[str]:
     """Register template commands."""
-    app.add_handler(CommandHandler("template", template_command))
-    app.add_handler(CallbackQueryHandler(template_callback, pattern=r"^template:"))
+    on("message", template_command, flt=cmd("template"))
+    on("callback_query", template_callback,
+       flt=F.data.regexp(re.compile(r"^template:")))
     return ["/template", "template:* callbacks"]

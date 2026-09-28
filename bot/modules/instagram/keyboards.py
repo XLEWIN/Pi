@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot.emojis import EID
 from bot.keyboards.colored import btn_danger, btn_primary, btn_success, btn_url
@@ -14,13 +14,13 @@ def open_on_ig(url: str) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
     if url:
         rows.append([btn_url("Open on Instagram", url, icon_emoji_id=EID.WEB)])
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def settings_keyboard(auto: bool, max_items: int) -> InlineKeyboardMarkup:
     auto_label = "Auto: On" if auto else "Auto: Off"
     return InlineKeyboardMarkup(
-        [
+        inline_keyboard=[
             [
                 btn_success(
                     auto_label,
@@ -41,4 +41,4 @@ def error_keyboard(url: Optional[str] = None) -> InlineKeyboardMarkup:
     if url:
         rows.append([btn_url("Open link", url, icon_emoji_id=EID.WEB)])
     rows.append([btn_danger("Close", "ig:close", icon_emoji_id=EID.CROSS)])
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup(inline_keyboard=rows)

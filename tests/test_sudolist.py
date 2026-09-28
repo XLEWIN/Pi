@@ -13,7 +13,7 @@ Run from the Pi/Pi root:
 Environment isolation (BEFORE any bot import):
     * BOT_TOKEN is forced — bot.config exits without one.
     * LOCALAPPDATA points at a temp dir so bot.database creates a fresh DB.
-No network: context.bot is a fake.
+No network: the bot is a fake.
 """
 
 from __future__ import annotations
@@ -41,21 +41,9 @@ _PIBOT.mkdir(parents=True, exist_ok=True)
 atexit.register(shutil.rmtree, _TEST_DIR, ignore_errors=True)
 
 # ── Imports (after env) ───────────────────────────────────────────
+from aiofakes import call, make_message  # noqa: E402
 from bot.database import db  # noqa: E402
 from bot.modules.bans import OWNER_ID, sudolist_command  # noqa: E402
-
-
-class _FakeMessage:
-    def __init__(self):
-        self.replies = []
-
-    async def reply_text(self, text, parse_mode=None, reply_markup=None):
-        self.replies.append({"text": text, "parse_mode": parse_mode})
-        return SimpleNamespace(message_id=1)
-
-    @property
-    def last(self):
-        return self.replies[-1]["text"] if self.replies else ""
 
 
 class _FakeBot:
@@ -74,15 +62,9 @@ class _FakeBot:
         )
 
 
-def _update(user_id):
-    return SimpleNamespace(
-        effective_user=SimpleNamespace(id=user_id),
-        message=_FakeMessage(),
-    )
-
-
-def _context(bot=None):
-    return SimpleNamespace(bot=bot or _FakeBot())
+def _msg(user_id):
+    """Group command message — replies are recorded in .calls/.sent_texts."""
+    return make_message("/sudolist", user_id=user_id)
 
 
 def _clear_sudo():
@@ -101,12 +83,12 @@ class TestSudolist(unittest.IsolatedAsyncioTestCase):
         # THE regression path: sudo users configured → the join runs.
         db.add_sudo_user(222, added_by=OWNER_ID)
         db.add_sudo_user(111, added_by=OWNER_ID)
-        upd = _update(OWNER_ID)
+        msg = _msg(OWNER_ID)
         bot = _FakeBot()
 
-        await sudolist_command(upd, _context(bot=bot))
+        await call(sudolist_command, msg, bot=bot)
 
-        text = upd.message.last
+        text = msg.sent_texts[-1]
         self.assertIn("Sudo Users:", text)
         self.assertIn('tg://user?id=111', text)
         self.assertIn('tg://user?id=222', text)
@@ -117,14 +99,14 @@ class TestSudolist(unittest.IsolatedAsyncioTestCase):
         self.assertIn("@user111", text)  # username preferred over name
 
     async def test_no_sudo_users_message(self):
-        upd = _update(OWNER_ID)
-        await sudolist_command(upd, _context())
-        self.assertIn("No sudo users", upd.message.last)
+        msg = _msg(OWNER_ID)
+        await call(sudolist_command, msg, bot=_FakeBot())
+        self.assertIn("No sudo users", msg.sent_texts[-1])
 
     async def test_non_owner_denied(self):
-        upd = _update(123456789)
-        await sudolist_command(upd, _context())
-        self.assertIn("Only the bot owner", upd.message.last)
+        msg = _msg(123456789)
+        await call(sudolist_command, msg, bot=_FakeBot())
+        self.assertIn("Only the bot owner", msg.sent_texts[-1])
 
     async def test_get_chat_failure_falls_back_to_code_id(self):
         db.add_sudo_user(333, added_by=OWNER_ID)
@@ -133,11 +115,11 @@ class TestSudolist(unittest.IsolatedAsyncioTestCase):
             async def get_chat(self, user_id):
                 raise RuntimeError("network")
 
-        upd = _update(OWNER_ID)
-        await sudolist_command(upd, _context(bot=_BoomBot()))
+        msg = _msg(OWNER_ID)
+        await call(sudolist_command, msg, bot=_BoomBot())
 
-        self.assertIn("<code>333</code>", upd.message.last)
-        self.assertIn(f"<code>{OWNER_ID}</code>", upd.message.last)
+        self.assertIn("<code>333</code>", msg.sent_texts[-1])
+        self.assertIn(f"<code>{OWNER_ID}</code>", msg.sent_texts[-1])
 
 
 if __name__ == "__main__":

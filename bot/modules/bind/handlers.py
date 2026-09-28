@@ -4,11 +4,12 @@ import asyncio
 import logging
 from typing import Any, Dict, Optional
 
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import ContextTypes, filters
+from aiogram import Bot
+from aiogram.enums import ParseMode
+from aiogram.types import Message
 
 from bot.emojis import E
+from bot.reply import reply_text
 
 from . import database as bdb
 from .checks import (
@@ -18,11 +19,7 @@ from .checks import (
     is_group_admin,
     should_enforce,
 )
-from .config import (
-    HANDLER_GROUP,
-    JOIN_TRACKER_GROUP,
-    PLACEHOLDERS_HELP,
-)
+from .config import PLACEHOLDERS_HELP
 from .keyboards import bind_main_menu, force_join_keyboard, help_bind_text, replace_confirm_menu
 from .utils import (
     channel_display,
@@ -36,7 +33,7 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
-async def _resolve_channel(context: ContextTypes.DEFAULT_TYPE, ref: str):
+async def _resolve_channel(bot: Bot, ref: str):
     """Resolve a channel reference to a Chat-like object, or raise ValueError."""
     parsed = parse_channel_ref(ref)
     if not parsed:
@@ -45,21 +42,21 @@ async def _resolve_channel(context: ContextTypes.DEFAULT_TYPE, ref: str):
 
     if username:
         try:
-            return await context.bot.get_chat(username)
+            return await bot.get_chat(username)
         except Exception as e:
             raise ValueError(f"Channel @{username} not found or bot can't access it. ({e})") from e
 
     try:
-        return await context.bot.get_chat(channel_id)
+        return await bot.get_chat(channel_id)
     except Exception as e:
         raise ValueError(f"Chat {channel_id} not found or bot can't access it. ({e})") from e
 
 
-async def _bot_is_channel_admin(context: ContextTypes.DEFAULT_TYPE, chat) -> bool:
+async def _bot_is_channel_admin(bot: Bot, chat) -> bool:
     """Bot must be able to call getChatMember on the channel."""
     try:
-        me = await context.bot.get_me()
-        member = await context.bot.get_chat_member(chat.id, me.id)
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat.id, me.id)
         return member.status in ("administrator", "creator", "member")
     except Exception:
         # Some public channels allow member checks without admin — try anyway.
@@ -73,18 +70,19 @@ def _channel_link(chat) -> Optional[str]:
     return None
 
 
-async def bind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def bind_command(message: Message, bot: Bot, args: list, chat_data: dict) -> None:
     """Handle /bind [channel] — bind this group to a channel."""
-    if not update.message or not update.effective_chat or update.effective_chat.type == "private":
-        if update.message:
-            await update.message.reply_text(f"{E.ERROR} This command only works in groups.", parse_mode=ParseMode.HTML)
+    if not message or not message.chat or message.chat.type == "private":
+        if message:
+            await reply_text(message, f"{E.ERROR} This command only works in groups.", parse_mode=ParseMode.HTML)
         return
 
-    chat_id = update.effective_chat.id
-    user = update.effective_user
+    chat_id = message.chat.id
+    user = message.from_user
 
-    if not await is_group_admin(context.bot, chat_id, user.id):
-        await update.message.reply_text(
+    if not await is_group_admin(bot, chat_id, user.id):
+        await reply_text(
+            message,
             f"{E.ERROR} Only group admins can bind a channel.",
             parse_mode=ParseMode.HTML,
         )
@@ -93,11 +91,12 @@ async def bind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     existing = bdb.get_settings(chat_id)
 
     # No argument → show status / usage.
-    if not context.args:
+    if not args:
         if existing:
             link = existing.get("channel_link") or ""
-            btn = bind_main_menu(existing, group_title=update.effective_chat.title or "")
-            await update.message.reply_text(
+            btn = bind_main_menu(existing, group_title=message.chat.title or "")
+            await reply_text(
+                message,
                 f"{E.CHECK} <b>Already bound</b> to {channel_display(existing)}.\n"
                 f"Force Join: <b>{'ON' if existing.get('force_join') else 'OFF'}</b> • "
                 f"Grace: <b>{format_grace(existing.get('grace_minutes') or 0)}</b>\n\n"
@@ -107,29 +106,32 @@ async def bind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 disable_web_page_preview=True,
             )
         else:
-            await update.message.reply_text(
+            await reply_text(
+                message,
                 f"{E.INFO} Not bound yet.\n\n{help_bind_text()}",
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
         return
 
-    ref = context.args[0]
+    ref = args[0]
     try:
-        channel = await _resolve_channel(context, ref)
+        channel = await _resolve_channel(bot, ref)
     except ValueError as e:
-        await update.message.reply_text(f"{E.ERROR} {e}", parse_mode=ParseMode.HTML)
+        await reply_text(message, f"{E.ERROR} {e}", parse_mode=ParseMode.HTML)
         return
 
     if channel.type not in ("channel", "supergroup", "group"):
-        await update.message.reply_text(
+        await reply_text(
+            message,
             f"{E.ERROR} Target must be a channel or supergroup.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    if not await _bot_is_channel_admin(context, channel):
-        await update.message.reply_text(
+    if not await _bot_is_channel_admin(bot, channel):
+        await reply_text(
+            message,
             f"{E.ERROR} I can't check membership in that chat. "
             "Add me as an admin of the channel (or make sure it's public).",
             parse_mode=ParseMode.HTML,
@@ -139,19 +141,20 @@ async def bind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # One channel ↔ one group: reject if another GC already holds this channel.
     other = bdb.find_other_binding(channel.id, chat_id)
     if other:
-        await update.message.reply_text(_channel_taken_text(), parse_mode=ParseMode.HTML)
+        await reply_text(message, _channel_taken_text(), parse_mode=ParseMode.HTML)
         return
 
     # Already bound to a different channel → confirm replace.
     if existing and existing.get("channel_id") and existing["channel_id"] != channel.id:
         # Stash pending target in chat_data for confirm callback.
-        context.chat_data["bind_pending_channel"] = {
+        chat_data["bind_pending_channel"] = {
             "id": channel.id,
             "username": channel.username,
             "title": channel.title,
             "link": _channel_link(channel),
         }
-        await update.message.reply_text(
+        await reply_text(
+            message,
             f"{E.WARNING} Already bound to {channel_display(existing)}.\n"
             f"Replace with <b>{channel.title or channel.username or channel.id}</b>?",
             parse_mode=ParseMode.HTML,
@@ -159,7 +162,7 @@ async def bind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    _apply_binding(update, context, channel, bound_by=user.id)
+    _apply_binding(message, channel, bound_by=user.id)
 
 
 def _channel_taken_text() -> str:
@@ -170,8 +173,8 @@ def _channel_taken_text() -> str:
     )
 
 
-def _apply_binding(update: Update, context: ContextTypes.DEFAULT_TYPE, channel, bound_by: int) -> None:
-    chat_id = update.effective_chat.id
+def _apply_binding(message: Message, channel, bound_by: int) -> None:
+    chat_id = message.chat.id
     link = _channel_link(channel)
     try:
         bdb.upsert_binding(
@@ -184,7 +187,7 @@ def _apply_binding(update: Update, context: ContextTypes.DEFAULT_TYPE, channel, 
         )
     except ValueError as e:
         if str(e) == "CHANNEL_TAKEN":
-            spawn(update.message.reply_text(_channel_taken_text(), parse_mode=ParseMode.HTML))
+            spawn(reply_text(message, _channel_taken_text(), parse_mode=ParseMode.HTML))
             return
         raise
     settings = bdb.get_settings(chat_id)
@@ -199,30 +202,32 @@ def _apply_binding(update: Update, context: ContextTypes.DEFAULT_TYPE, channel, 
     )
     # Fire reply first; heavy work already done above (sync SQLite is fine here).
     spawn(
-        update.message.reply_text(
+        reply_text(
+            message,
             text,
             parse_mode=ParseMode.HTML,
-            reply_markup=bind_main_menu(settings, group_title=update.effective_chat.title or ""),
+            reply_markup=bind_main_menu(settings, group_title=message.chat.title or ""),
             disable_web_page_preview=True,
         )
     )
 
 
-async def bindmenu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def bindmenu_command(message: Message, bot: Bot, chat_data: dict) -> None:
     """Handle /bindmenu — open the configuration panel."""
-    if not update.message or not update.effective_chat or update.effective_chat.type == "private":
-        if update.message:
-            await update.message.reply_text(f"{E.ERROR} This command only works in groups.", parse_mode=ParseMode.HTML)
+    if not message or not message.chat or message.chat.type == "private":
+        if message:
+            await reply_text(message, f"{E.ERROR} This command only works in groups.", parse_mode=ParseMode.HTML)
         return
 
-    chat_id = update.effective_chat.id
-    user = update.effective_user
+    chat_id = message.chat.id
+    user = message.from_user
 
     # Opening /bindmenu cancels any pending custom-message / channel prompt.
-    context.chat_data.pop("bind_wait", None)
+    chat_data.pop("bind_wait", None)
 
-    if not await is_group_admin(context.bot, chat_id, user.id):
-        await update.message.reply_text(
+    if not await is_group_admin(bot, chat_id, user.id):
+        await reply_text(
+            message,
             f"{E.ERROR} Only group admins can open the bind menu.",
             parse_mode=ParseMode.HTML,
         )
@@ -230,14 +235,16 @@ async def bindmenu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     settings = bdb.get_settings(chat_id)
     if not settings:
-        await update.message.reply_text(
+        await reply_text(
+            message,
             f"{E.INFO} Not bound yet.\n\n{help_bind_text()}",
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
         return
 
-    await update.message.reply_text(
+    await reply_text(
+        message,
         f"{E.SETTINGS} <b>Bind Menu</b>\n"
         f"{E.ANNOUNCE} {channel_display(settings)}\n"
         f"Force Join <b>{'✅ ON' if settings.get('force_join') else '❌ OFF'}</b>\n"
@@ -247,7 +254,7 @@ async def bindmenu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         f"Auto-delete: <b>{settings.get('auto_delete_seconds') or 0}s</b>\n\n"
         f"<i>Placeholders:</i> <code>{PLACEHOLDERS_HELP}</code>",
         parse_mode=ParseMode.HTML,
-        reply_markup=bind_main_menu(settings, group_title=update.effective_chat.title or ""),
+        reply_markup=bind_main_menu(settings, group_title=message.chat.title or ""),
         disable_web_page_preview=True,
     )
 
@@ -258,12 +265,11 @@ def _active_gate_count(settings: Dict[str, Any]) -> int:
     return sum(1 for col in GATES.values() if int(settings.get(col) or 0))
 
 
-async def gate_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def gate_message_handler(message: Message, bot: Bot) -> None:
     """Enforce force-join / message-type gates on incoming group messages."""
-    message = update.message
     if not message:
         return
-    chat = update.effective_chat
+    chat = message.chat
     if not chat or chat.type == "private":
         return
 
@@ -284,7 +290,7 @@ async def gate_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     is_admin = False
     if int(settings.get("admin_bypass") or 1):
-        is_admin = await is_group_admin(context.bot, chat_id, user.id)
+        is_admin = await is_group_admin(bot, chat_id, user.id)
 
     join_ts = bdb.get_join_time(chat_id, user.id)
     grace_ok = in_grace(join_ts, int(settings.get("grace_minutes") or 0))
@@ -300,7 +306,7 @@ async def gate_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # Membership check (cached unless we need a decision).
     channel_id = settings["channel_id"]
-    if await is_channel_member(context.bot, channel_id, user.id, fresh=False):
+    if await is_channel_member(bot, channel_id, user.id, fresh=False):
         # Cache said member — allow. Also persist join for future grace math.
         bdb.record_join(chat_id, user.id)
         return
@@ -313,7 +319,7 @@ async def gate_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as _e:
         logger.debug(f"bind fail counter: {_e}")
 
-    if not await is_bot_admin(context.bot, chat_id):
+    if not await is_bot_admin(bot, chat_id):
         # Can't delete; still try to warn once (best effort).
         pass
     else:
@@ -341,7 +347,7 @@ async def gate_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     # Avoid spamming: delete previous warning for this user if still tracked? Keep simple —
     # send new warning; optional auto-delete below.
     try:
-        warning = await context.bot.send_message(
+        warning = await bot.send_message(
             chat_id=chat_id,
             text=f"{E.ANNOUNCE} {body}",
             parse_mode=ParseMode.HTML,
@@ -352,15 +358,15 @@ async def gate_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         bdb.add_warning(chat_id, warning.message_id, user.id)
         delay = int(settings.get("auto_delete_seconds") or 0)
         if delay > 0:
-            spawn(_auto_delete(context, chat_id, warning.message_id, delay))
+            spawn(_auto_delete(bot, chat_id, warning.message_id, delay))
     except Exception as e:
         logger.warning(f"bind warning send failed: {e}")
 
 
-async def _auto_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int) -> None:
+async def _auto_delete(bot: Bot, chat_id: int, message_id: int, delay: int) -> None:
     try:
         await asyncio.sleep(delay)
-        await context.bot.delete_message(chat_id, message_id)
+        await bot.delete_message(chat_id, message_id)
     except Exception:
         pass
     finally:
@@ -370,13 +376,12 @@ async def _auto_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message
             pass
 
 
-async def join_tracker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def join_tracker(message: Message, bot: Bot) -> None:
     """Record group-join timestamps for grace period math."""
-    message = update.message
-    if not message or not update.effective_chat or update.effective_chat.type == "private":
+    if not message or not message.chat or message.chat.type == "private":
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = message.chat.id
     if not message.new_chat_members:
         return
 
@@ -390,7 +395,7 @@ async def join_tracker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     for member in message.new_chat_members:
         if member.is_bot:
             continue
-        if member.id == context.bot.id:
+        if member.id == bot.id:
             continue
         bdb.record_join(chat_id, member.id, joined_at=now)
 
@@ -399,31 +404,30 @@ async def join_tracker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         bdb.clear_join(chat_id, message.left_chat_member.id)
 
 
-async def waiting_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def waiting_text_handler(message: Message, bot: Bot, chat_data: dict) -> None:
     """Consume admin text when waiting for custom message or new channel."""
-    message = update.message
-    if not message or not update.effective_chat or update.effective_chat.type == "private":
+    if not message or not message.chat or message.chat.type == "private":
         return
 
-    wait = context.chat_data.get("bind_wait")
+    wait = chat_data.get("bind_wait")
     if not wait:
         return
 
-    chat_id = update.effective_chat.id
-    user = update.effective_user
-    if not await is_group_admin(context.bot, chat_id, user.id):
+    chat_id = message.chat.id
+    user = message.from_user
+    if not await is_group_admin(bot, chat_id, user.id):
         return
 
     settings = bdb.get_settings(chat_id)
     if not settings:
-        context.chat_data.pop("bind_wait", None)
+        chat_data.pop("bind_wait", None)
         return
 
     if wait == "custom":
-        context.chat_data.pop("bind_wait", None)
+        chat_data.pop("bind_wait", None)
         text = (message.text or "").strip()
         if not text:
-            await message.reply_text(f"{E.ERROR} Empty message — send non-empty text or /bindmenu.", parse_mode=ParseMode.HTML)
+            await reply_text(message, f"{E.ERROR} Empty message — send non-empty text or /bindmenu.", parse_mode=ParseMode.HTML)
             return
         # Show placeholders that survived / were typed.
         bdb.update_field(chat_id, "custom_message", text)
@@ -431,28 +435,33 @@ async def waiting_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             await message.delete()
         except Exception:
             pass
-        await update.effective_chat.send_message(
-            f"{E.CHECK} Custom force-join message saved.\n"
-            f"<i>Placeholders:</i> <code>{PLACEHOLDERS_HELP}</code>",
+        await bot.send_message(
+            chat_id=message.chat.id,
+            text=(
+                f"{E.CHECK} Custom force-join message saved.\n"
+                f"<i>Placeholders:</i> <code>{PLACEHOLDERS_HELP}</code>"
+            ),
             parse_mode=ParseMode.HTML,
         )
         return
 
     if wait == "channel":
-        context.chat_data.pop("bind_wait", None)
+        chat_data.pop("bind_wait", None)
         raw = (message.text or "").strip()
         try:
-            channel = await _resolve_channel(context, raw)
+            channel = await _resolve_channel(bot, raw)
         except ValueError as e:
-            await update.effective_chat.send_message(f"{E.ERROR} {e}", parse_mode=ParseMode.HTML)
+            await bot.send_message(chat_id=message.chat.id, text=f"{E.ERROR} {e}", parse_mode=ParseMode.HTML)
             return
         if channel.type not in ("channel", "supergroup", "group"):
-            await update.effective_chat.send_message(
-                f"{E.ERROR} Target must be a channel or supergroup.", parse_mode=ParseMode.HTML
+            await bot.send_message(
+                chat_id=message.chat.id,
+                text=f"{E.ERROR} Target must be a channel or supergroup.",
+                parse_mode=ParseMode.HTML,
             )
             return
         if bdb.find_other_binding(channel.id, chat_id):
-            await update.effective_chat.send_message(_channel_taken_text(), parse_mode=ParseMode.HTML)
+            await bot.send_message(chat_id=message.chat.id, text=_channel_taken_text(), parse_mode=ParseMode.HTML)
             return
         link = _channel_link(channel)
         try:
@@ -466,13 +475,14 @@ async def waiting_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         except ValueError as e:
             if str(e) == "CHANNEL_TAKEN":
-                await update.effective_chat.send_message(_channel_taken_text(), parse_mode=ParseMode.HTML)
+                await bot.send_message(chat_id=message.chat.id, text=_channel_taken_text(), parse_mode=ParseMode.HTML)
                 return
             raise
         fresh = bdb.get_settings(chat_id)
-        await update.effective_chat.send_message(
-            f"{E.CHECK} Channel replaced with <b>{channel.title or channel.username or channel.id}</b>.",
+        await bot.send_message(
+            chat_id=message.chat.id,
+            text=f"{E.CHECK} Channel replaced with <b>{channel.title or channel.username or channel.id}</b>.",
             parse_mode=ParseMode.HTML,
-            reply_markup=bind_main_menu(fresh, group_title=update.effective_chat.title or ""),
+            reply_markup=bind_main_menu(fresh, group_title=message.chat.title or ""),
         )
         return

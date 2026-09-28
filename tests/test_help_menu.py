@@ -13,8 +13,12 @@ No network: handlers run against fakes that record replies/edits.
 
 Production layout: ONE plain text message — menu text with the buttons
 attached (no photo/media). Callbacks edit that same message in place
-(``edit_message_text``); menus sent by older versions as photo captions
-keep working through the caption-edit compatibility branch.
+(``edit_text`` on ``query.message``); menus sent by older versions as
+photo captions keep working through the caption-edit compatibility
+branch.
+
+Handlers are aiogram-era: ``await call(fn, event, bot=..., bot_data=...)``
+passes only the deps each real signature declares.
 """
 
 from __future__ import annotations
@@ -39,6 +43,7 @@ os.environ["LOCALAPPDATA"] = _TEST_DIR
 atexit.register(shutil.rmtree, _TEST_DIR, ignore_errors=True)
 
 # ── Imports (after env) ───────────────────────────────────────────
+from aiofakes import call  # noqa: E402
 from bot.constants import BOT_DESCRIPTION, HELP_MENU  # noqa: E402
 from bot.modules import help as help_mod  # noqa: E402
 from bot.modules import start as start_mod  # noqa: E402
@@ -52,6 +57,8 @@ class _FakeMessage:
     def __init__(self, chat_type: str = "private", chat_id: int = 1,
                  message_id: int = 100, is_photo: bool = False):
         self.chat = SimpleNamespace(id=chat_id, type=chat_type, title="Test Chat")
+        self.from_user = SimpleNamespace(id=42, is_bot=False, first_name="T",
+                                         username="tester")
         self.message_id = message_id
         self.message_thread_id = None
         #: non-empty when this message carries media — legacy menus sent
@@ -59,21 +66,45 @@ class _FakeMessage:
         self.photo = [SimpleNamespace()] if is_photo else []
         self.replies: list = []   # {"text", "markup"} dicts
         self.photos: list = []    # {"photo", "caption", "markup"} dicts — must stay empty
-        self.markup_edits: list = []
+        self.edits: list = []         # edit_text kwargs dicts
+        self.caption_edits: list = []  # edit_caption kwargs dicts
+        self.markup_stripped = False
         self.deleted = False
 
-    async def reply_text(self, text, parse_mode=None, reply_markup=None, **kw):
-        self.replies.append({"text": text, "markup": reply_markup})
+    # reply_text → answer (private) / reply (group) — bot.reply semantics
+    async def _record(self, text, **kw):
+        self.replies.append({"text": text, "markup": kw.get("reply_markup")})
         return SimpleNamespace(message_id=self.message_id + 1, chat=self.chat)
 
-    async def reply_photo(self, photo, caption=None, parse_mode=None,
-                          reply_markup=None, **kw):
-        self.photos.append({"photo": photo, "caption": caption,
-                            "markup": reply_markup})
+    async def answer(self, text, **kw):
+        return await self._record(text, **kw)
+
+    async def reply(self, text, **kw):
+        return await self._record(text, **kw)
+
+    async def answer_photo(self, photo, **kw):
+        self.photos.append({"photo": photo, "caption": kw.get("caption"),
+                            "markup": kw.get("reply_markup")})
         return SimpleNamespace(message_id=self.message_id + 1, chat=self.chat)
 
-    async def edit_message_reply_markup(self, reply_markup=None, **kw):
-        self.markup_edits.append(reply_markup)
+    async def reply_photo(self, photo, **kw):
+        return await self.answer_photo(photo, **kw)
+
+    async def edit_text(self, text, **kw):
+        self.edits.append({"text": text, "markup": kw.get("reply_markup")})
+        return self
+
+    async def edit_caption(self, caption=None, **kw):
+        self.caption_edits.append({"caption": caption,
+                                   "markup": kw.get("reply_markup")})
+        if caption is None:
+            self.markup_stripped = True
+        return self
+
+    async def edit_reply_markup(self, reply_markup=None, **kw):
+        if reply_markup is None:
+            self.markup_stripped = True
+        return self
 
     async def delete(self):
         self.deleted = True
@@ -93,17 +124,25 @@ class TimedOut(Exception):
 
 
 class _TextTimeoutMessage(_FakeMessage):
-    async def reply_text(self, *a, **kw):
+    async def answer(self, *a, **kw):
+        raise TimedOut("request timed out")
+
+    async def reply(self, *a, **kw):
         raise TimedOut("request timed out")
 
 
 class _BrandFailsMessage(_FakeMessage):
     """Brand text (with <tg-emoji>) rejected → plain fallback must send."""
 
-    async def reply_text(self, text, *a, **kw):
+    async def answer(self, text, *a, **kw):
         if "<tg-emoji" in text:
             raise RuntimeError("CUSTOM_EMOJI_FAIL")
-        return await super().reply_text(text, *a, **kw)
+        return await super().answer(text, *a, **kw)
+
+    async def reply(self, text, *a, **kw):
+        if "<tg-emoji" in text:
+            raise RuntimeError("CUSTOM_EMOJI_FAIL")
+        return await super().reply(text, *a, **kw)
 
 
 def _photo_msg(chat_type: str = "private", chat_id: int = 1) -> _FakeMessage:
@@ -112,29 +151,30 @@ def _photo_msg(chat_type: str = "private", chat_id: int = 1) -> _FakeMessage:
 
 
 class _FakeQuery:
+    """CallbackQuery duck-type — edits/answers are recorded on itself
+    (edits live on the target message, mirroring query.message.edit_*)."""
+
     def __init__(self, data: str, message: _FakeMessage | None = None):
         self.data = data
+        self.from_user = SimpleNamespace(id=42, is_bot=False, first_name="T",
+                                         username="tester")
         self.answers: list = []
-        self.edits: list = []            # edit_message_text kwargs
-        self.caption_edits: list = []    # edit_message_caption kwargs
-        self.markup_stripped = False
         self.message = message if message is not None else _FakeMessage()
 
     async def answer(self, text=None, show_alert=False, **kw):
         self.answers.append({"text": text, "show_alert": show_alert})
 
-    async def edit_message_text(self, text, parse_mode=None, reply_markup=None, **kw):
-        self.edits.append({"text": text, "markup": reply_markup})
+    @property
+    def edits(self):
+        return self.message.edits
 
-    async def edit_message_caption(self, caption=None, parse_mode=None,
-                                   reply_markup=None, **kw):
-        self.caption_edits.append({"caption": caption, "markup": reply_markup})
-        if caption is None:
-            self.markup_stripped = True
+    @property
+    def caption_edits(self):
+        return self.message.caption_edits
 
-    async def edit_message_reply_markup(self, reply_markup=None, **kw):
-        if reply_markup is None:
-            self.markup_stripped = True
+    @property
+    def markup_stripped(self):
+        return self.message.markup_stripped
 
     @property
     def last_caption(self):
@@ -164,20 +204,21 @@ def _ctx() -> SimpleNamespace:
     return SimpleNamespace(
         bot_data={"username": BOT_USERNAME},
         bot=_FakeBot(),
-        args=[],
     )
 
 
-def _cmd_update(chat_type: str = "private", message: _FakeMessage | None = None):
-    msg = message or _FakeMessage()
+async def _run(fn, event, ctx: SimpleNamespace | None = None):
+    """``await call(fn, event, bot=..., bot_data=...)`` with test defaults."""
+    ctx = ctx if ctx is not None else _ctx()
+    return await call(fn, event, bot=ctx.bot, bot_data=ctx.bot_data)
+
+
+def _cmd_msg(chat_type: str = "private",
+             message: _FakeMessage | None = None) -> _FakeMessage:
+    msg = message if message is not None else _FakeMessage()
     msg.chat.type = chat_type
     msg.chat.id = -100 if chat_type != "private" else 1
-    return SimpleNamespace(
-        message=msg,
-        effective_message=msg,
-        effective_chat=msg.chat,
-        effective_user=SimpleNamespace(id=42),
-    )
+    return msg
 
 
 def _cb_update(data: str, message: _FakeMessage | None = None):
@@ -185,7 +226,7 @@ def _cb_update(data: str, message: _FakeMessage | None = None):
 
 
 def _style(btn):
-    return (getattr(btn, "api_kwargs", None) or {}).get("style")
+    return getattr(btn, "style", None)
 
 
 def _flat(markup):
@@ -285,11 +326,11 @@ class TestModulePagination(unittest.TestCase):
 
 class TestGroupRedirect(unittest.IsolatedAsyncioTestCase):
     async def test_group_gets_single_text_message(self):
-        upd = _cmd_update("supergroup")
-        await help_mod.help_command(upd, _ctx())
-        self.assertEqual(upd.message.photos, [])  # never a photo
-        self.assertEqual(len(upd.message.replies), 1)
-        reply = upd.message.last
+        msg = _cmd_msg("supergroup")
+        await _run(help_mod.help_command, msg)
+        self.assertEqual(msg.photos, [])  # never a photo
+        self.assertEqual(len(msg.replies), 1)
+        reply = msg.last
         self.assertIn("Help Menu", reply["text"])
         self.assertIn("DM", reply["text"])
         buttons = _flat(reply["markup"])
@@ -297,18 +338,18 @@ class TestGroupRedirect(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(buttons[0].url, f"https://t.me/{BOT_USERNAME}")
 
     async def test_brand_emoji_failure_falls_back_to_plain(self):
-        upd = _cmd_update("supergroup", message=_BrandFailsMessage())
-        await help_mod.help_command(upd, _ctx())
-        self.assertEqual(len(upd.message.replies), 1)  # exactly one message sent
-        self.assertNotIn("<tg-emoji", upd.message.last["text"])
-        buttons = _flat(upd.message.last["markup"])
+        msg = _cmd_msg("supergroup", message=_BrandFailsMessage())
+        await _run(help_mod.help_command, msg)
+        self.assertEqual(len(msg.replies), 1)  # exactly one message sent
+        self.assertNotIn("<tg-emoji", msg.last["text"])
+        buttons = _flat(msg.last["markup"])
         self.assertEqual(buttons[0].url, f"https://t.me/{BOT_USERNAME}")
 
     async def test_private_menu_has_no_dm_button(self):
-        upd = _cmd_update("private")
-        await help_mod.help_command(upd, _ctx())
-        self.assertEqual(len(upd.message.replies), 1)
-        buttons = _flat(upd.message.last["markup"])
+        msg = _cmd_msg("private")
+        await _run(help_mod.help_command, msg)
+        self.assertEqual(len(msg.replies), 1)
+        buttons = _flat(msg.last["markup"])
         self.assertFalse(any(getattr(b, "url", None) for b in buttons))
 
 
@@ -318,13 +359,13 @@ class TestGroupRedirect(unittest.IsolatedAsyncioTestCase):
 
 class TestPrivateMenu(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.upd = _cmd_update("private")
-        await help_mod.help_command(self.upd, _ctx())
-        self.msg = self.upd.message.last
+        self.sent = _cmd_msg("private")
+        await _run(help_mod.help_command, self.sent)
+        self.msg = self.sent.last
 
     def test_single_message_only(self):
-        self.assertEqual(len(self.upd.message.replies), 1)
-        self.assertEqual(self.upd.message.photos, [])  # no media ever
+        self.assertEqual(len(self.sent.replies), 1)
+        self.assertEqual(self.sent.photos, [])  # no media ever
 
     def test_menu_text_content(self):
         self.assertIsNotNone(self.msg)
@@ -380,9 +421,7 @@ class TestPrivateMenu(unittest.IsolatedAsyncioTestCase):
 
     def test_module_icons_present(self):
         first = self.msg["markup"].inline_keyboard[0][0]
-        icon = (getattr(first, "api_kwargs", None) or {}).get(
-            "icon_custom_emoji_id"
-        )
+        icon = getattr(first, "icon_custom_emoji_id", None)
         self.assertTrue(icon)  # branded button icon from EID
 
 
@@ -394,7 +433,7 @@ class TestTextEdits(unittest.IsolatedAsyncioTestCase):
     async def test_drilldown_edits_text(self):
         ctx = _ctx()
         cb = _cb_update("help:open:moderation:0:0")  # plain text message
-        await help_mod.help_callback(cb, ctx)
+        await _run(help_mod.help_callback, cb.callback_query, ctx)
 
         self.assertEqual(len(cb.callback_query.edits), 1)
         self.assertEqual(cb.callback_query.caption_edits, [])  # not a photo
@@ -408,7 +447,7 @@ class TestTextEdits(unittest.IsolatedAsyncioTestCase):
 
     async def test_module_subpage_nav(self):
         cb = _cb_update("help:open:moderation:0:1")
-        await help_mod.help_callback(cb, _ctx())
+        await _run(help_mod.help_callback, cb.callback_query)
         edit = cb.callback_query.last_edit
         self.assertIn("Page 2/2", edit["text"])
         nav = edit["markup"].inline_keyboard[0]
@@ -419,7 +458,7 @@ class TestTextEdits(unittest.IsolatedAsyncioTestCase):
         seen = []
         for sub in range(help_mod._module_page_count(mod)):
             cb = _cb_update(f"help:open:moderation:0:{sub}")
-            await help_mod.help_callback(cb, _ctx())
+            await _run(help_mod.help_callback, cb.callback_query)
             seen.append(cb.callback_query.last_edit["text"])
         for header, _ in mod["sections"]:
             if header:
@@ -427,7 +466,7 @@ class TestTextEdits(unittest.IsolatedAsyncioTestCase):
 
     async def test_main_pagination_edits_text(self):
         cb = _cb_update("help:main:1")
-        await help_mod.help_callback(cb, _ctx())
+        await _run(help_mod.help_callback, cb.callback_query)
         edit = cb.callback_query.last_edit
         self.assertIn(f"Page 2/{help_mod._page_count()}", edit["text"])
         nav = edit["markup"].inline_keyboard[3]
@@ -437,7 +476,7 @@ class TestTextEdits(unittest.IsolatedAsyncioTestCase):
         ctx = _ctx()
         msg = _FakeMessage()
         cb = _cb_update("help:close", message=msg)
-        await help_mod.help_callback(cb, ctx)
+        await _run(help_mod.help_callback, cb.callback_query, ctx)
         self.assertTrue(msg.deleted)
         self.assertEqual(ctx.bot.deletes, [])  # nothing else exists
 
@@ -445,7 +484,7 @@ class TestTextEdits(unittest.IsolatedAsyncioTestCase):
         ctx = _ctx()
         msg = _FakeMessage()
         cb = _cb_update("help:start", message=msg)
-        await help_mod.help_callback(cb, ctx)
+        await _run(help_mod.help_callback, cb.callback_query, ctx)
         edit = cb.callback_query.last_edit
         self.assertIn(BOT_DESCRIPTION, edit["text"])
         self.assertIsNotNone(_by_data(edit["markup"], "start:help"))
@@ -453,7 +492,7 @@ class TestTextEdits(unittest.IsolatedAsyncioTestCase):
 
     async def test_callback_is_answered(self):
         cb = _cb_update("help:main:1")
-        await help_mod.help_callback(cb, _ctx())
+        await _run(help_mod.help_callback, cb.callback_query)
         self.assertEqual(len(cb.callback_query.answers), 1)
 
 
@@ -465,7 +504,7 @@ class TestLegacyPhotoMessages(unittest.IsolatedAsyncioTestCase):
     async def test_drilldown_edits_caption(self):
         ctx = _ctx()
         cb = _cb_update("help:open:moderation:0:0", message=_photo_msg())
-        await help_mod.help_callback(cb, ctx)
+        await _run(help_mod.help_callback, cb.callback_query, ctx)
 
         self.assertEqual(len(cb.callback_query.caption_edits), 1)
         self.assertEqual(cb.callback_query.edits, [])  # photo → caption edit
@@ -480,7 +519,7 @@ class TestLegacyPhotoMessages(unittest.IsolatedAsyncioTestCase):
         ctx = _ctx()
         msg = _photo_msg()
         cb = _cb_update("help:close", message=msg)
-        await help_mod.help_callback(cb, ctx)
+        await _run(help_mod.help_callback, cb.callback_query, ctx)
         self.assertTrue(msg.deleted)
 
 
@@ -490,28 +529,28 @@ class TestLegacyPhotoMessages(unittest.IsolatedAsyncioTestCase):
 
 class TestSendFailures(unittest.IsolatedAsyncioTestCase):
     async def test_brand_failure_sends_single_plain_message(self):
-        upd = _cmd_update("private", message=_BrandFailsMessage())
-        await help_mod.help_command(upd, _ctx())
-        self.assertEqual(upd.message.photos, [])
-        self.assertEqual(len(upd.message.replies), 1)  # still ONE message
-        self.assertNotIn("<tg-emoji", upd.message.last["text"])
-        self.assertIn("Help Menu", upd.message.last["text"])
+        msg = _cmd_msg("private", message=_BrandFailsMessage())
+        await _run(help_mod.help_command, msg)
+        self.assertEqual(msg.photos, [])
+        self.assertEqual(len(msg.replies), 1)  # still ONE message
+        self.assertNotIn("<tg-emoji", msg.last["text"])
+        self.assertIn("Help Menu", msg.last["text"])
         self.assertIsNotNone(
             _by_data(
-                upd.message.last["markup"],
+                msg.last["markup"],
                 f"help:open:{HELP_MENU[0]['key']}:0:0",
             )
         )
 
     async def test_timeout_never_retries(self):
-        upd = _cmd_update("private", message=_TextTimeoutMessage())
-        await help_mod.help_command(upd, _ctx())
-        self.assertEqual(upd.message.photos, [])
-        self.assertEqual(upd.message.replies, [])  # no duplicate send
+        msg = _cmd_msg("private", message=_TextTimeoutMessage())
+        await _run(help_mod.help_command, msg)
+        self.assertEqual(msg.photos, [])
+        self.assertEqual(msg.replies, [])  # no duplicate send
 
     async def test_foreign_message_callbacks_edit_text(self):
         cb = _cb_update("help:main:1", message=_FakeMessage())  # photo=[]
-        await help_mod.help_callback(cb, _ctx())
+        await _run(help_mod.help_callback, cb.callback_query)
         self.assertEqual(cb.callback_query.caption_edits, [])
         self.assertIn(f"Page 2/{help_mod._page_count()}",
                       cb.callback_query.last_edit["text"])
@@ -525,13 +564,13 @@ class TestCloseAndUnknown(unittest.IsolatedAsyncioTestCase):
     async def test_close_falls_back_to_stripping_buttons(self):
         msg = _DeleteFailsMessage()
         cb = _cb_update("help:close", message=msg)
-        await help_mod.help_callback(cb, _ctx())
+        await _run(help_mod.help_callback, cb.callback_query)
         self.assertFalse(msg.deleted)
         self.assertTrue(cb.callback_query.markup_stripped)
 
     async def test_unknown_module_alerts(self):
         cb = _cb_update("help:open:doesnotexist:0:0")
-        await help_mod.help_callback(cb, _ctx())
+        await _run(help_mod.help_callback, cb.callback_query)
         self.assertEqual(cb.callback_query.edits, [])
         self.assertEqual(cb.callback_query.caption_edits, [])
         answers = cb.callback_query.answers
@@ -540,7 +579,7 @@ class TestCloseAndUnknown(unittest.IsolatedAsyncioTestCase):
 
     async def test_unknown_route_alerts(self):
         cb = _cb_update("help:bogus")
-        await help_mod.help_callback(cb, _ctx())
+        await _run(help_mod.help_callback, cb.callback_query)
         self.assertEqual(cb.callback_query.edits, [])
         answers = cb.callback_query.answers
         self.assertEqual(len(answers), 1)
@@ -548,7 +587,7 @@ class TestCloseAndUnknown(unittest.IsolatedAsyncioTestCase):
 
     async def test_foreign_callback_ignored(self):
         cb = _cb_update("tag:whatever")
-        await help_mod.help_callback(cb, _ctx())
+        await _run(help_mod.help_callback, cb.callback_query)
         self.assertEqual(cb.callback_query.answers, [])
 
 
@@ -560,7 +599,7 @@ class TestStartHelpLoop(unittest.IsolatedAsyncioTestCase):
     async def test_start_help_button_swaps_to_menu_message(self):
         start_msg = _FakeMessage()
         cb = _cb_update("start:help", message=start_msg)
-        await start_mod.start_callback(cb, _ctx())
+        await _run(start_mod.start_callback, cb.callback_query)
         # start screen replaced by ONE text menu message
         self.assertTrue(start_msg.deleted)
         self.assertEqual(start_msg.photos, [])
@@ -574,7 +613,7 @@ class TestStartHelpLoop(unittest.IsolatedAsyncioTestCase):
 
     async def test_start_dashboard_still_coming_soon(self):
         cb = _cb_update("start:dashboard")
-        await start_mod.start_callback(cb, _ctx())
+        await _run(start_mod.start_callback, cb.callback_query)
         self.assertEqual(cb.callback_query.edits, [])
         self.assertEqual(cb.callback_query.answers[0]["text"], "Coming soon!")
 

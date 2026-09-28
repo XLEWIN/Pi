@@ -7,17 +7,18 @@ import asyncio
 import re
 from html import escape
 
-from telegram import Update
-from telegram.error import BadRequest
-from telegram.ext import Application, CallbackQueryHandler, ContextTypes
-from telegram.constants import ParseMode
+from aiogram import Bot, F
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import CallbackQuery, Message
 
-from bot.command_handler import CommandHandler
 from bot.constants import BOT_DESCRIPTION, LOG_CHANNEL_ID, START_TEXT, URL_ADD_TO_GROUP, URL_OFFICIAL_CHANNEL, URL_NETWORK
 from bot.database import db
 from bot.emojis import E
 from bot.keyboards.colored import btn_primary, btn_success, btn_url, build_keyboard
 from bot.logger import logger
+from bot.pipeline import cmd, on
+from bot.reply import reply_text
 
 # Background only — never on the reply path. Generous so slow routes still land.
 LOG_TIMEOUT_SECONDS = 10
@@ -39,11 +40,11 @@ def _spawn(coro) -> None:
     task.add_done_callback(_done)
 
 
-async def send_log(context: ContextTypes.DEFAULT_TYPE, message: str):
+async def send_log(bot: Bot, message: str):
     """Send a log message. Fails soft — never raises to the caller."""
     try:
         await asyncio.wait_for(
-            context.bot.send_message(
+            bot.send_message(
                 chat_id=LOG_CHANNEL_ID,
                 text=message,
                 parse_mode=ParseMode.HTML,
@@ -121,24 +122,24 @@ def format_newuser_log(user, chat_title: str = None, plain: bool = False) -> str
     return "\n".join(lines)
 
 
-async def send_newuser_log(context, user, chat_title: str = None) -> None:
+async def send_newuser_log(bot, user, chat_title: str = None) -> None:
     """Post #Newuser to the log channel. Fails soft — never raises.
 
     Tries the custom-emoji (rich) form first; if the chat rejects
     <tg-emoji> (400), retries once with plain fallback glyphs.
     """
-    if context is None or getattr(context, "bot", None) is None:
+    if bot is None:
         return
     rich = format_newuser_log(user, chat_title)
     try:
         await asyncio.wait_for(
-            context.bot.send_message(
+            bot.send_message(
                 chat_id=LOG_CHANNEL_ID, text=rich, parse_mode=ParseMode.HTML
             ),
             timeout=LOG_TIMEOUT_SECONDS,
         )
         return
-    except BadRequest as e:
+    except TelegramBadRequest as e:
         logger.debug(f"rich #newuser rejected ({e}) — retrying plain")
     except asyncio.TimeoutError:
         logger.warning(f"#newuser log timed out after {LOG_TIMEOUT_SECONDS}s")
@@ -148,7 +149,7 @@ async def send_newuser_log(context, user, chat_title: str = None) -> None:
         return
     try:
         await asyncio.wait_for(
-            context.bot.send_message(
+            bot.send_message(
                 chat_id=LOG_CHANNEL_ID,
                 text=format_newuser_log(user, chat_title, plain=True),
                 parse_mode=ParseMode.HTML,
@@ -191,7 +192,7 @@ async def _safe_delete(message) -> None:
         pass
 
 
-async def _finish_start(context: ContextTypes.DEFAULT_TYPE, user, chat) -> None:
+async def _finish_start(bot: Bot, user, chat) -> None:
     """Background work after the user already has their reply."""
     def _db_work() -> None:
         try:
@@ -215,15 +216,15 @@ async def _finish_start(context: ContextTypes.DEFAULT_TYPE, user, chat) -> None:
     await loop.run_in_executor(None, _db_work)
 
     if chat.type == "private":
-        await send_log(context, format_user_log(user, "started the bot (DM)"))
+        await send_log(bot, format_user_log(user, "started the bot (DM)"))
 
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def start_command(message: Message, bot: Bot, bot_data: dict) -> None:
     """Handle /start — one reply first; DB + log only after that."""
-    user = update.effective_user
-    chat = update.effective_chat
+    user = message.from_user
+    chat = message.chat
 
-    username = context.bot_data.get("username", "Phi π")
+    username = bot_data.get("username", "Phi π")
     text = START_TEXT.format(
         fire=E.FIRE,
         username=f"@{username}",
@@ -243,7 +244,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # plain-HTML retry — never retry a TimedOut.
     try:
         await asyncio.wait_for(
-            update.message.reply_text(
+            reply_text(
+                message,
                 text, reply_markup=keyboard, parse_mode=ParseMode.HTML
             ),
             timeout=REPLY_TIMEOUT_SECONDS,
@@ -256,7 +258,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         logger.warning(f"Start brand reply failed ({e}); sending plain fallback")
         try:
             await asyncio.wait_for(
-                update.message.reply_text(
+                reply_text(
+                    message,
                     plain_text, reply_markup=plain_keyboard, parse_mode=ParseMode.HTML
                 ),
                 timeout=REPLY_TIMEOUT_SECONDS,
@@ -266,27 +269,28 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
 
     # Reply is on its way — only now do delete / DB / channel log.
-    if update.message:
-        _spawn(_safe_delete(update.message))
+    if message:
+        _spawn(_safe_delete(message))
 
-    _spawn(_finish_start(context, user, chat))
+    _spawn(_finish_start(bot, user, chat))
 
 
-async def start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def start_callback(callback_query: CallbackQuery) -> None:
     """Handle the start callback buttons."""
-    query = update.callback_query
+    query = callback_query
     data = query.data or ""
     if data == "start:help":
         # Open the interactive help menu (help.py owns the edit).
         from bot.modules.help import show_main_menu
 
-        await show_main_menu(update, context)
+        await show_main_menu(query)
         return
     await query.answer("Coming soon!", show_alert=False)
 
 
-def setup(app: Application) -> list[str]:
+def setup() -> list[str]:
     """Register this module's handlers."""
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CallbackQueryHandler(start_callback, pattern=r"^start:"))
+    on("message", start_command, flt=cmd("start"))
+    on("callback_query", start_callback,
+       flt=F.data.regexp(re.compile(r"^start:")))
     return ["/start", "start:* callbacks"]

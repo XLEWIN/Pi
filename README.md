@@ -4,7 +4,7 @@ A modular Telegram bot for community management: moderation, antispam,
 welcomes, filters, levels/XP, chat stats, channel binds, Instagram
 downloads, mass-tagging sessions, and an admin toolbox.
 
-Built on [python-telegram-bot](https://docs.python-telegram-bot.org/)
+Built on [aiogram](https://docs.aiogram.dev/)
 (long polling) with **MongoDB** for storage.
 
 ## Features

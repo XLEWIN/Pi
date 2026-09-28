@@ -12,31 +12,32 @@ from datetime import datetime
 from html import escape
 from typing import Optional
 
-from telegram import Update, User
-from telegram.constants import ParseMode
-from telegram.ext import Application, ContextTypes
+from aiogram import Bot
+from aiogram.enums import ParseMode
+from aiogram.types import Message, User
 
-from bot.command_handler import CommandHandler
 from bot.database import db
 from bot.emojis import E
+from bot.pipeline import cmd, on
+from bot.reply import reply_text
 from bot.responses import action_card, field_extra, field_user, rank_value, user_label
 
 logger = logging.getLogger(__name__)
 
 
 async def _resolve_target(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+    message: Message, bot: Bot, args: list
 ) -> Optional[User]:
-    if update.message.reply_to_message and update.message.reply_to_message.from_user:
-        return update.message.reply_to_message.from_user
-    if context.args:
-        arg = context.args[0]
-        chat_id = update.effective_chat.id
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return message.reply_to_message.from_user
+    if args:
+        arg = args[0]
+        chat_id = message.chat.id
         try:
             if arg.startswith("@"):
-                member = await context.bot.get_chat_member(chat_id, arg)
+                member = await bot.get_chat_member(chat_id, arg)
                 return member.user
-            member = await context.bot.get_chat_member(chat_id, int(arg))
+            member = await bot.get_chat_member(chat_id, int(arg))
             return member.user
         except Exception:
             # Fall through — may be a bare ID the bot can't resolve as member.
@@ -62,14 +63,14 @@ async def _resolve_target(
                 return u  # type: ignore
             except Exception:
                 return None
-    return update.effective_user
+    return message.from_user
 
 
-async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def profile_command(message: Message, bot: Bot, args: list):
     """/profile — reputation + activity card for a user."""
-    target = await _resolve_target(update, context)
+    target = await _resolve_target(message, bot, args)
     if not target:
-        await update.message.reply_text(
+        await reply_text(message, 
             f"{E.ERROR} Could not find that user.\n"
             "Usage: /profile [@user] or reply with /profile",
             parse_mode=ParseMode.HTML,
@@ -83,7 +84,7 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     active_days = db.get_active_days(uid)
 
     # Chat context only in groups — ranks are derived from daily_messages.
-    chat = update.effective_chat
+    chat = message.chat
     chat_id = None
     if chat is not None and getattr(chat, "type", None) not in (None, "private"):
         chat_id = chat.id
@@ -132,14 +133,14 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         field_extra(E.BAN, "Restrictions", str(restr)),
     ])
     text = action_card("User Profile", fields, icon=E.USER)
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    await reply_text(message, text, parse_mode=ParseMode.HTML)
 
 
 def _fmt(n: int) -> str:
     return f"{n:,}"
 
 
-def setup(app: Application) -> list:
-    app.add_handler(CommandHandler("profile", profile_command))
-    app.add_handler(CommandHandler("rep", profile_command))
+def setup() -> list:
+    on("message", profile_command, flt=cmd("profile"))
+    on("message", profile_command, flt=cmd("rep"))
     return ["/profile", "/rep"]

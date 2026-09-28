@@ -48,27 +48,25 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from html import escape
 from typing import List, Optional, Tuple
 
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.error import BadRequest
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from aiogram import Bot, F
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters.logic import and_f
+from aiogram.types import CallbackQuery, Message
 
-from bot.command_handler import COMMAND, CommandHandler
+from bot.command_handler import COMMAND
 from bot.database import db
 from bot.constants import CHAT_RANK_MESSAGES, GLOBAL_RANK_MESSAGES
 from bot.emojis import E, EID
 from bot.keyboards.colored import btn_primary, btn_success, build_keyboard
 from bot.responses import plain_error, mention
 from bot.modules.start import send_newuser_log
+from bot.pipeline import GROUPS, cmd, on
+from bot.reply import reply_text
 from bot.timeutils import ist_clock, ist_date, ist_monday
 
 logger = logging.getLogger(__name__)
@@ -246,11 +244,11 @@ def _mytop_board(user, scope: str) -> Tuple[str, Optional[object]]:
 # Counter — every group text message, DB off the event loop
 # ═════════════════════════════════════════════════════════════════
 
-async def count_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.text:
+async def count_message(message: Message, bot: Bot) -> None:
+    if not message or not message.text:
         return
-    chat = update.effective_chat
-    user = update.effective_user
+    chat = message.chat
+    user = message.from_user
     if chat is None or chat.type == "private" or user is None or user.is_bot:
         return
 
@@ -295,7 +293,7 @@ async def count_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if is_new:
         # Fires once per user, ever — logs to the configured log channel.
-        await send_newuser_log(context, user, chat_title)
+        await send_newuser_log(bot, user, chat_title)
 
     if total is None:
         return
@@ -311,7 +309,8 @@ async def count_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if lines:
         try:
-            await update.message.reply_text(
+            await reply_text(
+                message,
                 "\n".join(lines), parse_mode=ParseMode.HTML
             )
         except Exception as e:  # noqa: BLE001
@@ -322,30 +321,33 @@ async def count_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # Commands
 # ═════════════════════════════════════════════════════════════════
 
-async def rankings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
+async def rankings_command(message: Message) -> None:
+    msg = message
     if msg is None:
         return
-    chat = update.effective_chat
+    chat = message.chat
     if chat is None or chat.type == "private":
-        await msg.reply_text(
+        await reply_text(
+            msg,
             plain_error("This command only works in groups."),
             parse_mode=ParseMode.HTML,
         )
         return
     text, markup = await asyncio.to_thread(_rank_board, chat.id, "overall")
-    await msg.reply_text(
+    await reply_text(
+        msg,
         text, parse_mode=ParseMode.HTML, reply_markup=markup
     )
 
 
-async def mytop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
-    user = update.effective_user
+async def mytop_command(message: Message) -> None:
+    msg = message
+    user = message.from_user
     if msg is None or user is None:
         return
     text, markup = await asyncio.to_thread(_mytop_board, user, "overall")
-    await msg.reply_text(
+    await reply_text(
+        msg,
         text, parse_mode=ParseMode.HTML, reply_markup=markup
     )
 
@@ -354,8 +356,8 @@ async def mytop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # Tab switching — cs:r:<scope> / cs:m:<user_id>:<scope>
 # ═════════════════════════════════════════════════════════════════
 
-async def board_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
+async def board_callback(callback_query: CallbackQuery) -> None:
+    query = callback_query
     if query is None or not query.data or not query.data.startswith("cs:"):
         return
 
@@ -407,10 +409,10 @@ async def board_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         # PTB: CallbackQuery.edit_message_text — Message has no such method
         # (it only exposes edit_text), so always edit through the query.
-        await query.edit_message_text(
+        await query.message.edit_text(
             text, reply_markup=markup, parse_mode=ParseMode.HTML
         )
-    except BadRequest as e:
+    except TelegramBadRequest as e:
         if "message is not modified" not in str(e):
             logger.debug("board tab edit failed: %s", e)
     except Exception as e:  # noqa: BLE001 — never crash the callback
@@ -419,18 +421,14 @@ async def board_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 # ═════════════════════════════════════════════════════════════════
 
-def setup(app: Application) -> List[str]:
+def setup() -> List[str]:
     # Own group (18): PTB runs max ONE handler per group — sharing
     # group 0 with antispam.flood_watch shadowed the counter for every
     # plain group message (nobody was registered or counted).
-    app.add_handler(
-        MessageHandler(
-            (filters.TEXT & ~COMMAND) & filters.ChatType.GROUPS,
-            count_message,
-        ),
-        group=18,
-    )
-    app.add_handler(CommandHandler("rankings", rankings_command))
-    app.add_handler(CommandHandler("mytop", mytop_command))
-    app.add_handler(CallbackQueryHandler(board_callback, pattern=r"^cs:[rm]:"))
+    on("message", count_message, group=18,
+       flt=and_f(F.text, ~COMMAND, GROUPS))
+    on("message", rankings_command, flt=cmd("rankings"))
+    on("message", mytop_command, flt=cmd("mytop"))
+    on("callback_query", board_callback,
+       flt=F.data.regexp(re.compile(r"^cs:[rm]:")))
     return ["/rankings", "/mytop", "count_message", "cs: tabs"]

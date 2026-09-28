@@ -22,16 +22,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from html import escape
 from typing import Any, Dict, List, Optional
 
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import Application, CallbackQueryHandler, ContextTypes
+from aiogram import Bot, F
+from aiogram.enums import ParseMode
+from aiogram.types import CallbackQuery, Message
 
-from bot.command_handler import CommandHandler
 from bot.config import settings
+from bot.pipeline import cmd, on
+from bot.reply import reply_text
 from bot.database import db
 from bot.emojis import E
 from bot.keyboards.colored import btn_success, build_keyboard
@@ -147,9 +149,8 @@ def _info_card(chat, members: str, link: str) -> str:
 
 # ── Admin scan (live) + short-lived cache ────────────────────────
 
-async def _scan_admin_chats(context) -> List[Dict[str, Any]]:
+async def _scan_admin_chats(bot: Bot) -> List[Dict[str, Any]]:
     """Tracked groups where THIS bot is currently admin/creator."""
-    bot = context.bot
     rows = db.get_all_groups()
     if not rows:
         return []
@@ -175,12 +176,12 @@ async def _scan_admin_chats(context) -> List[Dict[str, Any]]:
     return [k for k in kept if k is not None]
 
 
-def _store_cache(context, chats: List[Dict[str, Any]]) -> None:
-    context.bot_data[_CACHE_KEY] = {"at": time.time(), "chats": chats}
+def _store_cache(bot_data: dict, chats: List[Dict[str, Any]]) -> None:
+    bot_data[_CACHE_KEY] = {"at": time.time(), "chats": chats}
 
 
-def _cached(context) -> Optional[List[Dict[str, Any]]]:
-    entry = context.bot_data.get(_CACHE_KEY)
+def _cached(bot_data: dict) -> Optional[List[Dict[str, Any]]]:
+    entry = bot_data.get(_CACHE_KEY)
     if not isinstance(entry, dict):
         return None
     if time.time() - float(entry.get("at", 0)) > _CACHE_TTL:
@@ -189,9 +190,9 @@ def _cached(context) -> Optional[List[Dict[str, Any]]]:
     return chats if isinstance(chats, list) else None
 
 
-async def _fresh_chats(context) -> List[Dict[str, Any]]:
-    chats = await _scan_admin_chats(context)
-    _store_cache(context, chats)
+async def _fresh_chats(bot: Bot, bot_data: dict) -> List[Dict[str, Any]]:
+    chats = await _scan_admin_chats(bot)
+    _store_cache(bot_data, chats)
     return chats
 
 
@@ -210,7 +211,7 @@ async def _answer(query, text: Optional[str] = None, *,
 
 async def _safe_edit(query, text: str, markup) -> None:
     try:
-        await query.edit_message_text(
+        await query.message.edit_text(
             text, parse_mode=ParseMode.HTML, reply_markup=markup
         )
     except Exception as e:
@@ -224,30 +225,28 @@ async def _safe_edit(query, text: str, markup) -> None:
 
 # ── Handlers ─────────────────────────────────────────────────────
 
-async def mychats_command(update: Update,
-                          context: ContextTypes.DEFAULT_TYPE) -> None:
+async def mychats_command(message: Message, bot: Bot, bot_data: dict) -> None:
     """/mychats — owner-only list of the bot's admin chats."""
-    msg = update.effective_message
+    msg = message
     if msg is None:
         return
-    if not _is_owner(update.effective_user):
-        await msg.reply_text(
+    if not _is_owner(message.from_user):
+        await reply_text(msg, 
             f"{E.CROWN} Only the bot owner can use /mychats.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    chats = await _fresh_chats(context)   # command always rescans
-    await msg.reply_text(
+    chats = await _fresh_chats(bot, bot_data)   # command always rescans
+    await reply_text(msg, 
         _menu_text(chats, 0),
         parse_mode=ParseMode.HTML,
         reply_markup=_menu_keyboard(chats, 0) if chats else None,
     )
 
 
-async def _send_info(query, context, chat_id: int, page: int) -> None:
+async def _send_info(query, bot: Bot, chat_id: int, page: int) -> None:
     """Swap the list for one chat's info card (live data + invite link)."""
-    bot = context.bot
     try:
         chat = await asyncio.wait_for(
             bot.get_chat(chat_id), timeout=_API_TIMEOUT
@@ -289,10 +288,9 @@ async def _send_info(query, context, chat_id: int, page: int) -> None:
                      _back_keyboard(page))
 
 
-async def mychats_callback(update: Update,
-                           context: ContextTypes.DEFAULT_TYPE) -> None:
+async def mychats_callback(callback_query: CallbackQuery, bot: Bot, bot_data: dict) -> None:
     """Route mychats:* callbacks — pagination, info cards, no-ops."""
-    query = update.callback_query
+    query = callback_query
     if query is None or not str(query.data or "").startswith(f"{_CB}:"):
         return
     if not _is_owner(query.from_user):
@@ -308,9 +306,9 @@ async def mychats_callback(update: Update,
         return
 
     # Page flips and info cards share the scan; refresh if it expired.
-    chats = _cached(context)
+    chats = _cached(bot_data)
     if chats is None:
-        chats = await _fresh_chats(context)
+        chats = await _fresh_chats(bot, bot_data)
 
     if action == "page":
         page = _clamp(_int_at(parts, 2), len(chats))
@@ -323,16 +321,17 @@ async def mychats_callback(update: Update,
         chat_id = _int_at(parts, 2)
         page = _clamp(_int_at(parts, 3), len(chats))
         await _answer(query)
-        await _send_info(query, context, chat_id, page)
+        await _send_info(query, bot, chat_id, page)
         return
 
     await _answer(query, "Unknown option", alert=True)
 
 
-def setup(app: Application) -> List[str]:
+def setup() -> List[str]:
     """Register this module's handlers. Returns route descriptions."""
-    app.add_handler(CommandHandler("mychats", mychats_command))
-    app.add_handler(
-        CallbackQueryHandler(mychats_callback, pattern=rf"^{_CB}:")
+    on("message", mychats_command, flt=cmd("mychats"))
+    on(
+        "callback_query", mychats_callback,
+        flt=F.data.regexp(re.compile(rf"^{_CB}:")),
     )
     return ["/mychats"]

@@ -37,6 +37,7 @@ atexit.register(shutil.rmtree, _TEST_DIR, ignore_errors=True)
 # ── Imports (after env) ───────────────────────────────────────────
 from bot.database import db  # noqa: E402
 from bot.modules import users as users_mod  # noqa: E402
+from aiofakes import call, make_callback, make_message  # noqa: E402
 
 ME_ID = 42
 TARGET_ID = 777
@@ -85,56 +86,43 @@ class _FakeBot:
         raise RuntimeError("user not found")
 
 
-class _FakeMessage:
-    def __init__(self, chat_type: str = "supergroup", reply=None):
-        self.chat = SimpleNamespace(id=-100123, type=chat_type, title="Test")
-        self.reply_to_message = reply
-        self.replies: list = []
-        self.deleted = False
-
-    async def reply_text(self, text, parse_mode=None, reply_markup=None, **kw):
-        self.replies.append({"text": text, "markup": reply_markup})
-
-    async def delete(self):
-        self.deleted = True
-
-    @property
-    def last(self):
-        return self.replies[-1] if self.replies else None
-
-
-def _cmd_update(args=None, reply=None, user=None, chat_type="supergroup"):
-    msg = _FakeMessage(chat_type, reply=reply)
-    return SimpleNamespace(
-        message=msg,
-        effective_message=msg,
-        effective_chat=msg.chat,
-        effective_user=user or _user(),
-    ), SimpleNamespace(args=args or [], bot=_FakeBot())
-
-
-def _cb_update(data: str, from_user=None):
-    query = SimpleNamespace(
-        data=data,
-        from_user=from_user or _user(TARGET_ID, "Clicker", "Person"),
-        answers=[],
-        edits=[],
-        message=_FakeMessage(),
+def _cmd(args=None, *, reply=None, chat_type="supergroup"):
+    """Command message + bot — reply_text records on ``msg.calls``."""
+    msg = make_message(
+        "/info", chat_id=-100123, chat_type=chat_type,
+        reply_to_message=reply,
     )
+    return msg, _FakeBot()
 
-    async def answer(text=None, show_alert=False, **kw):
-        query.answers.append({"text": text, "show_alert": show_alert})
 
-    async def edit_message_text(text, parse_mode=None, reply_markup=None, **kw):
-        query.edits.append({"text": text, "markup": reply_markup})
+def _cb(data: str, *, user_id=TARGET_ID, first="Clicker", last="Person"):
+    """info:* callback — its message records edits/deletes."""
+    cb = make_callback(data, user_id=user_id)
+    cb.from_user.first_name = first
+    cb.from_user.last_name = last
+    cb.from_user.full_name = f"{first} {last}".strip()
+    return cb
 
-    async def edit_message_reply_markup(reply_markup=None, **kw):
-        query.markup_stripped = reply_markup is None
 
-    query.answer = answer
-    query.edit_message_text = edit_message_text
-    query.edit_message_reply_markup = edit_message_reply_markup
-    return SimpleNamespace(callback_query=query), SimpleNamespace(bot=_FakeBot())
+def _sends(msg, kinds=("reply", "answer")):
+    """(text, markup) dicts for the given send kinds, oldest first."""
+    return [
+        {"text": t, "markup": kw.get("reply_markup")}
+        for (k, t, kw) in msg.calls if k in kinds
+    ]
+
+
+def _last(msg):
+    sent = _sends(msg)
+    return sent[-1] if sent else None
+
+
+def _edits(msg):
+    return _sends(msg, kinds=("edit_text",))
+
+
+def _deleted(msg):
+    return any(k == "delete" for (k, _, _) in msg.calls)
 
 
 def _flat(markup):
@@ -208,16 +196,10 @@ class TestInfoCardContent(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(buttons), 2)
         self.assertEqual(buttons[0].text, "My Info")
         self.assertEqual(buttons[0].callback_data, "info:me")
-        self.assertEqual(
-            (getattr(buttons[0], "api_kwargs", None) or {}).get("style"),
-            "primary",
-        )
+        self.assertEqual(getattr(buttons[0], "style", None), "primary")
         self.assertEqual(buttons[1].text, "Close")
         self.assertEqual(buttons[1].callback_data, "info:close")
-        self.assertEqual(
-            (getattr(buttons[1], "api_kwargs", None) or {}).get("style"),
-            "danger",
-        )
+        self.assertEqual(getattr(buttons[1], "style", None), "danger")
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -226,53 +208,59 @@ class TestInfoCardContent(unittest.IsolatedAsyncioTestCase):
 
 class TestInfoCommands(unittest.IsolatedAsyncioTestCase):
     async def test_info_defaults_to_self(self):
-        upd, ctx = _cmd_update()
-        await users_mod.info_command(upd, ctx)
-        self.assertIn(f"<code>{ME_ID}</code>", upd.message.last["text"])
-        self.assertIsNotNone(upd.message.last["markup"])
-        self.assertEqual(
-            _flat(upd.message.last["markup"])[0].callback_data, "info:me"
-        )
+        msg, bot = _cmd()
+        await call(users_mod.info_command, msg, bot=bot)
+        last = _last(msg)
+        self.assertIn(f"<code>{ME_ID}</code>", last["text"])
+        self.assertIsNotNone(last["markup"])
+        self.assertEqual(_flat(last["markup"])[0].callback_data, "info:me")
 
     async def test_info_numeric_target(self):
-        upd, ctx = _cmd_update(args=[str(TARGET_ID)])
-        await users_mod.info_command(upd, ctx)
-        self.assertIn(f"<code>{TARGET_ID}</code>", upd.message.last["text"])
-        self.assertIn("First Name: Target", upd.message.last["text"])
+        msg, bot = _cmd()
+        await call(users_mod.info_command, msg, bot=bot,
+                   args=[str(TARGET_ID)])
+        last = _last(msg)
+        self.assertIn(f"<code>{TARGET_ID}</code>", last["text"])
+        self.assertIn("First Name: Target", last["text"])
         # Resolved by numeric id (and used again for the bio lookup).
-        self.assertIn(TARGET_ID, ctx.bot.get_chat_calls)
+        self.assertIn(TARGET_ID, bot.get_chat_calls)
 
     async def test_info_unknown_target_errors(self):
-        upd, ctx = _cmd_update(args=["999999"])
-        await users_mod.info_command(upd, ctx)
-        self.assertIn("Could not find", upd.message.last["text"])
-        self.assertIn("Usage", upd.message.last["text"])
+        msg, bot = _cmd()
+        await call(users_mod.info_command, msg, bot=bot, args=["999999"])
+        last = _last(msg)
+        self.assertIn("Could not find", last["text"])
+        self.assertIn("Usage", last["text"])
 
     async def test_info_reply_target(self):
-        upd, ctx = _cmd_update(reply=SimpleNamespace(from_user=_user(TARGET_ID, "Replied")))
-        await users_mod.info_command(upd, ctx)
-        self.assertIn(f"<code>{TARGET_ID}</code>", upd.message.last["text"])
-        self.assertIn("First Name: Replied", upd.message.last["text"])
+        msg, bot = _cmd(
+            reply=SimpleNamespace(from_user=_user(TARGET_ID, "Replied"))
+        )
+        await call(users_mod.info_command, msg, bot=bot)
+        last = _last(msg)
+        self.assertIn(f"<code>{TARGET_ID}</code>", last["text"])
+        self.assertIn("First Name: Replied", last["text"])
 
     async def test_info_mention_target(self):
-        upd, ctx = _cmd_update(args=["@mentioned"])
-        await users_mod.info_command(upd, ctx)
-        self.assertIn(f"<code>{TARGET_ID}</code>", upd.message.last["text"])
+        msg, bot = _cmd()
+        await call(users_mod.info_command, msg, bot=bot, args=["@mentioned"])
+        self.assertIn(f"<code>{TARGET_ID}</code>", _last(msg)["text"])
 
     async def test_myinfo_always_self(self):
-        upd, ctx = _cmd_update(args=["ignored"])
-        await users_mod.myinfo_command(upd, ctx)
-        self.assertIn(f"<code>{ME_ID}</code>", upd.message.last["text"])
+        msg, bot = _cmd()
+        await call(users_mod.myinfo_command, msg, bot=bot, args=["ignored"])
+        self.assertIn(f"<code>{ME_ID}</code>", _last(msg)["text"])
 
     async def test_userinfo_requires_target(self):
-        upd, ctx = _cmd_update()
-        await users_mod.userinfo_command(upd, ctx)
-        self.assertIn("Please specify a user", upd.message.last["text"])
+        msg, bot = _cmd()
+        await call(users_mod.userinfo_command, msg, bot=bot, args=[])
+        self.assertIn("Please specify a user", _last(msg)["text"])
 
     async def test_userinfo_with_target(self):
-        upd, ctx = _cmd_update(args=[str(TARGET_ID)])
-        await users_mod.userinfo_command(upd, ctx)
-        self.assertIn(f"<code>{TARGET_ID}</code>", upd.message.last["text"])
+        msg, bot = _cmd()
+        await call(users_mod.userinfo_command, msg, bot=bot,
+                   args=[str(TARGET_ID)])
+        self.assertIn(f"<code>{TARGET_ID}</code>", _last(msg)["text"])
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -281,33 +269,33 @@ class TestInfoCommands(unittest.IsolatedAsyncioTestCase):
 
 class TestInfoCallback(unittest.IsolatedAsyncioTestCase):
     async def test_my_info_renders_for_clicker(self):
-        upd, ctx = _cb_update("info:me")
-        await users_mod.info_callback(upd, ctx)
-        self.assertEqual(len(upd.callback_query.answers), 1)
-        self.assertEqual(len(upd.callback_query.edits), 1)
-        edit = upd.callback_query.edits[0]
+        cb = _cb("info:me")
+        await call(users_mod.info_callback, cb, bot=_FakeBot())
+        self.assertEqual(len(cb.answers), 1)
+        edits = _edits(cb.message)
+        self.assertEqual(len(edits), 1)
         # Clicker is TARGET_ID, not the original sender.
-        self.assertIn(f"<code>{TARGET_ID}</code>", edit["text"])
-        self.assertIn("Clicker Person", edit["text"])
-        self.assertIsNotNone(edit["markup"])
-        self.assertFalse(upd.callback_query.message.deleted)
+        self.assertIn(f"<code>{TARGET_ID}</code>", edits[0]["text"])
+        self.assertIn("Clicker Person", edits[0]["text"])
+        self.assertIsNotNone(edits[0]["markup"])
+        self.assertFalse(_deleted(cb.message))
 
     async def test_close_deletes_message(self):
-        upd, ctx = _cb_update("info:close")
-        await users_mod.info_callback(upd, ctx)
-        self.assertTrue(upd.callback_query.message.deleted)
-        self.assertEqual(upd.callback_query.edits, [])
+        cb = _cb("info:close")
+        await call(users_mod.info_callback, cb, bot=_FakeBot())
+        self.assertTrue(_deleted(cb.message))
+        self.assertEqual(_edits(cb.message), [])
 
     async def test_unknown_action_alerts(self):
-        upd, ctx = _cb_update("info:bogus")
-        await users_mod.info_callback(upd, ctx)
-        self.assertTrue(upd.callback_query.answers[0]["show_alert"])
-        self.assertEqual(upd.callback_query.edits, [])
+        cb = _cb("info:bogus")
+        await call(users_mod.info_callback, cb, bot=_FakeBot())
+        self.assertTrue(cb.answers[0]["show_alert"])
+        self.assertEqual(_edits(cb.message), [])
 
     async def test_foreign_callback_ignored(self):
-        upd, ctx = _cb_update("tag:whatever")
-        await users_mod.info_callback(upd, ctx)
-        self.assertEqual(upd.callback_query.answers, [])
+        cb = _cb("tag:whatever")
+        await call(users_mod.info_callback, cb, bot=_FakeBot())
+        self.assertEqual(cb.answers, [])
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -316,33 +304,33 @@ class TestInfoCallback(unittest.IsolatedAsyncioTestCase):
 
 class TestIdCommand(unittest.IsolatedAsyncioTestCase):
     async def test_id_chat_and_user(self):
-        upd, ctx = _cmd_update()
-        await users_mod.id_command(upd, ctx)
-        text = upd.message.last["text"]
+        msg, _bot = _cmd()
+        await call(users_mod.id_command, msg)
+        text = _last(msg)["text"]
         self.assertIn("Chat ID: <code>-100123</code>", text)
         self.assertIn("Your ID: <code>42</code>", text)
         self.assertNotIn("Target", text)
 
     async def test_id_with_reply_target(self):
-        upd, ctx = _cmd_update(reply=SimpleNamespace(from_user=_user(TARGET_ID)))
-        await users_mod.id_command(upd, ctx)
-        text = upd.message.last["text"]
+        msg, _bot = _cmd(reply=SimpleNamespace(from_user=_user(TARGET_ID)))
+        await call(users_mod.id_command, msg)
+        text = _last(msg)["text"]
         self.assertIn("Chat ID:", text)
         self.assertIn(f"<code>{TARGET_ID}</code>", text)
         self.assertIn("tg://user?id=777", text)
 
     async def test_id_private_chat(self):
-        upd, ctx = _cmd_update(chat_type="private")
-        upd.effective_chat.id = ME_ID  # DM chat id == user id
-        await users_mod.id_command(upd, ctx)
-        text = upd.message.last["text"]
+        msg, _bot = _cmd(chat_type="private")
+        msg.chat.id = ME_ID  # DM chat id == user id
+        await call(users_mod.id_command, msg)
+        text = _last(msg)["text"]
         self.assertIn(f"<code>{ME_ID}</code>", text)
 
     async def test_id_uses_custom_emoji(self):
         """Chat/Your/Target icons must be custom, never plain 💬/🎯."""
-        upd, ctx = _cmd_update(reply=SimpleNamespace(from_user=_user(TARGET_ID)))
-        await users_mod.id_command(upd, ctx)
-        text = upd.message.last["text"]
+        msg, _bot = _cmd(reply=SimpleNamespace(from_user=_user(TARGET_ID)))
+        await call(users_mod.id_command, msg)
+        text = _last(msg)["text"]
         self.assertIn("<tg-emoji", text)
         self.assertNotIn("💬", text)
         self.assertNotIn("🎯", text)

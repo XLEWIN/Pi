@@ -6,7 +6,7 @@ Callback data lives under the `tag:` prefix (group 0 handler).
 
 from __future__ import annotations
 
-from telegram import InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardMarkup
 
 from bot.emojis import EID
 from bot.keyboards.colored import (

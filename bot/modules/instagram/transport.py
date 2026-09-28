@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from telegram import Message
-from telegram.constants import ParseMode
+from aiogram.enums import ParseMode
+from aiogram.types import FSInputFile, Message
 
 from .config import ig_config
 from .metrics import ig_log, metrics
@@ -79,13 +79,13 @@ class TelegramTransport:
         if reply_to_message_id:
             common["reply_to_message_id"] = reply_to_message_id
 
-        with path.open("rb") as fh:
-            if kind == MediaKind.PHOTO:
-                return await self.bot.send_photo(photo=fh, **common)
-            if kind == MediaKind.VIDEO:
-                return await self.bot.send_video(video=fh, supports_streaming=True, **common)
-            if kind == MediaKind.AUDIO:
-                return await self.bot.send_audio(audio=fh, **common)
-            if kind == MediaKind.ANIMATION:
-                return await self.bot.send_animation(animation=fh, **common)
-            return await self.bot.send_document(document=fh, filename=path.name, **common)
+        upload = FSInputFile(path, filename=path.name)
+        if kind == MediaKind.PHOTO:
+            return await self.bot.send_photo(photo=upload, **common)
+        if kind == MediaKind.VIDEO:
+            return await self.bot.send_video(video=upload, supports_streaming=True, **common)
+        if kind == MediaKind.AUDIO:
+            return await self.bot.send_audio(audio=upload, **common)
+        if kind == MediaKind.ANIMATION:
+            return await self.bot.send_animation(animation=upload, **common)
+        return await self.bot.send_document(document=upload, **common)

@@ -15,19 +15,16 @@ Callback data:
 
 from __future__ import annotations
 
+import re
 from html import escape
 
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    ChatJoinRequestHandler,
-    ContextTypes,
-)
+from aiogram import Bot, F
+from aiogram.enums import ParseMode
+from aiogram.types import CallbackQuery, ChatJoinRequest, Message
 
-from bot.command_handler import CommandHandler
 from bot.database import db
+from bot.pipeline import cmd, on
+from bot.reply import reply_text
 from bot.emojis import E, EID
 from bot.keyboards.colored import btn_danger, btn_success, build_keyboard
 from bot.logger import logger
@@ -45,10 +42,10 @@ _PENDING: dict[tuple[int, int], str] = {}
 
 # ── Helpers ──────────────────────────────────────────────────────
 
-async def _is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+async def _is_admin(message: Message, bot: Bot) -> bool:
     try:
-        member = await context.bot.get_chat_member(
-            update.effective_chat.id, update.effective_user.id
+        member = await bot.get_chat_member(
+            message.chat.id, message.from_user.id
         )
         return member.status in ("administrator", "creator")
     except Exception:
@@ -111,26 +108,26 @@ def request_keyboard(chat_id: int, user_id: int):
 
 # ── /request on|off ──────────────────────────────────────────────
 
-async def request_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def request_command(message: Message, bot: Bot, args: list) -> None:
     """Handle /request — show status, or toggle with on/off."""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(
+    if message.chat.type == "private":
+        await reply_text(message, 
             f"{E.ERROR} This command only works in groups.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    if not await _is_admin(update, context):
-        await update.message.reply_text(
+    if not await _is_admin(message, bot):
+        await reply_text(message, 
             f"{E.ERROR} You need admin rights to change join request settings.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    if not context.args or context.args[0].lower() not in ("on", "off"):
-        enabled = db.get_join_requests(update.effective_chat.id)
+    if not args or args[0].lower() not in ("on", "off"):
+        enabled = db.get_join_requests(message.chat.id)
         await reply_card(
-            update.message,
+            message,
             action_card(
                 "Join Requests",
                 [
@@ -144,10 +141,10 @@ async def request_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    enable = context.args[0].lower() == "on"
-    db.set_join_requests(update.effective_chat.id, enable)
+    enable = args[0].lower() == "on"
+    db.set_join_requests(message.chat.id, enable)
     await reply_card(
-        update.message,
+        message,
         action_card(
             "Join Requests",
             [
@@ -167,11 +164,9 @@ async def request_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 # ── ChatJoinRequestHandler ───────────────────────────────────────
 
-async def on_join_request(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
+async def on_join_request(chat_join_request: ChatJoinRequest, bot: Bot) -> None:
     """Post the approval card when someone requests to join the group."""
-    request = update.chat_join_request
+    request = chat_join_request
     if request is None:
         return
 
@@ -182,7 +177,7 @@ async def on_join_request(
     _PENDING[(chat.id, request.from_user.id)] = _mention(request.from_user)
 
     try:
-        await context.bot.send_message(
+        await bot.send_message(
             chat.id,
             request_card(request.from_user),
             parse_mode=ParseMode.HTML,
@@ -194,11 +189,9 @@ async def on_join_request(
 
 # ── Accept / Decline callbacks ───────────────────────────────────
 
-async def join_request_callback(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
+async def join_request_callback(callback_query: CallbackQuery, bot: Bot) -> None:
     """Approve/decline a pending request and rewrite the card in place."""
-    query = update.callback_query
+    query = callback_query
     if query is None or not (query.data or "").startswith(f"{_CB}:"):
         return
 
@@ -218,7 +211,7 @@ async def join_request_callback(
 
     # Admin gate — only group admins/owner may press the buttons.
     try:
-        member = await context.bot.get_chat_member(chat_id, query.from_user.id)
+        member = await bot.get_chat_member(chat_id, query.from_user.id)
         if member.status not in ("administrator", "creator"):
             await query.answer(
                 "Only admins can process join requests.", show_alert=True
@@ -238,9 +231,9 @@ async def join_request_callback(
 
     try:
         if action == "accept":
-            await context.bot.approve_chat_join_request(chat_id, user_id)
+            await bot.approve_chat_join_request(chat_id, user_id)
         else:
-            await context.bot.decline_chat_join_request(chat_id, user_id)
+            await bot.decline_chat_join_request(chat_id, user_id)
     except Exception as e:
         logger.warning(f"Join request {action} failed for {user_id}: {e}")
         await _edit_text(
@@ -251,7 +244,7 @@ async def join_request_callback(
     # Approved users become members → live lookup gives a fresh name;
     # declined users never were members → use the card-time cache.
     try:
-        member = await context.bot.get_chat_member(chat_id, user_id)
+        member = await bot.get_chat_member(chat_id, user_id)
         requester_text = _mention(member.user)
     except Exception:
         requester_text = _PENDING.pop(
@@ -267,19 +260,20 @@ async def join_request_callback(
 
 async def _edit_text(query, text: str) -> None:
     try:
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML)
+        await query.message.edit_text(text, parse_mode=ParseMode.HTML)
     except Exception as e:
         logger.debug(f"join-request result edit failed: {e}")
 
 
 # ── Module setup ─────────────────────────────────────────────────
 
-def setup(app: Application) -> list[str]:
+def setup() -> list[str]:
     """Register this module's handlers. Returns route descriptions for the log."""
-    app.add_handler(CommandHandler("request", request_command))
-    app.add_handler(ChatJoinRequestHandler(on_join_request))
-    app.add_handler(
-        CallbackQueryHandler(join_request_callback, pattern=rf"^{_CB}:")
+    on("message", request_command, flt=cmd("request"))
+    on("chat_join_request", on_join_request)
+    on(
+        "callback_query", join_request_callback,
+        flt=F.data.regexp(re.compile(rf"^{_CB}:")),
     )
     return [
         "/request on|off",

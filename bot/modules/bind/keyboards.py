@@ -8,7 +8,7 @@ Unicode outside that set.
 
 from typing import Any, Dict, List, Optional
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot.emojis import EID
 from bot.keyboards.colored import (

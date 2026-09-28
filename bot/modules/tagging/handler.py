@@ -12,11 +12,12 @@ from __future__ import annotations
 import asyncio
 import time
 
-from telegram import Update
-from telegram.ext import ContextTypes
+from aiogram import Bot
+from aiogram.types import CallbackQuery, ChatMemberUpdated, Message
 
 from bot.emojis import E
 from bot.logger import logger
+from bot.reply import reply_text
 from bot.responses import action_card, plain_error, plain_ok
 
 from . import (
@@ -57,8 +58,8 @@ _VALUE_OVERRIDES = {
 
 async def _reply(message, text: str, reply_markup=None):
     """HTML reply helper (E.* are tg-emoji HTML)."""
-    return await message.reply_text(
-        text, parse_mode="HTML", reply_markup=reply_markup
+    return await reply_text(
+        message, text, parse_mode="HTML", reply_markup=reply_markup
     )
 
 
@@ -82,40 +83,39 @@ def settings_card(st: TagSettings) -> str:
 
 # ── /all ──────────────────────────────────────────────────────────
 
-async def all_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
-    chat = update.effective_chat
-    user = update.effective_user
-    if msg is None or chat is None or user is None:
+async def all_command(message: Message, bot: Bot) -> None:
+    if message is None or message.chat is None or message.from_user is None:
         return
+    chat = message.chat
+    user = message.from_user
 
     if not _is_group(chat):
-        await _reply(msg, plain_error(config.MSG_NOT_GROUP))
+        await _reply(message, plain_error(config.MSG_NOT_GROUP))
         return
-    if msg.reply_to_message is None:
-        await _reply(msg, plain_error(config.MSG_NO_REPLY))
+    if message.reply_to_message is None:
+        await _reply(message, plain_error(config.MSG_NO_REPLY))
         return
     if sess_mod.is_running(chat.id):
-        await _reply(msg, plain_error(config.MSG_RUNNING))
+        await _reply(message, plain_error(config.MSG_RUNNING))
         return
-    if not await permissions.is_admin(chat.id, user.id, context.bot):
-        await _reply(msg, plain_error(config.MSG_NOT_ADMIN))
+    if not await permissions.is_admin(chat.id, user.id, bot):
+        await _reply(message, plain_error(config.MSG_NOT_ADMIN))
         return
 
     get_manager().kick()  # deferred MTProto startup (needs a running loop)
 
     # Authoritative admin exclusion — fetched fresh for every /all.
     try:
-        admins = await permissions.admin_ids(chat.id, context.bot)
+        admins = await permissions.admin_ids(chat.id, bot)
     except AdminFetchError:
-        await _reply(msg, plain_error(config.MSG_ADMIN_FETCH_FAIL))
+        await _reply(message, plain_error(config.MSG_ADMIN_FETCH_FAIL))
         return
 
     st = settings_mod.get(chat.id)
-    source = msg.reply_to_message
+    source = message.reply_to_message
 
     # Status card exists before the session (session needs its message id).
-    status = await _reply(msg, sender.start_card(st))
+    status = await _reply(message, sender.start_card(st))
 
     db_id = 0
     try:
@@ -142,7 +142,7 @@ async def all_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await status.delete()
         except Exception:
             pass
-        await _reply(msg, plain_error(config.MSG_RUNNING))
+        await _reply(message, plain_error(config.MSG_RUNNING))
         return
     except Exception as e:
         logger.error(f"Tagging session create failed chat={chat.id}", exc_info=e)
@@ -155,67 +155,65 @@ async def all_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await status.delete()
         except Exception:
             pass
-        await _reply(msg, plain_error("Could not start tagging — try again."))
+        await _reply(message, plain_error("Could not start tagging — try again."))
         return
 
-    session.task = asyncio.create_task(sender.run(session, context))
+    session.task = asyncio.create_task(sender.run(session, bot))
 
 
 # ── /tagabort ─────────────────────────────────────────────────────
 
-async def tagabort_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
-    chat = update.effective_chat
-    user = update.effective_user
-    if msg is None or chat is None or user is None:
+async def tagabort_command(message: Message, bot: Bot) -> None:
+    if message is None or message.chat is None or message.from_user is None:
         return
+    chat = message.chat
+    user = message.from_user
 
     s = sess_mod.get(chat.id)
     if s is None or not s.running:
-        await _reply(msg, plain_error(config.MSG_NO_SESSION))
+        await _reply(message, plain_error(config.MSG_NO_SESSION))
         return
-    if not await permissions.is_admin(chat.id, user.id, context.bot):
-        await _reply(msg, plain_error(config.MSG_NOT_ADMIN))
+    if not await permissions.is_admin(chat.id, user.id, bot):
+        await _reply(message, plain_error(config.MSG_NOT_ADMIN))
         return
 
     s.token.cancel()
     try:
         await asyncio.wait_for(s.done.wait(), timeout=8.0)
     except asyncio.TimeoutError:
-        await _reply(msg, plain_ok("Stopping after the current message…"))
+        await _reply(message, plain_ok("Stopping after the current message…"))
         return
 
     if s.state == "completed":
         await _reply(
-            msg,
+            message,
             plain_ok(f"Tagging already finished. Tagged: {s.tagged} / {s.total} users"),
         )
         return
     await _reply(
-        msg, plain_ok(config.MSG_STOPPED_FMT.format(tagged=s.tagged, total=s.total))
+        message, plain_ok(config.MSG_STOPPED_FMT.format(tagged=s.tagged, total=s.total))
     )
 
 
 # ── /allsettings ──────────────────────────────────────────────────
 
-async def allsettings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
-    chat = update.effective_chat
-    user = update.effective_user
-    if msg is None or chat is None or user is None:
+async def allsettings_command(message: Message, bot: Bot, args: list) -> None:
+    if message is None or message.chat is None or message.from_user is None:
         return
+    chat = message.chat
+    user = message.from_user
 
     if not _is_group(chat):
-        await _reply(msg, plain_error(config.MSG_NOT_GROUP))
+        await _reply(message, plain_error(config.MSG_NOT_GROUP))
         return
-    if not await permissions.is_admin(chat.id, user.id, context.bot):
-        await _reply(msg, plain_error(config.MSG_NOT_ADMIN))
+    if not await permissions.is_admin(chat.id, user.id, bot):
+        await _reply(message, plain_error(config.MSG_NOT_ADMIN))
         return
 
-    args = context.args or []
+    args = args or []
     if not args:
         st = settings_mod.get(chat.id)
-        await _reply(msg, settings_card(st), reply_markup=settings_keyboard(st))
+        await _reply(message, settings_card(st), reply_markup=settings_keyboard(st))
         return
 
     key_raw = args[0].lower()
@@ -223,10 +221,10 @@ async def allsettings_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         st = settings_mod.apply_arg(chat.id, key_raw, value)
     except ValueError as e:
-        await _reply(msg, plain_error(str(e)))
+        await _reply(message, plain_error(str(e)))
         return
     await _reply(
-        msg,
+        message,
         action_card(
             "Settings Updated",
             [(E.CHECK, "Setting", f"<b>{key_raw}</b> → {value or 'next'}")],
@@ -238,18 +236,17 @@ async def allsettings_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # ── /tagstats ─────────────────────────────────────────────────────
 
-async def tagstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
-    chat = update.effective_chat
-    user = update.effective_user
-    if msg is None or chat is None or user is None:
+async def tagstats_command(message: Message, bot: Bot) -> None:
+    if message is None or message.chat is None or message.from_user is None:
         return
+    chat = message.chat
+    user = message.from_user
 
     if not _is_group(chat):
-        await _reply(msg, plain_error(config.MSG_NOT_GROUP))
+        await _reply(message, plain_error(config.MSG_NOT_GROUP))
         return
-    if not await permissions.is_admin(chat.id, user.id, context.bot):
-        await _reply(msg, plain_error(config.MSG_NOT_ADMIN))
+    if not await permissions.is_admin(chat.id, user.id, bot):
+        await _reply(message, plain_error(config.MSG_NOT_ADMIN))
         return
 
     st = settings_mod.get(chat.id)
@@ -276,18 +273,18 @@ async def tagstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         ],
         icon=E.ANNOUNCE,
     )
-    await _reply(msg, card, reply_markup=stats_keyboard())
+    await _reply(message, card, reply_markup=stats_keyboard())
 
 
 # ── tag: callbacks ────────────────────────────────────────────────
 
-async def tag_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def tag_callback(callback_query: CallbackQuery, bot: Bot) -> None:
     """tag:abort + tag:set:<key> (settings cycles)."""
-    query = update.callback_query
+    query = callback_query
     if query is None:
         return
     data = query.data or ""
-    chat = update.effective_chat
+    chat = query.message.chat if query.message else None
     user = query.from_user
     if chat is None or user is None:
         return
@@ -295,10 +292,10 @@ async def tag_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     parts = data.split(":", 2)
 
     if len(parts) == 2 and parts[1] == "abort":
-        await _handle_abort_click(update, context)
+        await _handle_abort_click(callback_query, bot)
         return
     if len(parts) == 3 and parts[1] == "set":
-        await _handle_set_click(update, context, parts[2])
+        await _handle_set_click(callback_query, bot, parts[2])
         return
     try:
         await query.answer()
@@ -306,15 +303,15 @@ async def tag_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         pass
 
 
-async def _handle_abort_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    chat = update.effective_chat
+async def _handle_abort_click(callback_query: CallbackQuery, bot: Bot) -> None:
+    query = callback_query
+    chat = query.message.chat if query.message else None
     user = query.from_user
     s = sess_mod.get(chat.id) if chat else None
     if s is None or not s.running:
         await _safe_answer(query, config.MSG_NO_SESSION, alert=True)
         return
-    if not await permissions.is_admin(chat.id, user.id, context.bot):
+    if not await permissions.is_admin(chat.id, user.id, bot):
         await _safe_answer(query, config.MSG_NOT_ADMIN, alert=True)
         return
     s.token.cancel()
@@ -326,17 +323,17 @@ async def _handle_abort_click(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def _handle_set_click(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, key: str
+    callback_query: CallbackQuery, bot: Bot, key: str
 ) -> None:
-    query = update.callback_query
-    chat = update.effective_chat
+    query = callback_query
+    chat = query.message.chat if query.message else None
     user = query.from_user
     if chat is None or user is None:
         return
     if not _is_group(chat):
         await _safe_answer(query, config.MSG_NOT_GROUP, alert=True)
         return
-    if not await permissions.is_admin(chat.id, user.id, context.bot):
+    if not await permissions.is_admin(chat.id, user.id, bot):
         await _safe_answer(query, config.MSG_NOT_ADMIN, alert=True)
         return
     try:
@@ -345,7 +342,7 @@ async def _handle_set_click(
         await _safe_answer(query, "Unknown setting.", alert=True)
         return
     try:
-        await query.edit_message_text(
+        await query.message.edit_text(
             settings_card(st),
             parse_mode="HTML",
             reply_markup=settings_keyboard(st),
@@ -364,34 +361,32 @@ async def _safe_answer(query, text: str, *, alert: bool = False) -> None:
 
 # ── Observers (groups 15/16/17) ───────────────────────────────────
 
-async def activity_observer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def activity_observer(message: Message) -> None:
     """Group message → buffered activity touch (no DB in hot path)."""
     get_manager().kick()  # one-time deferred MTProto startup
-    msg = update.effective_message
-    chat = update.effective_chat
-    if msg is None or chat is None or msg.from_user is None:
+    if message is None or message.chat is None or message.from_user is None:
         return
-    if msg.sender_chat is not None:
+    chat = message.chat
+    if message.sender_chat is not None:
         return  # anonymous admin / channel post — no real user to tag
-    activity_tracker.touch(chat.id, msg.from_user)
+    activity_tracker.touch(chat.id, message.from_user)
 
 
-async def member_observer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def member_observer(message: Message) -> None:
     """Joins/leaves via service messages → immediate registry writes."""
-    msg = update.effective_message
-    chat = update.effective_chat
-    if msg is None or chat is None:
+    if message is None or message.chat is None:
         return
-    for u in msg.new_chat_members or ():
+    chat = message.chat
+    for u in message.new_chat_members or ():
         member_registry.on_join(chat.id, u)
-    left = msg.left_chat_member
+    left = message.left_chat_member
     if left is not None:
         member_registry.on_leave(chat.id, left)
 
 
-async def chat_member_observer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def chat_member_observer(chat_member: ChatMemberUpdated) -> None:
     """chat_member updates → registry join/leave (large-chat precision)."""
-    change = update.chat_member
+    change = chat_member
     if change is None:
         return
     new = change.new_chat_member
@@ -406,13 +401,13 @@ async def chat_member_observer(update: Update, context: ContextTypes.DEFAULT_TYP
         member_registry.on_leave(change.chat.id, new.user)
 
 
-async def callback_activity_observer(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
+async def callback_activity_observer(callback_query: CallbackQuery) -> None:
     """Any callback press counts as activity (group chats only)."""
-    query = update.callback_query
-    chat = update.effective_chat
-    if query is None or chat is None or query.from_user is None:
+    query = callback_query
+    if query is None:
+        return
+    chat = query.message.chat if query.message else None
+    if chat is None or query.from_user is None:
         return
     if not _is_group(chat):
         return

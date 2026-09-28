@@ -55,6 +55,7 @@ from bot.modules.tagging.tagall import (  # noqa: E402
     tagall_command,
 )
 from bot.modules.tagging.models import TagSettings  # noqa: E402
+from aiofakes import call  # noqa: E402
 
 CHAT = -999888777
 _AT_RE = re.compile(r"^@(all|eall)(?:\s|$)")
@@ -99,34 +100,30 @@ class _FakeBot:
 
 
 class _FakeMessage:
-    def __init__(self, *, chat_id=CHAT, reply_to=None, text=None):
-        self.chat = SimpleNamespace(id=chat_id, type="supergroup")
+    def __init__(self, *, chat_id=CHAT, reply_to=None, text=None,
+                 chat_type="supergroup", user_id=42):
+        self.chat = SimpleNamespace(id=chat_id, type=chat_type)
+        self.from_user = SimpleNamespace(
+            id=user_id, is_bot=False, first_name="Invoker", username="invoker",
+        )
         self.reply_to_message = reply_to
         self.text = text
         self.replies = []
         self.message_id = 500
         self.message_thread_id = None
 
-    async def reply_text(self, text, parse_mode=None, reply_markup=None):
-        self.replies.append({"text": text, "markup": reply_markup})
+    async def _record(self, text, **kw):
+        self.replies.append({"text": text, "markup": kw.get("reply_markup")})
         return SimpleNamespace(message_id=501, chat=self.chat,
                                message_thread_id=None)
+
+    # bot.reply routes group → reply, private → answer; reply_text is
+    # the PTB-era shortcut some helpers still call.
+    reply = answer = reply_text = _record
 
     @property
     def last(self):
         return self.replies[-1]["text"] if self.replies else ""
-
-
-def _fake_update(msg, user_id=42):
-    return SimpleNamespace(
-        effective_message=msg,
-        effective_chat=msg.chat,
-        effective_user=SimpleNamespace(id=user_id),
-    )
-
-
-def _fake_context(bot=None):
-    return SimpleNamespace(bot=bot or _FakeBot())
 
 
 def _fake_source(chat_id=CHAT, message_id=77):
@@ -140,18 +137,18 @@ def _fake_source(chat_id=CHAT, message_id=77):
 def _fake_status():
     msg = SimpleNamespace(deleted=False, edits=[], replies=[])
 
-    async def edit_message_text(text, parse_mode=None, reply_markup=None):
+    async def edit_text(text, **kw):
         msg.edits.append(text)
+
+    async def reply(text, **kw):
+        msg.replies.append(text)
 
     async def delete():
         msg.deleted = True
 
-    async def reply_text(text, parse_mode=None, reply_markup=None):
-        msg.replies.append(text)
-
-    msg.edit_message_text = edit_message_text
+    msg.edit_text = edit_text
+    msg.reply = reply
     msg.delete = delete
-    msg.reply_text = reply_text
     return msg
 
 
@@ -265,33 +262,30 @@ class TestSpecStrings(unittest.TestCase):
 
 class TestTagallCommand(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
     async def test_private_rejected(self):
-        msg = _FakeMessage(text="/tagall hi")
-        upd = _fake_update(msg)
-        upd.effective_chat = SimpleNamespace(id=1, type="private")
-        await tagall_command(upd, _fake_context())
+        msg = _FakeMessage(text="/tagall hi", chat_id=1, chat_type="private")
+        await call(tagall_command, msg, bot=_FakeBot())
         self.assertIn(config.MSG_NOT_GROUP, msg.last)
 
     async def test_text_and_reply_rejected(self):
         msg = _FakeMessage(text="/tagall hi", reply_to=_fake_source())
-        await tagall_command(_fake_update(msg), _fake_context())
+        await call(tagall_command, msg, bot=_FakeBot())
         self.assertIn(config.MSG_TAGALL_ONE_ARG, msg.last)
 
     async def test_no_input_rejected(self):
         msg = _FakeMessage(text="/tagall")
-        await tagall_command(_fake_update(msg), _fake_context())
+        await call(tagall_command, msg, bot=_FakeBot())
         self.assertIn(config.MSG_TAGALL_NO_INPUT, msg.last)
 
     async def test_requires_admin(self):
         msg = _FakeMessage(text="/tagall hi")
-        ctx = _fake_context(bot=_FakeBot(invoker_status="member"))
-        await tagall_command(_fake_update(msg), ctx)
+        await call(tagall_command, msg, bot=_FakeBot(invoker_status="member"))
         self.assertIn(config.MSG_NOT_ADMIN, msg.last)
 
     async def test_running_blocks_new_start(self):
         status = _fake_status()
         _run_session(status)
         msg = _FakeMessage(text="/tagall hi")
-        await tagall_command(_fake_update(msg), _fake_context())
+        await call(tagall_command, msg, bot=_FakeBot())
         self.assertIn(config.MSG_RUNNING, msg.last)
 
     async def test_admin_fetch_failure_is_fatal(self):
@@ -302,7 +296,7 @@ class TestTagallCommand(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("nope")
 
         bot.get_chat_administrators = boom
-        await tagall_command(_fake_update(msg), _fake_context(bot=bot))
+        await call(tagall_command, msg, bot=bot)
         self.assertIn(config.MSG_ADMIN_FETCH_FAIL, msg.last)
 
     async def test_admin_starts_windowless_session(self):
@@ -311,7 +305,7 @@ class TestTagallCommand(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
         settings_mod.apply_arg(CHAT, "max", "50")
         msg = _FakeMessage(text="/tagall hello all")
         with patch.object(tagall_mod, "run", new=AsyncMock()) as run_mock:
-            await tagall_command(_fake_update(msg), _fake_context())
+            await call(tagall_command, msg, bot=_FakeBot())
             self.assertIsNotNone(sess_mod.get(CHAT))
             s = sess_mod.get(CHAT)
             self.assertEqual(s.settings.mode, "all")  # boabot: everybody
@@ -333,7 +327,7 @@ class TestTriggers(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
     async def test_etagall_sets_emoji_mode(self):
         msg = _FakeMessage(text="/etagall party")
         with patch.object(tagall_mod, "run", new=AsyncMock()) as run_mock:
-            await etagall_command(_fake_update(msg), _fake_context())
+            await call(etagall_command, msg, bot=_FakeBot())
             s = sess_mod.get(CHAT)
             self.assertIsNotNone(s)
             if s.task:
@@ -344,7 +338,7 @@ class TestTriggers(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
     async def test_at_all_trigger(self):
         msg = _FakeMessage(text="@all wake up")
         with patch.object(tagall_mod, "run", new=AsyncMock()) as run_mock:
-            await at_trigger(_fake_update(msg), _fake_context())
+            await call(at_trigger, msg, bot=_FakeBot())
             s = sess_mod.get(CHAT)
             self.assertIsNotNone(s)
             if s.task:
@@ -356,7 +350,7 @@ class TestTriggers(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
     async def test_at_eall_trigger(self):
         msg = _FakeMessage(text="@eall party")
         with patch.object(tagall_mod, "run", new=AsyncMock()) as run_mock:
-            await at_trigger(_fake_update(msg), _fake_context())
+            await call(at_trigger, msg, bot=_FakeBot())
             s = sess_mod.get(CHAT)
             if s.task:
                 await s.task
@@ -375,7 +369,7 @@ class TestTagallRun(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
         bot = bot or _RunBot()
         with patch.object(config, "TAGALL_BATCH_DELAY", 0):
             await tagall_mod.run(
-                s, _fake_context(bot=bot),
+                s, bot,
                 text=text, reply_mode=reply_mode, emoji_mode=emoji_mode,
             )
         return s, bot, status
@@ -453,7 +447,7 @@ class TestTagallRun(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
         type(bot).session = s
 
         with patch.object(config, "TAGALL_BATCH_DELAY", 0):
-            await tagall_mod.run(s, _fake_context(bot=bot), text="go")
+            await tagall_mod.run(s, bot, text="go")
 
         self.assertEqual(s.state, "aborted")
         self.assertEqual(len(bot.sent), 1)  # stopped after first batch
@@ -471,7 +465,7 @@ class TestTagallRun(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
         s = _run_session(status)
         bot = _RunBot()
 
-        await tagall_mod.run(s, _fake_context(bot=bot), text="hi")
+        await tagall_mod.run(s, bot, text="hi")
 
         self.assertEqual(s.state, "failed")
         self.assertEqual(bot.sent, [])

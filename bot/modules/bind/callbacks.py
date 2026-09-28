@@ -4,9 +4,9 @@ import logging
 from html import escape
 from typing import Any, Dict, Optional
 
-from telegram import InlineKeyboardMarkup, Update
-from telegram.constants import ParseMode
-from telegram.ext import ContextTypes
+from aiogram import Bot
+from aiogram.enums import ParseMode
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup
 
 from bot.emojis import E
 
@@ -51,7 +51,7 @@ async def _safe_answer(query, text: str = "", alert: bool = False) -> None:
 
 async def _edit(query, text: str, reply_markup: Optional[InlineKeyboardMarkup]) -> None:
     try:
-        await query.edit_message_text(
+        await query.message.edit_text(
             text,
             parse_mode=ParseMode.HTML,
             reply_markup=reply_markup,
@@ -63,13 +63,13 @@ async def _edit(query, text: str, reply_markup: Optional[InlineKeyboardMarkup]) 
             logger.debug(f"bind callback edit failed: {e}")
 
 
-async def _deny_non_admin(query, context, chat_id: int, user_id: int) -> bool:
+async def _deny_non_admin(query, bot, chat_id: int, user_id: int) -> bool:
     """Return True (and answer) if the user is no longer a group admin."""
-    if await is_group_admin(context.bot, chat_id, user_id):
+    if await is_group_admin(bot, chat_id, user_id):
         return False
     await _safe_answer(query, "Admin rights required.", alert=True)
     try:
-        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
     return True
@@ -125,13 +125,13 @@ def _status_text(settings: Dict[str, Any], group_title: str = "") -> str:
     return "\n".join(rows)
 
 
-async def bind_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def bind_callback(callback_query: CallbackQuery, bot: Bot, chat_data: dict) -> None:
     """Route all ^bind: callbacks."""
-    query = update.callback_query
+    query = callback_query
     if not query or not query.data or not query.message:
         return
 
-    user = update.effective_user
+    user = callback_query.from_user
     chat = query.message.chat
     # Prefer the chat the menu lives in (group). Callbacks from DM menus unsupported.
     if chat.type == "private":
@@ -145,7 +145,7 @@ async def bind_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     payload = parts[2] if len(parts) > 2 else None
 
     # Always re-verify admin membership for every callback.
-    if await _deny_non_admin(query, context, chat_id, user.id):
+    if await _deny_non_admin(query, bot, chat_id, user.id):
         return
 
     settings = bdb.get_settings(chat_id)
@@ -155,7 +155,7 @@ async def bind_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if action == "close":
         await _safe_answer(query, "Closed")
         try:
-            await query.edit_message_reply_markup(reply_markup=None)
+            await query.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
         return
@@ -296,7 +296,7 @@ async def bind_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     if action == "custom_set":
-        context.chat_data["bind_wait"] = "custom"
+        chat_data["bind_wait"] = "custom"
         await _safe_answer(query, "Send the new message", alert=False)
         await _edit(
             query,
@@ -336,7 +336,7 @@ async def bind_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     # ── Change channel ────────────────────────────────────
     if action == "change":
-        context.chat_data["bind_wait"] = "channel"
+        chat_data["bind_wait"] = "channel"
         await _safe_answer(query, "Send new channel")
         await _edit(
             query,
@@ -351,14 +351,14 @@ async def bind_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     if action == "replace_yes":
-        pending = context.chat_data.get("bind_pending_channel")
+        pending = chat_data.get("bind_pending_channel")
         if not pending:
             await _safe_answer(query, "Nothing pending.", alert=True)
             await _edit(query, _menu_text(settings, group_title), bind_main_menu(settings, group_title=group_title))
             return
         # Re-check at confirm time — channel may have been claimed meanwhile.
         if bdb.find_other_binding(int(pending["id"]), chat_id):
-            context.chat_data.pop("bind_pending_channel", None)
+            chat_data.pop("bind_pending_channel", None)
             await _safe_answer(query, "Channel is already bound to another group.", alert=True)
             await _edit(query, _channel_taken_text(), unbind_confirm_menu())
             return
@@ -380,13 +380,13 @@ async def bind_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 bound_by=user.id,
             )
         except ValueError as e:
-            context.chat_data.pop("bind_pending_channel", None)
+            chat_data.pop("bind_pending_channel", None)
             if str(e) == "CHANNEL_TAKEN":
                 await _safe_answer(query, "Channel is already bound to another group.", alert=True)
                 await _edit(query, _channel_taken_text(), unbind_confirm_menu())
                 return
             raise
-        context.chat_data.pop("bind_pending_channel", None)
+        chat_data.pop("bind_pending_channel", None)
         fresh = bdb.get_settings(chat_id)
         await _safe_answer(query, "Channel replaced")
         await _edit(query, _menu_text(fresh, group_title), bind_main_menu(fresh, group_title=group_title))
@@ -406,8 +406,8 @@ async def bind_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if action == "unbind_yes":
         bdb.remove_binding(chat_id)
-        context.chat_data.pop("bind_wait", None)
-        context.chat_data.pop("bind_pending_channel", None)
+        chat_data.pop("bind_wait", None)
+        chat_data.pop("bind_pending_channel", None)
         await _safe_answer(query, "Unbound")
         await _edit(query, f"{E.CHECK} Group unbound. All gates disabled.", bind_main_menu(None, group_title=group_title))
         return
@@ -422,14 +422,14 @@ async def bind_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         channel_id = settings["channel_id"]
         # Spec: force fresh check, never trust cache on this button.
         invalidate_cache(channel_id, user.id)
-        ok = await is_channel_member(context.bot, channel_id, user.id, fresh=True)
+        ok = await is_channel_member(bot, channel_id, user.id, fresh=True)
 
         if ok:
             # Persist join for grace bookkeeping going forward.
             bdb.record_join(chat_id, user.id)
             await _safe_answer(query, "Membership verified", alert=False)
             try:
-                await query.edit_message_text(
+                await query.message.edit_text(
                     f"{E.CHECK} You're a member — you can chat now.",
                     parse_mode=ParseMode.HTML,
                 )

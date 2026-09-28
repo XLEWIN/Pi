@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Set
 
-from telegram import Message
+from aiogram.types import Message
 
 from .cancellation import CancelToken
 from .exceptions import AlreadyRunningError

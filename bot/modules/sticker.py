@@ -48,15 +48,14 @@ import shutil
 import tempfile
 import textwrap
 from html import escape
-from pathlib import Path
 from typing import List, Optional, Tuple
 
 import httpx
 from PIL import Image, ImageDraw, ImageFont
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.error import BadRequest
-from telegram.ext import Application, ContextTypes
+from aiogram import Bot
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import FSInputFile, Message
 
 from telethon.errors import (
     RPCError,
@@ -78,12 +77,15 @@ from telethon.tl.types import (
     InputUserSelf,
 )
 
-from bot.command_handler import CommandHandler, parse_command
+from bot.command_handler import parse_command
 from bot.config import settings
 from bot.constants import LOG_CHANNEL_ID
 from bot.emojis import E, EID
 from bot.keyboards.colored import btn_url, build_keyboard
 from bot.logger import logger
+from bot.pipeline import cmd, on
+from bot.reply import (reply_animation, reply_document, reply_sticker,
+                       reply_text, reply_video)
 from bot.responses import action_card, field_extra, plain_error
 
 #: Log GC (from bot.constants, same as main.py) — kang sources land
@@ -627,8 +629,7 @@ _OWNER_RETRY_WAIT = 1.0
 #    see admin.py / tagall.py). setdefault keeps explicit overrides.
 async def _send_reply(msg, text, **kw):
     kw.setdefault("parse_mode", ParseMode.HTML)
-    _fn = msg.reply_text
-    return await _fn(text, **kw)
+    return await reply_text(msg, text, **kw)
 
 
 async def _edit_reply(target, text, **kw):
@@ -640,9 +641,9 @@ async def _edit_reply(target, text, **kw):
 # /kang
 # ═════════════════════════════════════════════════════════════════
 
-async def kang_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
-    user = update.effective_user
+async def kang_command(message: Message, bot: Bot) -> None:
+    msg = message
+    user = message.from_user
     if msg is None:
         return
     if user is None:
@@ -698,8 +699,8 @@ async def kang_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             suffix = source_suffix(kind, reply)
             path = os.path.join(tmp, f"kang_src{suffix}")
             try:
-                tgfile = await context.bot.get_file(file_id)
-                await tgfile.download_to_drive(path)
+                tgfile = await bot.get_file(file_id)
+                await bot.download_file(tgfile.file_path, destination=path)
             except Exception as e:  # noqa: BLE001 — surfaced as a card
                 raise KangError(f"Download failed ({type(e).__name__}).") from e
             if not os.path.isfile(path):
@@ -808,9 +809,9 @@ async def kang_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # /unkang
 # ═════════════════════════════════════════════════════════════════
 
-async def unkang_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
-    user = update.effective_user
+async def unkang_command(message: Message, bot: Bot) -> None:
+    msg = message
+    user = message.from_user
     if msg is None:
         return
     if user is None:
@@ -839,7 +840,7 @@ async def unkang_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         # Re-send by file_id → the log channel holds the SAME document,
         # giving us id/access_hash/file_reference without a file_id decode.
-        log_msg = await context.bot.send_sticker(LOG_CHANNEL_ID, sticker=st.file_id)
+        log_msg = await bot.send_sticker(LOG_CHANNEL_ID, sticker=st.file_id)
         fetched = await client.get_messages(LOG_CHANNEL_ID, ids=log_msg.message_id)
         doc = getattr(fetched.media, "document", None) if fetched is not None and fetched.media else None
         if doc is None:
@@ -869,7 +870,7 @@ async def unkang_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     finally:
         if log_msg is not None:
             try:
-                await context.bot.delete_message(LOG_CHANNEL_ID, log_msg.message_id)
+                await bot.delete_message(LOG_CHANNEL_ID, log_msg.message_id)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -878,10 +879,10 @@ async def unkang_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # Download helpers: /getsticker /getvidsticker /getvideo /stickerid
 # ═════════════════════════════════════════════════════════════════
 
-async def _download(context: ContextTypes.DEFAULT_TYPE, file_id: str, dest: str) -> str:
+async def _download(bot: Bot, file_id: str, dest: str) -> str:
     try:
-        tgfile = await context.bot.get_file(file_id)
-        await tgfile.download_to_drive(dest)
+        tgfile = await bot.get_file(file_id)
+        await bot.download_file(tgfile.file_path, destination=dest)
     except Exception as e:  # noqa: BLE001
         raise KangError(f"Download failed ({type(e).__name__}).") from e
     if not os.path.isfile(dest):
@@ -889,8 +890,8 @@ async def _download(context: ContextTypes.DEFAULT_TYPE, file_id: str, dest: str)
     return dest
 
 
-async def getsticker_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
+async def getsticker_command(message: Message, bot: Bot) -> None:
+    msg = message
     if msg is None:
         return
     reply = msg.reply_to_message
@@ -913,7 +914,7 @@ async def getsticker_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         src_ext = source_suffix("resize", reply)
         src = os.path.join(tmp, f"sticker{src_ext}")
-        await _download(context, st.file_id, src)
+        await _download(bot, st.file_id, src)
         img = Image.open(src)
         if img.mode not in ("RGB", "RGBA", "P", "L", "LA"):
             img = img.convert("RGBA")
@@ -927,7 +928,7 @@ async def getsticker_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             ],
             icon=E.CHECK,
         )
-        await msg.reply_document(document=Path(out), caption=caption, parse_mode=ParseMode.HTML)
+        await reply_document(msg, document=FSInputFile(out), caption=caption, parse_mode=ParseMode.HTML)
     except KangError as e:
         await _send_reply(msg, plain_error(escape(str(e))))
     except Exception as e:  # noqa: BLE001
@@ -937,8 +938,8 @@ async def getsticker_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-async def getvidsticker_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
+async def getvidsticker_command(message: Message, bot: Bot) -> None:
+    msg = message
     if msg is None:
         return
     reply = msg.reply_to_message
@@ -957,7 +958,7 @@ async def getvidsticker_command(update: Update, context: ContextTypes.DEFAULT_TY
     tmp = tempfile.mkdtemp(prefix="pi_getvid_")
     try:
         src = os.path.join(tmp, "sticker.webm")
-        await _download(context, st.file_id, src)
+        await _download(bot, st.file_id, src)
         caption = action_card(
             "Video sticker downloaded",
             [
@@ -967,10 +968,10 @@ async def getvidsticker_command(update: Update, context: ContextTypes.DEFAULT_TY
             icon=E.CHECK,
         )
         try:
-                await msg.reply_animation(animation=Path(src), caption=caption, parse_mode=ParseMode.HTML)
-        except BadRequest:
+                await reply_animation(msg, animation=FSInputFile(src), caption=caption, parse_mode=ParseMode.HTML)
+        except TelegramBadRequest:
             # Bot API won't always take a raw .webm as an animation
-                await msg.reply_document(document=Path(src), caption=caption, parse_mode=ParseMode.HTML)
+                await reply_document(msg, document=FSInputFile(src), caption=caption, parse_mode=ParseMode.HTML)
     except KangError as e:
         await _send_reply(msg, plain_error(escape(str(e))))
     except Exception as e:  # noqa: BLE001
@@ -980,8 +981,8 @@ async def getvidsticker_command(update: Update, context: ContextTypes.DEFAULT_TY
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-async def getvideo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
+async def getvideo_command(message: Message, bot: Bot) -> None:
+    msg = message
     if msg is None:
         return
     reply = msg.reply_to_message
@@ -994,13 +995,13 @@ async def getvideo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     tmp = tempfile.mkdtemp(prefix="pi_getvideo_")
     try:
-        src = await _download(context, anim.file_id, os.path.join(tmp, "video.mp4"))
+        src = await _download(bot, anim.file_id, os.path.join(tmp, "video.mp4"))
         caption = action_card(
             "Video downloaded",
             [field_extra(E.SETTINGS, "File ID", f"<code>{escape(anim.file_id)}</code>")],
             icon=E.CHECK,
         )
-        await msg.reply_video(video=Path(src), caption=caption, parse_mode=ParseMode.HTML)
+        await reply_video(msg, video=FSInputFile(src), caption=caption, parse_mode=ParseMode.HTML)
     except KangError as e:
         await _send_reply(msg, plain_error(escape(str(e))))
     except Exception as e:  # noqa: BLE001
@@ -1010,8 +1011,8 @@ async def getvideo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-async def stickerid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
+async def stickerid_command(message: Message) -> None:
+    msg = message
     if msg is None:
         return
     reply = msg.reply_to_message
@@ -1031,8 +1032,8 @@ async def stickerid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 # /stickerinfo (+ /stinfo)
 # ═════════════════════════════════════════════════════════════════
 
-async def stickerinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
+async def stickerinfo_command(message: Message) -> None:
+    msg = message
     if msg is None:
         return
     reply = msg.reply_to_message
@@ -1073,8 +1074,8 @@ async def stickerinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 # /mmf (alias /memify)
 # ═════════════════════════════════════════════════════════════════
 
-async def mmf_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
+async def mmf_command(message: Message, bot: Bot) -> None:
+    msg = message
     if msg is None:
         return
     reply = msg.reply_to_message
@@ -1112,16 +1113,16 @@ async def mmf_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     try:
         suffix = source_suffix(kind, reply)
         src = os.path.join(tmp, f"mmf_src{suffix}")
-        await _download(context, file_id, src)
+        await _download(bot, file_id, src)
         meme = Memify(_pick_font()).draw_text(src, text, bg_color)
         if meme.lower().endswith(".webm"):
             try:
-                await msg.reply_sticker(sticker=Path(meme))
-            except BadRequest:
+                await reply_sticker(msg, sticker=FSInputFile(meme))
+            except TelegramBadRequest:
                 # Arbitrary VP9 rarely passes sticker validation — send as file
-                await msg.reply_document(document=Path(meme))
+                await reply_document(msg, document=FSInputFile(meme))
         else:
-            await msg.reply_document(document=Path(meme))
+            await reply_document(msg, document=FSInputFile(meme))
         await prog.delete()
     except KangError as e:
         await _edit_reply(prog, plain_error(escape(str(e))))
@@ -1134,15 +1135,15 @@ async def mmf_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 # ═════════════════════════════════════════════════════════════════
 
-def setup(app: Application) -> List[str]:
-    app.add_handler(CommandHandler("kang", kang_command))
-    app.add_handler(CommandHandler("unkang", unkang_command))
-    app.add_handler(CommandHandler("getsticker", getsticker_command))
-    app.add_handler(CommandHandler("getvidsticker", getvidsticker_command))
-    app.add_handler(CommandHandler("getvideo", getvideo_command))
-    app.add_handler(CommandHandler("stickerid", stickerid_command))
-    app.add_handler(CommandHandler(["stickerinfo", "stinfo"], stickerinfo_command))
-    app.add_handler(CommandHandler(["mmf", "memify"], mmf_command))
+def setup() -> List[str]:
+    on("message", kang_command, flt=cmd("kang"))
+    on("message", unkang_command, flt=cmd("unkang"))
+    on("message", getsticker_command, flt=cmd("getsticker"))
+    on("message", getvidsticker_command, flt=cmd("getvidsticker"))
+    on("message", getvideo_command, flt=cmd("getvideo"))
+    on("message", stickerid_command, flt=cmd("stickerid"))
+    on("message", stickerinfo_command, flt=cmd("stickerinfo", "stinfo"))
+    on("message", mmf_command, flt=cmd("mmf", "memify"))
     return [
         "/kang", "/unkang", "/getsticker", "/getvidsticker",
         "/getvideo", "/stickerid", "/stickerinfo", "/mmf",
