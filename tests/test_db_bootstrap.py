@@ -107,7 +107,7 @@ class TestBootSnapshot(unittest.TestCase):
     def test_mongomock_backend_skips_snapshot(self):
         inst = bdb.Database()
         self.assertIn("mongomock", inst.backend)
-        with self.assertNoLogs(logger="bot.database", level=logging.INFO):
+        with self.assertNoLogs(logger="phi", level=logging.INFO):
             inst._log_snapshot()
 
     def test_snapshot_logs_counts(self):
@@ -115,7 +115,7 @@ class TestBootSnapshot(unittest.TestCase):
         inst._real_mongo = self._FakeMongo(
             {"users": 5, "groups": 2, "daily_messages": 100}
         )
-        with self.assertLogs("bot.database", logging.INFO) as cm:
+        with self.assertLogs("phi", logging.INFO) as cm:
             inst._log_snapshot()
         joined = "\n".join(cm.output)
         self.assertIn("users=5", joined)
@@ -126,7 +126,7 @@ class TestBootSnapshot(unittest.TestCase):
     def test_empty_database_warns_loudly(self):
         inst = self._prod_instance()
         inst._real_mongo = self._FakeMongo({})
-        with self.assertLogs("bot.database", logging.WARNING) as cm:
+        with self.assertLogs("phi", logging.WARNING) as cm:
             inst._log_snapshot()
         joined = "\n".join(cm.output)
         self.assertIn("EMPTY", joined)
@@ -140,7 +140,7 @@ class TestBootSnapshot(unittest.TestCase):
                 raise RuntimeError("nope")
 
         inst._real_mongo = _Boom()
-        with self.assertLogs("bot.database", logging.WARNING) as cm:
+        with self.assertLogs("phi", logging.WARNING) as cm:
             inst._log_snapshot()  # must not raise
         self.assertIn("snapshot failed", "\n".join(cm.output))
 

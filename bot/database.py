@@ -20,7 +20,6 @@ thread-safe and pools connections process-wide.
 from __future__ import annotations
 
 import atexit
-import logging
 import os
 import sys
 import threading
@@ -34,7 +33,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from bot.constants import CHAT_RANK_MESSAGES, GLOBAL_RANK_MESSAGES
 from bot.timeutils import ist_date
 
-logger = logging.getLogger(__name__)
+# The shared console logger ("phi" handler). getLogger(__name__) here
+# went to an unconfigured logger: INFO was filtered by the root level
+# and WARNING+ escaped unformatted, so boot diagnostics like the
+# database snapshot never reached Railway's logs properly.
+from bot.logger import logger
 
 # Prefer a local (non-OneDrive) path for logs + MTProto sessions so
 # sync/locking cannot stall handlers. Falls back to the project folder
