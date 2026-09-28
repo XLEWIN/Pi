@@ -63,7 +63,7 @@ from bot.database import db
 from bot.constants import CHAT_RANK_MESSAGES, GLOBAL_RANK_MESSAGES
 from bot.emojis import E, EID
 from bot.keyboards.colored import btn_primary, btn_success, build_keyboard
-from bot.responses import plain_error, mention
+from bot.responses import plain_error
 from bot.modules.start import send_newuser_log
 from bot.pipeline import GROUPS, cmd, on
 from bot.reply import reply_text
@@ -155,11 +155,27 @@ def _mention_id(user_id: int, name: str) -> str:
 
 
 def _name_of(row) -> str:
-    """Display name from a users-JOIN row, with safe fallbacks."""
+    """Display name for a users-JOIN row: FIRST NAME hyperlinks the board.
+
+    Username is only a fallback for rows without a stored name
+    (the same preference the /mytop header uses - the owner asked for
+    first-name links on both boards, not @usernames).
+    """
     first = (row.get("first_name") or "").strip()
-    last = (row.get("last_name") or "").strip()
-    full = f"{first} {last}".strip()
-    return full or (row.get("username") or "").strip() or f"User {row.get('user_id')}"
+    return first or (row.get("username") or "").strip() or f"User {row.get('user_id')}"
+
+
+def _mention_name(user) -> str:
+    """Profile mention preferring the user's first name (not username)."""
+    name = (
+        (getattr(user, "first_name", None) or "").strip()
+        or (getattr(user, "username", None) or "").strip()
+        or f"User {getattr(user, 'id', '?')}"
+    )
+    uid = getattr(user, "id", None)
+    if uid is None:
+        return escape(name)
+    return _mention_id(uid, name)
 
 
 def _rank_line(index: int, mention_html: str, count: int) -> str:
@@ -223,7 +239,7 @@ def _mytop_board(user, scope: str) -> Tuple[str, Optional[object]]:
     since = _scope_since(scope)
     rows = db.get_user_top_groups(user.id, since=since, limit=_TOP_LIMIT)
 
-    lines = [f"{E.USER} {mention(user)}"]
+    lines = [f"{E.USER} {_mention_name(user)}"]
     lines.append(
         f"{_ICON_BOARD} <b>Top Groups</b> · <i>{_SCOPE_LABELS[scope]}</i>"
     )

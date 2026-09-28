@@ -44,6 +44,26 @@ class FakeBot:
         self.sent.append({"chat_id": chat_id, "document": document, **kw})
         return SimpleNamespace(message_id=len(self.sent))
 
+    async def send_animation(self, chat_id, animation, **kw):
+        self.sent.append({"chat_id": chat_id, "animation": animation, **kw})
+        return SimpleNamespace(message_id=len(self.sent))
+
+    async def send_audio(self, chat_id, audio, **kw):
+        self.sent.append({"chat_id": chat_id, "audio": audio, **kw})
+        return SimpleNamespace(message_id=len(self.sent))
+
+    async def send_voice(self, chat_id, voice, **kw):
+        self.sent.append({"chat_id": chat_id, "voice": voice, **kw})
+        return SimpleNamespace(message_id=len(self.sent))
+
+    async def send_video(self, chat_id, video, **kw):
+        self.sent.append({"chat_id": chat_id, "video": video, **kw})
+        return SimpleNamespace(message_id=len(self.sent))
+
+    async def send_video_note(self, chat_id, video_note, **kw):
+        self.sent.append({"chat_id": chat_id, "video_note": video_note, **kw})
+        return SimpleNamespace(message_id=len(self.sent))
+
     async def send_sticker(self, chat_id, sticker, **kw):
         self.sent.append({"chat_id": chat_id, "sticker": sticker, **kw})
         return SimpleNamespace(message_id=len(self.sent))

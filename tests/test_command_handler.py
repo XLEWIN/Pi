@@ -157,6 +157,35 @@ class TestCommandHandler(unittest.TestCase):
     def test_at_other_bot_rejected(self):
         self.assertFalse(self._match("!help@OtherBot"))
 
+    def test_at_self_via_bot_data_fallback(self):
+        """The real aiogram Bot has no .username attribute.
+
+        Production resolves it from pipeline.BOT_DATA (main.py stores
+        it after get_me()); without the fallback every ``/cmd@BotName``
+        was rejected for all users.
+        """
+        bot = FakeBot()
+        del bot.username  # simulate the real aiogram Bot object
+        try:
+            pipeline.BOT_DATA["username"] = BOT_USERNAME
+            self.assertEqual(
+                self._match(f"/help@{BOT_USERNAME}", bot=bot), {"args": []}
+            )
+            self.assertFalse(self._match("/help@OtherBot", bot=bot))
+        finally:
+            pipeline.BOT_DATA.pop("username", None)
+
+    def test_bot_username_preferred_over_bot_data(self):
+        """When the bot object carries a username it wins (no staleness)."""
+        try:
+            pipeline.BOT_DATA["username"] = "StaleName"
+            self.assertEqual(
+                self._match(f"/help@{BOT_USERNAME}"), {"args": []}
+            )
+            self.assertFalse(self._match("/help@StaleName"))
+        finally:
+            pipeline.BOT_DATA.pop("username", None)
+
     def test_unregistered_rejected(self):
         self.assertFalse(self._match("!nope"))
         self.assertFalse(self._match("/nope"))

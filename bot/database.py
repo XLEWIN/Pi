@@ -583,6 +583,10 @@ class Database:
             "user_level": [
                 ({"user_id": 1}, {"unique": True}),
             ],
+            "afk": [
+                ({"user_id": 1}, {"unique": True}),
+                ({"username": 1}, {}),
+            ],
             "user_chat_level": [
                 ({"chat_id": 1, "user_id": 1}, {"unique": True}),
             ],
@@ -2486,6 +2490,57 @@ class Database:
         except Exception as e:
             logger.error(f"Error ranking user groups: {e}")
             return []
+
+    # ── AFK (bot/modules/afk.py) ────────────────────────────────────
+
+    def set_afk(self, user_id: int, first_name: Optional[str],
+                username: Optional[str], reason: Optional[str],
+                start_time: str, media_id: Optional[str] = None,
+                media_type: Optional[str] = None) -> None:
+        """Mark ``user_id`` AFK (upsert on their own row).
+
+        ``username`` is stored lowercased so ``get_afk_by_username``
+        matches Telegram's case-insensitive @mentions.
+        """
+        try:
+            self._mongo["afk"].update_one(
+                {"user_id": user_id},
+                {"$set": {
+                    "user_id": user_id,
+                    "user_first_name": first_name or "",
+                    "username": (username or "").lower() or None,
+                    "afk_reason": reason,
+                    "afk_start_time": start_time,
+                    "media_id": media_id,
+                    "media_type": media_type,
+                }},
+                upsert=True,
+            )
+        except Exception as e:
+            logger.error(f"Error setting AFK for {user_id}: {e}")
+
+    def get_afk(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """AFK row for ``user_id`` or None."""
+        try:
+            return self._find_one("afk", {"user_id": user_id})
+        except Exception as e:
+            logger.error(f"Error reading AFK for {user_id}: {e}")
+            return None
+
+    def get_afk_by_username(self, username: str) -> Optional[Dict[str, Any]]:
+        """AFK row by @username (case-insensitive - stored lowercase)."""
+        try:
+            return self._find_one("afk", {"username": (username or "").lower()})
+        except Exception as e:
+            logger.error(f"Error reading AFK by username {username!r}: {e}")
+            return None
+
+    def clear_afk(self, user_id: int) -> None:
+        """Remove this user's single AFK row (their own document only)."""
+        try:
+            self._mongo["afk"].delete_one({"user_id": user_id})
+        except Exception as e:
+            logger.error(f"Error clearing AFK for {user_id}: {e}")
 
     def set_template(self, user_id: int, template: int):
         self.update_user_level(user_id, template=template)

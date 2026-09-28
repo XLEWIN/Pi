@@ -78,6 +78,37 @@ class MultiPrefixCommand(Filter):
 COMMAND = MultiPrefixCommand()
 
 
+def _bot_username(bot) -> Optional[str]:  # noqa: ANN001
+    """This bot's username, wherever this process knows it.
+
+    aiogram's ``Bot`` object has no ``.username`` attribute (it only
+    appears on ``bot.me`` after an API call), so ``/help@BotName`` used
+    to be rejected for EVERY user.  Resolution order:
+
+    1. ``bot.username`` — fakes/tests, and any wrapper that carries it;
+    2. ``pipeline.BOT_DATA["username"]`` — set by ``main.py`` right
+       after ``get_me()`` at startup;
+    3. ``settings.bot_username`` — config default (``BOT_USERNAME`` env).
+    """
+    username = getattr(bot, "username", None)
+    if username:
+        return username
+    try:
+        from bot import pipeline  # local import: pipeline imports us
+
+        username = pipeline.BOT_DATA.get("username")
+        if username:
+            return username
+    except Exception:  # noqa: BLE001 — never break dispatch on this
+        pass
+    try:
+        from bot.config import settings
+
+        return settings.bot_username
+    except Exception:  # noqa: BLE001
+        return None
+
+
 class CommandFilter(Filter):
     """Match messages invoking one of ``commands``; injects ``args``."""
 
@@ -103,7 +134,7 @@ class CommandFilter(Filter):
             return False
         if len(parts) > 1:
             # @-suffix must name this bot (mirror PTB CommandHandler).
-            username = getattr(bot, "username", None)
+            username = _bot_username(bot)
             if username is None or parts[1].lower() != username.lower():
                 return False
         return {"args": args}

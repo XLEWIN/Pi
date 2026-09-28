@@ -508,6 +508,15 @@ class TestRankings(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("\U0001f4ca", text)  # plain 📊
         self.assertNotIn("\U0001f4ac", text)  # plain 💬
 
+    async def test_links_prefer_first_name_over_username(self):
+        """Hyperlink text is the first name; @username is only a fallback."""
+        msg = _msg("/rankings")
+        await call(cs.rankings_command, msg)
+        text = _sent(msg)
+        self.assertIn(">Lewin<", text)
+        self.assertIn(">Samuel<", text)
+        self.assertNotIn("lewin", text)  # username must not be the link
+
     async def test_order_and_rank_numbers(self):
         msg = _msg("/rankings")
         await call(cs.rankings_command, msg)
@@ -612,6 +621,14 @@ class TestMytop(unittest.IsolatedAsyncioTestCase):
         for scope, label in cs._SCOPE_LABELS.items():
             text, _ = cs._mytop_board(viewer, scope)
             self.assertIn(f"<i>{label}</i>", text, scope)
+
+    async def test_header_links_first_name_not_username(self):
+        """The /mytop header hyperlink uses the first name (not @username)."""
+        viewer = SimpleNamespace(id=USER_1, username="lewin", first_name="Lewin")
+        text, _ = cs._mytop_board(viewer, "overall")
+        self.assertIn(f'href="tg://user?id={USER_1}"', text)
+        self.assertIn(">Lewin<", text)
+        self.assertNotIn("lewin", text)
 
     async def test_works_in_private(self):
         msg = _msg("/mytop", chat_type="private", chat_id=USER_1)
@@ -770,9 +787,11 @@ class TestFormatters(unittest.TestCase):
         self.assertEqual(cs._clip("Short"), "Short")
 
     def test_name_fallbacks(self):
+        # First name is the board's hyperlink text - last name is NOT
+        # appended (the owner wants first-name links, not full names).
         self.assertEqual(
             cs._name_of({"user_id": 5, "first_name": "Sam", "last_name": "Lee"}),
-            "Sam Lee",
+            "Sam",
         )
         self.assertEqual(
             cs._name_of({"user_id": 5, "username": "samlee"}), "samlee"
