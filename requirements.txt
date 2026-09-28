@@ -8,7 +8,11 @@ moviepy>=2.0.0
 # moviepy ships this; sticker video kangs call it directly as the
 # portable ffmpeg binary (Railway/containers have no system ffmpeg).
 imageio-ffmpeg>=0.5.0
-pymongo>=4.9.0
+# <4.10: pymongo 4.10+ passes sort= from UpdateOne._add_to_bulk, but
+# mongomock 4.3.0 (latest, test backend) has no sort kwarg on
+# BulkOperationBuilder.add_update → every bulk_write through mongomock
+# raises TypeError. Tests exercise this path (test_tagging flush).
+pymongo>=4.9.0,<4.10
 dnspython>=2.8.0
 
 # Test-only
