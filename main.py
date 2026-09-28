@@ -123,6 +123,17 @@ def main() -> None:
     from bot.database import db
 
     logger.info(f"Database backend: {db.backend}")
+    if db.backend.startswith("mongomock"):
+        # Tests never call main(); reaching here on mongomock means test
+        # detection misfired in production — refuse instead of running on
+        # RAM and wiping every count on restart (this actually happened:
+        # aiogram's unittest.mock import fooled the old sys.modules
+        # check, so MONGO_URI was ignored on every Railway deploy).
+        raise SystemExit(
+            "Refusing to start: in-memory test database active in "
+            "production. Set MONGO_URI and check _is_test_process() "
+            "detection in bot/database.py."
+        )
 
     async def amain() -> None:
         sigterm = {"hit": False}

@@ -2,8 +2,11 @@
 
 Backend selection (checked in order):
 
-1. ``unittest`` / ``pytest`` already imported  → in-memory mongomock.
-   Test runs NEVER touch a real server, even when MONGO_URI is set.
+1. The process is a TEST run — ``python -m unittest``, ``python -m
+   pytest``, a direct ``test_*.py`` file, or ``PI_TEST_BACKEND=1``.
+   Tests get in-memory mongomock and NEVER touch a real server, even
+   when MONGO_URI is set. (Mere presence of the unittest library does
+   NOT count: aiogram imports unittest.mock at import time.)
 2. ``MONGO_URI`` from the environment (``bot.config`` loads ``.env``).
 3. The project ``.env`` file, loaded here when this module is imported
    before ``bot.config``.
@@ -72,7 +75,35 @@ _DELETE_OPS = frozenset({
     "delete_one", "delete_many", "drop", "find_one_and_delete",
 })
 
-_TEST_BACKENDS = ("unittest", "pytest")
+def _is_test_process() -> bool:
+    """True only when this process is deliberately running the tests.
+
+    The old check — ``unittest`` in ``sys.modules`` — silently broke
+    after the aiogram migration: ``aiogram.types.base`` does
+    ``from unittest.mock import sentinel`` at import time, so EVERY
+    production boot looked like a test run and ignored ``MONGO_URI``
+    (in-memory database, all data gone on each restart). Detection is
+    now positive: the runner command line, an explicit env flag, or
+    pytest — never mere presence of the unittest library.
+    """
+    flag = os.getenv("PI_TEST_BACKEND", "").strip().lower()
+    if flag in ("1", "true", "yes", "on"):
+        return True
+    # python -m unittest / python -m pytest. sys.orig_argv is the raw
+    # command line: sys.argv[0] is rewritten by unittest to
+    # "python.exe -m unittest", so only orig_argv carries the -m form.
+    orig = getattr(sys, "orig_argv", None) or []
+    if "-m" in orig:
+        after = orig[orig.index("-m") + 1:]
+        if after and after[0] in ("unittest", "pytest"):
+            return True
+    # Direct file run: python tests/test_*.py
+    argv0 = (sys.argv[0] if sys.argv and sys.argv[0] else "")
+    base = argv0.replace("\\", "/").rsplit("/", 1)[-1]
+    if base.startswith("test_") and base.endswith(".py"):
+        return True
+    # pytest is not a production dependency — its presence is a signal.
+    return "pytest" in sys.modules
 
 
 def _resolve_uri() -> Optional[str]:
@@ -83,7 +114,7 @@ def _resolve_uri() -> Optional[str]:
     message counts/rankings vanished on every restart while the bot
     kept pretending everything worked.
     """
-    if any(m in sys.modules for m in _TEST_BACKENDS):
+    if _is_test_process():
         return None  # caller switches to mongomock
     uri = os.getenv("MONGO_URI", "").strip()
     if uri:

@@ -14,6 +14,7 @@ Guards two production incidents:
 
 import logging
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,15 +25,52 @@ from bot.database import db
 
 
 class TestResolveUri(unittest.TestCase):
-    def test_tests_process_resolves_to_mongomock(self):
-        # unittest is loaded in this process → None → mongomock backend
+    def test_discovery_runner_is_a_test_process(self):
+        # python -m unittest discover → sys.orig_argv carries the -m form
+        # (sys.argv[0] itself is rewritten to "python.exe -m unittest").
+        with mock.patch.object(
+            sys, "orig_argv", ["python.exe", "-m", "unittest", "discover"]
+        ), mock.patch.object(sys, "argv", ["python.exe -m unittest"]):
+            self.assertTrue(bdb._is_test_process())
+
+    def test_pytest_module_runner_is_a_test_process(self):
+        with mock.patch.object(
+            sys, "orig_argv", ["python.exe", "-m", "pytest"]
+        ), mock.patch.object(sys, "argv", ["python.exe -m pytest"]):
+            self.assertTrue(bdb._is_test_process())
+
+    def test_direct_test_file_run_is_a_test_process(self):
+        with mock.patch.object(
+            sys, "argv", [r"C:\repo\tests\test_thing.py"]
+        ):
+            self.assertTrue(bdb._is_test_process())
+
+    def test_explicit_env_flag_wins(self):
+        with mock.patch.object(
+            sys, "argv", ["main.py"]
+        ), mock.patch.dict(os.environ, {"PI_TEST_BACKEND": "1"}):
+            self.assertTrue(bdb._is_test_process())
+
+    def test_production_invocation_is_not_a_test_process(self):
+        # Regression: aiogram does `from unittest.mock import sentinel`
+        # at import time, so unittest IS in sys.modules during a normal
+        # `python main.py` boot — yet it must NOT count as a test run
+        # (that false positive made Railway run on mongomock and wiped
+        # all data on every restart despite MONGO_URI being set).
+        for argv in (["main.py"], [r"C:\app\main.py"], ["worker"]):
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(sys, "orig_argv", ["python", argv[0]]):
+                self.assertFalse(bdb._is_test_process(), argv)
+
+    def test_this_very_suite_resolves_to_none(self):
+        # The suite always runs via a detected runner → mongomock.
         self.assertIsNone(bdb._resolve_uri())
         self.assertIn("mongomock", db.backend)
 
     def test_missing_uri_outside_tests_fails_fast(self):
         with tempfile.TemporaryDirectory() as td:
             with mock.patch.object(
-                bdb, "_TEST_BACKENDS", ("no_such_module_xyz",)
+                bdb, "_is_test_process", return_value=False
             ), mock.patch.object(bdb, "_LEGACY_DIR", Path(td)), mock.patch.dict(
                 os.environ, {"MONGO_URI": ""}
             ):
@@ -43,11 +81,11 @@ class TestResolveUri(unittest.TestCase):
         self.assertIn("in-memory", msg)
 
     def test_env_uri_wins(self):
-        sentinel = "mongodb://example.invalid/phi"
+        sentinel_uri = "mongodb://example.invalid/phi"
         with mock.patch.object(
-            bdb, "_TEST_BACKENDS", ("no_such_module_xyz",)
-        ), mock.patch.dict(os.environ, {"MONGO_URI": sentinel}):
-            self.assertEqual(bdb._resolve_uri(), sentinel)
+            bdb, "_is_test_process", return_value=False
+        ), mock.patch.dict(os.environ, {"MONGO_URI": sentinel_uri}):
+            self.assertEqual(bdb._resolve_uri(), sentinel_uri)
 
 
 class TestEnsureIndexes(unittest.TestCase):
