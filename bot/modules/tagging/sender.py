@@ -278,7 +278,7 @@ async def run(session: TagSession, bot) -> None:
         # Registry backfill from shared history — the observer only
         # knows members who chatted since this process started.
         try:
-            seeded = tdb.seed_from_history(s.chat_id)
+            seeded = await asyncio.to_thread(tdb.seed_from_history, s.chat_id)
             if seeded:
                 logger.info(
                     f"Tagging seeded {seeded} member(s) from history "
@@ -318,7 +318,8 @@ async def run(session: TagSession, bot) -> None:
                 await s.token.sleep(0.35)
 
         sess_mod.finish(s, "completed")
-        tdb.finish_session(
+        await asyncio.to_thread(
+            tdb.finish_session,
             s.session_id,
             "completed",
             total=s.total,
@@ -333,7 +334,8 @@ async def run(session: TagSession, bot) -> None:
 
     except SessionCancelled:
         sess_mod.finish(s, "aborted")
-        tdb.finish_session(
+        await asyncio.to_thread(
+            tdb.finish_session,
             s.session_id,
             "aborted",
             total=s.total,
@@ -345,9 +347,10 @@ async def run(session: TagSession, bot) -> None:
 
     except NobodyToTagError as e:
         sess_mod.finish(s, "failed")
-        known = tdb.count_members(s.chat_id)
-        tdb.finish_session(
-            s.session_id, "failed", total=0, error=str(e) or "nobody",
+        known = await asyncio.to_thread(tdb.count_members, s.chat_id)
+        await asyncio.to_thread(
+            tdb.finish_session, s.session_id, "failed", total=0,
+            error=str(e) or "nobody",
         )
         logger.info(
             f"Tagging nobody matched chat={s.chat_id} known={known} "
@@ -357,7 +360,8 @@ async def run(session: TagSession, bot) -> None:
 
     except FloodTooLongError as e:
         sess_mod.finish(s, "failed")
-        tdb.finish_session(
+        await asyncio.to_thread(
+            tdb.finish_session,
             s.session_id,
             "failed",
             total=s.total,
@@ -375,26 +379,33 @@ async def run(session: TagSession, bot) -> None:
 
     except TaggingError as e:
         sess_mod.finish(s, "failed")
-        tdb.finish_session(
-            s.session_id, "failed", total=s.total, tagged=s.tagged,
-            messages_sent=s.metrics.messages_sent, error=str(e),
+        await asyncio.to_thread(
+            tdb.finish_session, s.session_id, "failed", total=s.total,
+            tagged=s.tagged, messages_sent=s.metrics.messages_sent, error=str(e),
         )
         await _finalize_status(s, failed_card(str(e)))
 
     except asyncio.CancelledError:
         sess_mod.finish(s, "failed")
-        tdb.finish_session(
-            s.session_id, "failed", total=s.total, tagged=s.tagged,
-            messages_sent=s.metrics.messages_sent, error="task cancelled",
-        )
+        # Loop is shutting down — a re-delivered cancel must not lose the
+        # raise; a lost row is recovered by tdb.mark_interrupted() on boot.
+        try:
+            await asyncio.to_thread(
+                tdb.finish_session, s.session_id, "failed", total=s.total,
+                tagged=s.tagged, messages_sent=s.metrics.messages_sent,
+                error="task cancelled",
+            )
+        except asyncio.CancelledError:
+            pass
         raise
 
     except Exception as e:
         logger.error(f"Tagging session crashed chat={s.chat_id}", exc_info=e)
         sess_mod.finish(s, "failed")
-        tdb.finish_session(
-            s.session_id, "failed", total=s.total, tagged=s.tagged,
-            messages_sent=s.metrics.messages_sent, error=type(e).__name__,
+        await asyncio.to_thread(
+            tdb.finish_session, s.session_id, "failed", total=s.total,
+            tagged=s.tagged, messages_sent=s.metrics.messages_sent,
+            error=type(e).__name__,
         )
         await _finalize_status(s, failed_card("Unexpected error — see logs."))
 

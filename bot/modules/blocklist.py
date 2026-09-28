@@ -16,6 +16,7 @@ from bot.pipeline import GROUPS, cmd, on
 from bot.reply import reply_text
 from bot.database import db
 from bot.emojis import E
+from bot.async_bridge import adb
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +131,7 @@ async def add_blocklist(message: Message, bot: Bot, args: list):
     words = {w.lower() for w in args}
     added = []
     for word in words:
-        if await asyncio.to_thread(db.add_blocklist_word, chat_id, word, action, reason):
+        if await adb(db.add_blocklist_word(chat_id, word, action, reason)):
             added.append(word)
 
     if added:
@@ -161,7 +162,7 @@ async def remove_blocklist(message: Message, bot: Bot, args: list):
     words = {w.lower() for w in args}
     removed = []
     for word in words:
-        if await asyncio.to_thread(db.remove_blocklist_word, chat_id, word):
+        if await adb(db.remove_blocklist_word(chat_id, word)):
             removed.append(word)
 
     if removed:
@@ -175,7 +176,7 @@ async def remove_blocklist(message: Message, bot: Bot, args: list):
 async def view_blocklist(message: Message):
     """Handle /blocklistview — view blocked words."""
     chat_id = message.chat.id
-    blocklist = await asyncio.to_thread(db.get_blocklist, chat_id)
+    blocklist = await adb(db.get_blocklist(chat_id))
 
     if not blocklist:
         await reply_text(message, f"{E.INFO} No blocked words in this chat.",
@@ -202,7 +203,7 @@ async def clear_blocklist(message: Message, bot: Bot):
         return
 
     chat_id = message.chat.id
-    count = await asyncio.to_thread(db.clear_blocklist, chat_id)
+    count = await adb(db.clear_blocklist(chat_id))
     if count > 0:
         await reply_text(message, f"{E.CHECK} Cleared {count} blocked words.",
             parse_mode=ParseMode.HTML)
@@ -231,7 +232,7 @@ async def set_blocklist_action(message: Message, bot: Bot, args: list):
         return
 
     chat_id = message.chat.id
-    await asyncio.to_thread(db.set_blocklist_action, chat_id, args[0].lower())
+    await adb(db.set_blocklist_action(chat_id, args[0].lower()))
     await reply_text(message, f"{E.CHECK} Blocklist action set to: <b>{args[0].lower()}</b>", parse_mode=ParseMode.HTML)
 
 
@@ -253,7 +254,7 @@ async def set_blocklist_reason(message: Message, bot: Bot, args: list):
 
     chat_id = message.chat.id
     reason = " ".join(args)
-    await asyncio.to_thread(db.set_blocklist_reason, chat_id, reason)
+    await adb(db.set_blocklist_reason(chat_id, reason))
     await reply_text(message, f"{E.CHECK} Blocklist reason set to: <b>{reason}</b>", parse_mode=ParseMode.HTML)
 
 
@@ -266,10 +267,10 @@ async def blocklist_check(message: Message, bot: Bot):
     user_id = message.from_user.id
 
     # Check exemptions
-    if await asyncio.to_thread(db.is_blocklist_exempt, chat_id, user_id):
+    if await adb(db.is_blocklist_exempt(chat_id, user_id)):
         return
 
-    blocklist = await asyncio.to_thread(db.get_blocklist, chat_id)
+    blocklist = await adb(db.get_blocklist(chat_id))
     if not blocklist:
         return
 
@@ -288,7 +289,9 @@ async def blocklist_check(message: Message, bot: Bot):
                 except Exception as e:
                     logger.debug(f"spam counter failed: {e}")
 
-            import asyncio
+            # module-level `asyncio` — a function-level `import asyncio`
+            # HERE made asyncio a local name for the whole function, so the
+            # to_thread() call at the top raised UnboundLocalError instead.
             asyncio.get_running_loop().run_in_executor(None, _count_spam)
             await _take_action(message, bot, user_id, action, reason)
             return

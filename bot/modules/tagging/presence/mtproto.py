@@ -40,6 +40,30 @@ except Exception:  # ImportError and any packaging failure
     _TELETHON_OK = False
 
 
+# Participants are written to Mongo in chunks so a 5k-member sync never
+# issues 10k blocking round-trips on the event loop.
+_SYNC_CHUNK = 500
+
+
+def _write_members(chat_id: int, rows) -> None:
+    """Blocking registry writes for one sync chunk — MUST run in a thread.
+
+    rows: (user_id, username, display_name, is_bot, presence_ts|None)
+    """
+    from .. import database as tdb
+
+    for user_id, username, name, is_bot, presence_ts in rows:
+        tdb.upsert_member(
+            chat_id,
+            user_id,
+            username=username,
+            display_name=name,
+            is_bot=is_bot,
+        )
+        if presence_ts is not None:
+            tdb.set_presence(chat_id, user_id, presence_ts)
+
+
 class MtprotoPresence(PresenceProvider):
     """Background presence/member sync over Telethon (optional)."""
 
@@ -144,7 +168,12 @@ class MtprotoPresence(PresenceProvider):
         """
         from .manager import known_chat_ids
 
-        for chat_id in known_chat_ids():
+        # `known_chat_ids` is a synchronous helper that talks to Mongo.
+        # On the loop it would hand back a lazy box nobody drives, so the
+        # refresh pass has to cross a thread boundary like every other
+        # sync db helper (one hop per interval — this is a background
+        # loop, not the message path).
+        for chat_id in await asyncio.to_thread(known_chat_ids):
             await self.sync_chat(chat_id)
 
     async def _refresh_loop(self) -> None:
@@ -183,6 +212,7 @@ class MtprotoPresence(PresenceProvider):
 
         count = 0
         seen: set = set()
+        pending = []  # drained to _write_members in _SYNC_CHUNK pieces
         online_ts = time.time()  # epoch — matches DB timestamps
         try:
             async for user in self._client.iter_participants(chat_id):
@@ -191,26 +221,33 @@ class MtprotoPresence(PresenceProvider):
                 name = " ".join(
                     p for p in (user.first_name or "", user.last_name or "") if p
                 ) or str(user.id)
-                tdb.upsert_member(
-                    chat_id,
-                    user.id,
-                    username=user.username,
-                    display_name=name,
-                    is_bot=bool(user.bot),
-                )
-                seen.add(user.id)
-                count += 1
+                presence_ts = None
                 status = getattr(user, "status", None)
                 if isinstance(status, UserStatusOnline):
                     self._online[(chat_id, user.id)] = online_ts
-                    tdb.set_presence(chat_id, user.id, online_ts)
+                    presence_ts = online_ts
+                pending.append(
+                    (user.id, user.username, name, bool(user.bot), presence_ts)
+                )
+                seen.add(user.id)
+                count += 1
+                if len(pending) >= _SYNC_CHUNK:
+                    await asyncio.to_thread(_write_members, chat_id, pending)
+                    pending.clear()
         except Exception as e:
             logger.warning(f"Tagging MTProto sync chat {chat_id} failed: {e}")
+            if pending:
+                try:
+                    await asyncio.to_thread(_write_members, chat_id, pending)
+                except Exception:
+                    pass
             return count
+        if pending:
+            await asyncio.to_thread(_write_members, chat_id, pending)
         # Enumeration completed — reconcile: registry rows not seen live
         # have left (stale ghosts must never be tagged).
         try:
-            tdb.mark_left_except(chat_id, seen)
+            await asyncio.to_thread(tdb.mark_left_except, chat_id, seen)
         except Exception as e:
             logger.warning(f"Tagging MTProto reconcile failed: {e}")
         if count:

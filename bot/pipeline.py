@@ -12,13 +12,14 @@ This module bridges the two:
   successful run: the observer then continues with the next matching
   handler â€” reproducing "all groups run".  Handler exceptions are
   logged/persisted and the chain continues (PTB ``process_error`` parity).
-* An always-on data filter injects ``bot_data`` (process-global) and
-  ``chat_data`` (per-chat) into handler kwargs.
+ * A data filter injects ``bot_data`` (process-global) and ``chat_data``
+   (per-chat) into the handler kwargs of handlers that declare them.
 """
 
 from __future__ import annotations
 
 import functools
+import inspect
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List
 
@@ -156,9 +157,31 @@ def _wrap(fn: Callable) -> Callable:
     return _inner
 
 
+def _needs_data_filter(fn: Callable) -> bool:
+    """True when ``fn`` actually accepts ``chat_data`` / ``bot_data``.
+
+    The data filter was attached to EVERY handler, so each update paid a
+    ``chat_data_for()`` getattr-chain + ``dict.setdefault`` (and an extra
+    awaited filter) for ~155 handlers, almost none of which use the
+    injected kwargs. Handlers that declare them — or swallow extras with
+    ``**kwargs`` — still get them; everyone else skips the work.
+    """
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):  # builtins / no signature
+        return True
+    for p in sig.parameters.values():
+        if p.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if p.name in ("chat_data", "bot_data", "user_data"):
+            return True
+    return False
+
+
 def install(dp: Any) -> int:
     """Register every queued handler on ``dp`` in PTB dispatch order."""
     for e in _ordered():
-        flts = [f for f in (e.flt, _DataFilter()) if f is not None]
+        data_filter = _DataFilter() if _needs_data_filter(e.fn) else None
+        flts = [f for f in (e.flt, data_filter) if f is not None]
         getattr(dp, e.event).register(_wrap(e.fn), *flts)
     return len(_QUEUE)

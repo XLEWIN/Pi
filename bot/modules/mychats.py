@@ -39,6 +39,7 @@ from bot.emojis import E
 from bot.keyboards.colored import btn_success, build_keyboard
 from bot.modules.users import _chat_link
 from bot.responses import plain_error
+from bot.async_bridge import adb
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +152,7 @@ def _info_card(chat, members: str, link: str) -> str:
 
 async def _scan_admin_chats(bot: Bot) -> List[Dict[str, Any]]:
     """Tracked groups where THIS bot is currently admin/creator."""
-    rows = await asyncio.to_thread(db.get_all_groups)
+    rows = await adb(db.get_all_groups())
     if not rows:
         return []
 

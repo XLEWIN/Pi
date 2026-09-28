@@ -1,4 +1,8 @@
-"""Bind module callbacks — every action re-verifies group admin; edit in place."""
+"""Bind module callbacks — every action re-verifies group admin; edit in place.
+
+Every ``bdb.*`` call is blocking, uncached MongoDB I/O, so each one is
+awaited through ``asyncio.to_thread`` (see handlers.py for the reasoning).
+"""
 
 import logging
 from html import escape
@@ -30,6 +34,7 @@ from .keyboards import (
     unbind_confirm_menu,
 )
 from .utils import channel_display, format_autodel, format_grace, indicator
+from bot.async_bridge import adb
 
 
 def _channel_taken_text() -> str:
@@ -148,7 +153,7 @@ async def bind_callback(callback_query: CallbackQuery, bot: Bot, chat_data: dict
     if await _deny_non_admin(query, bot, chat_id, user.id):
         return
 
-    settings = bdb.get_settings(chat_id)
+    settings = await adb(bdb.get_settings(chat_id))
     group_title = chat.title or ""
 
     # ── Close ─────────────────────────────────────────────
@@ -183,13 +188,13 @@ async def bind_callback(callback_query: CallbackQuery, bot: Bot, chat_data: dict
     # ── Status ────────────────────────────────────────────
     if action == "status":
         await _safe_answer(query, "Status")
-        fresh = bdb.get_settings(chat_id) or settings
+        fresh = await adb(bdb.get_settings(chat_id)) or settings
         await _edit(query, _status_text(fresh, group_title), status_menu(fresh))
         return
 
     # ── Toggle master switches ────────────────────────────
     if action == "toggle" and payload in ("force_join", "admin_bypass"):
-        fresh = bdb.toggle_field(chat_id, payload)
+        fresh = await adb(bdb.toggle_field(chat_id, payload))
         await _safe_answer(query, f"{payload} → {'ON' if fresh and fresh.get(payload) else 'OFF'}")
         await _edit(query, _menu_text(fresh, group_title), bind_main_menu(fresh, group_title=group_title))
         return
@@ -209,7 +214,7 @@ async def bind_callback(callback_query: CallbackQuery, bot: Bot, chat_data: dict
 
     if action == "gate" and payload in GATES:
         col = GATES[payload]
-        fresh = bdb.toggle_field(chat_id, col)
+        fresh = await adb(bdb.toggle_field(chat_id, col))
         on = indicator(fresh.get(col)) if fresh else "OFF"
         await _safe_answer(query, f"{GATE_LABELS[payload]} → {on}")
         await _edit(
@@ -242,7 +247,7 @@ async def bind_callback(callback_query: CallbackQuery, bot: Bot, chat_data: dict
         except ValueError:
             await _safe_answer(query, "Invalid option.", alert=True)
             return
-        fresh = bdb.update_field(chat_id, "grace_minutes", minutes)
+        fresh = await adb(bdb.update_field(chat_id, "grace_minutes", minutes))
         await _safe_answer(query, f"Grace → {format_grace(minutes)}")
         await _edit(
             query,
@@ -272,7 +277,7 @@ async def bind_callback(callback_query: CallbackQuery, bot: Bot, chat_data: dict
         except ValueError:
             await _safe_answer(query, "Invalid option.", alert=True)
             return
-        fresh = bdb.update_field(chat_id, "auto_delete_seconds", secs)
+        fresh = await adb(bdb.update_field(chat_id, "auto_delete_seconds", secs))
         await _safe_answer(query, f"Auto-delete → {format_autodel(secs)}")
         await _edit(
             query,
@@ -309,7 +314,7 @@ async def bind_callback(callback_query: CallbackQuery, bot: Bot, chat_data: dict
         return
 
     if action == "custom_reset":
-        fresh = bdb.update_field(chat_id, "custom_message", None)
+        fresh = await adb(bdb.update_field(chat_id, "custom_message", None))
         await _safe_answer(query, "Reset to default")
         await _edit(
             query,
@@ -357,7 +362,7 @@ async def bind_callback(callback_query: CallbackQuery, bot: Bot, chat_data: dict
             await _edit(query, _menu_text(settings, group_title), bind_main_menu(settings, group_title=group_title))
             return
         # Re-check at confirm time — channel may have been claimed meanwhile.
-        if bdb.find_other_binding(int(pending["id"]), chat_id):
+        if await adb(bdb.find_other_binding(int(pending["id"]), chat_id)):
             chat_data.pop("bind_pending_channel", None)
             await _safe_answer(query, "Channel is already bound to another group.", alert=True)
             await _edit(query, _channel_taken_text(), unbind_confirm_menu())
@@ -371,14 +376,14 @@ async def bind_callback(callback_query: CallbackQuery, bot: Bot, chat_data: dict
         ch.username = pending.get("username")
         ch.title = pending.get("title")
         try:
-            bdb.upsert_binding(
+            await adb(bdb.upsert_binding(
                 chat_id,
                 ch.id,
                 channel_username=ch.username,
                 channel_title=ch.title,
                 channel_link=pending.get("link"),
                 bound_by=user.id,
-            )
+            ))
         except ValueError as e:
             chat_data.pop("bind_pending_channel", None)
             if str(e) == "CHANNEL_TAKEN":
@@ -387,7 +392,7 @@ async def bind_callback(callback_query: CallbackQuery, bot: Bot, chat_data: dict
                 return
             raise
         chat_data.pop("bind_pending_channel", None)
-        fresh = bdb.get_settings(chat_id)
+        fresh = await adb(bdb.get_settings(chat_id))
         await _safe_answer(query, "Channel replaced")
         await _edit(query, _menu_text(fresh, group_title), bind_main_menu(fresh, group_title=group_title))
         return
@@ -405,7 +410,7 @@ async def bind_callback(callback_query: CallbackQuery, bot: Bot, chat_data: dict
         return
 
     if action == "unbind_yes":
-        bdb.remove_binding(chat_id)
+        await adb(bdb.remove_binding(chat_id))
         chat_data.pop("bind_wait", None)
         chat_data.pop("bind_pending_channel", None)
         await _safe_answer(query, "Unbound")
@@ -414,7 +419,7 @@ async def bind_callback(callback_query: CallbackQuery, bot: Bot, chat_data: dict
 
     # ── I've Joined (fresh membership check) ──────────────
     if action == "join":
-        settings = bdb.get_settings(chat_id)
+        settings = await adb(bdb.get_settings(chat_id))
         if not settings or not settings.get("channel_id"):
             await _safe_answer(query, "Not bound.", alert=True)
             return
@@ -426,7 +431,7 @@ async def bind_callback(callback_query: CallbackQuery, bot: Bot, chat_data: dict
 
         if ok:
             # Persist join for grace bookkeeping going forward.
-            bdb.record_join(chat_id, user.id)
+            await adb(bdb.record_join(chat_id, user.id))
             await _safe_answer(query, "Membership verified", alert=False)
             try:
                 await query.message.edit_text(

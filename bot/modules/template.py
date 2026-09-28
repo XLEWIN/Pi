@@ -4,7 +4,6 @@ Lists the rank card templates in the house text style with numbered
 colored buttons; tapping one (or sending /template <number>) applies it.
 """
 
-import asyncio
 import re
 
 from aiogram import F
@@ -17,6 +16,7 @@ from bot.keyboards.colored import btn_danger, btn_primary, btn_success, build_ke
 from bot.pipeline import cmd, on
 from bot.profile_templates import THEMES
 from bot.reply import reply_text
+from bot.async_bridge import adb
 
 
 def _build_template_buttons():
@@ -64,9 +64,8 @@ async def template_command(message: Message):
         return
 
     # Current selection — same source as /rank (user_level.template).
-    info = await asyncio.to_thread(
-        db.get_user_rank_info, message.from_user.id
-    )
+    info = await adb(db.get_user_rank_info(message.from_user.id
+    ))
     active_id = info["template"]
     active_name = THEMES.get(active_id, THEMES[1])["name"]
 
@@ -103,7 +102,7 @@ async def template_callback(callback_query: CallbackQuery):
         return
 
     # Save template choice
-    await asyncio.to_thread(db.set_template, query.from_user.id, template_id)
+    await adb(db.set_template(query.from_user.id, template_id))
     theme_name = THEMES[template_id]["name"]
 
     await query.answer(f"Template set to {theme_name}!", show_alert=False)

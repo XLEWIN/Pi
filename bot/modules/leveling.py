@@ -28,6 +28,7 @@ from bot.profile_templates import get_theme_list, THEMES
 from bot.rank_image import create_rank_card
 from bot.emojis import E, EID
 from bot.timeutils import ist_monday, ist_month_start
+from bot.async_bridge import adb
 
 logger = logging.getLogger(__name__)
 
@@ -135,14 +136,17 @@ async def track_message(message: Message):
         return
 
     # Spam-blocked users earn no XP either (bot/modules/antispam.py).
-    if await asyncio.to_thread(db.is_spam_blocked, user.id):
+    # Warm cache = in-process answer; only a miss goes to the executor.
+    hit, blocked = db.peek_spam_blocked(user.id)
+    if not hit:
+        blocked = await adb(db.is_spam_blocked(user.id))
+    if blocked:
         return
 
     chat_id = message.chat.id
     user_id = user.id
 
-    # Cooldown: 30 seconds between XP gains
-    import time
+    # Cooldown: 30 seconds between XP gains (module-level `time`).
     now = time.time()
     cooldown_key = f"{user_id}:{chat_id}"
     if cooldown_key in _cooldowns and now - _cooldowns[cooldown_key] < 30:
@@ -155,10 +159,11 @@ async def track_message(message: Message):
         except Exception as e:
             logger.warning(f"XP track failed: {e}")
 
-    # SQLite is synchronous — run it off the event loop so commands stay fast.
-    import asyncio
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _db_work)
+    # Mongo is synchronous — run it off the event loop so commands stay fast.
+    # NOTE: no function-level `import asyncio` here: that would make asyncio a
+    # LOCAL name for the whole function and the to_thread() call at the top
+    # would raise UnboundLocalError (it did).
+    await asyncio.to_thread(_db_work)
 
 
 # ── Command handlers ─────────────────────────────────────
@@ -187,7 +192,7 @@ async def rank_command(message: Message, bot: Bot, args: list, bot_data: dict):
     user_id = target_user.id
 
     # Unified rank info — daily_messages is the source of truth.
-    info = await asyncio.to_thread(db.get_user_rank_info, user_id, chat_id)
+    info = await adb(db.get_user_rank_info(user_id, chat_id))
 
     name = target_user.first_name or "User"
     username = target_user.username or ""
@@ -297,7 +302,7 @@ async def ranktemplate_command(message: Message, args: list):
             parse_mode=ParseMode.HTML)
         return
 
-    await asyncio.to_thread(db.set_template, message.from_user.id, template)
+    await adb(db.set_template(message.from_user.id, template))
     theme_name = THEMES[template]["name"]
     await reply_text(message, f"{E.CHECK} Template set to {theme_name}!",
             parse_mode=ParseMode.HTML)
@@ -307,10 +312,9 @@ async def nextlevel_command(message: Message):
     """Handle /nextlevel — messages needed for the next chat/global rank."""
     user_id = message.from_user.id
     is_group = message.chat.type != "private"
-    info = await asyncio.to_thread(
-        db.get_user_rank_info, user_id,
+    info = await adb(db.get_user_rank_info(user_id,
         message.chat.id if is_group else None,
-    )
+    ))
 
     await reply_text(message, 
         _progress_text(info, is_group),
@@ -328,10 +332,9 @@ async def nextlevel_callback(callback_query: CallbackQuery):
 
     chat = query.message.chat
     is_group = getattr(chat, "type", "private") != "private"
-    info = await asyncio.to_thread(
-        db.get_user_rank_info, query.from_user.id,
+    info = await adb(db.get_user_rank_info(query.from_user.id,
         chat.id if is_group else None,
-    )
+    ))
     await reply_text(query.message, 
         _progress_text(info, is_group),
         parse_mode=ParseMode.HTML,
@@ -342,7 +345,7 @@ async def nextlevel_callback(callback_query: CallbackQuery):
 async def streak_command(message: Message):
     """Handle /streak — show message streak."""
     user_id = message.from_user.id
-    user_data = await asyncio.to_thread(db.get_user_level, user_id)
+    user_data = await adb(db.get_user_level(user_id))
     current = user_data.get("streak_current", 0)
     best = user_data.get("streak_best", 0)
 
@@ -361,7 +364,7 @@ async def leaderboard_command(message: Message):
         return
 
     chat_id = message.chat.id
-    lb = await asyncio.to_thread(db.get_leaderboard, chat_id, limit=10)
+    lb = await adb(db.get_leaderboard(chat_id, limit=10))
 
     if not lb:
         await reply_text(message, f"{E.INFO} No leaderboard data yet. Start chatting!",
@@ -389,7 +392,7 @@ async def daily_command(message: Message):
         return
 
     chat_id = message.chat.id
-    top = await asyncio.to_thread(db.get_daily_top, chat_id, limit=10)
+    top = await adb(db.get_daily_top(chat_id, limit=10))
 
     if not top:
         await reply_text(message, f"{E.INFO} No messages today yet. Be the first!",
@@ -414,9 +417,8 @@ async def weekly_command(message: Message):
         return
 
     chat_id = message.chat.id
-    top = await asyncio.to_thread(
-        db.get_period_top, chat_id, since=ist_monday(), limit=10
-    )
+    top = await adb(db.get_period_top(chat_id, since=ist_monday(), limit=10
+    ))
 
     if not top:
         await reply_text(message, f"{E.INFO} No messages this week yet!",
@@ -441,9 +443,8 @@ async def monthly_command(message: Message):
         return
 
     chat_id = message.chat.id
-    top = await asyncio.to_thread(
-        db.get_period_top, chat_id, since=ist_month_start(), limit=10
-    )
+    top = await adb(db.get_period_top(chat_id, since=ist_month_start(), limit=10
+    ))
 
     if not top:
         await reply_text(message, f"{E.INFO} No messages this month yet!",

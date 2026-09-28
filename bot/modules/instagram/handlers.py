@@ -47,6 +47,7 @@ from .resolver import ensure_yt_dlp, resolver_chain
 from .singleflight import run_exclusive
 from .transport import TelegramTransport, _caption_html
 from .url_utils import classify_post_type, find_instagram_urls, first_post_url, normalize_url
+from bot.async_bridge import adb
 
 
 # ── Helpers ─────────────────────────────────────────────────────
@@ -150,7 +151,7 @@ async def _send_cached(
             await bot.send_document(
                 chat_id, document=file_id, caption=cap, parse_mode=parse, reply_to_message_id=rid
             )
-        await asyncio.to_thread(db.ig_touch_file_id, key)
+        await adb(db.ig_touch_file_id(key))
         metrics.bump("uploads")
     return True
 
@@ -209,7 +210,7 @@ async def process_url(
         caption = _first_caption_html(post, norm)
 
         cache_keys = [f"{post.media_id}:{i}" for i in range(len(post.assets))]
-        cached = get_file_ids(cache_keys)
+        cached = await get_file_ids(cache_keys)
 
         # Fast path: every asset already has a stored Telegram file_id.
         if post.assets and len(cached) == len(cache_keys):
@@ -218,11 +219,10 @@ async def process_url(
                     bot, chat_id, post, cached, caption, reply_to_message_id
                 )
                 elapsed = int((time.perf_counter() - t0) * 1000)
-                await asyncio.to_thread(
-                    db.ig_log_download,
+                await adb(db.ig_log_download(
                     chat_id, requester_id, "cache", post.post_type.value,
                     len(post.assets), elapsed, None,
-                )
+                ))
                 ig_log(f"cache-hit send {post.media_id} in {elapsed}ms")
                 return True
             except Exception as e:
@@ -254,16 +254,15 @@ async def process_url(
                 sent_any = True
                 file_id = _extract_file_id(sent)
                 if file_id:
-                    put_file_id(f.cache_key, file_id, f.kind.value, post.canonical_url)
+                    await put_file_id(f.cache_key, file_id, f.kind.value, post.canonical_url)
                 first = False
 
             if sent_any:
                 elapsed = int((time.perf_counter() - t0) * 1000)
-                await asyncio.to_thread(
-                    db.ig_log_download,
+                await adb(db.ig_log_download(
                     chat_id, requester_id, "ok", post.post_type.value,
                     len(files), elapsed, None,
-                )
+                ))
                 ig_log(f"sent {len(files)} for {post.media_id} in {elapsed}ms")
             return sent_any
         finally:
@@ -277,9 +276,8 @@ async def process_url(
         ig_log(f"job error: {e}")
         metrics.bump("resolved_fail", error=str(e)[:200])
         try:
-            await asyncio.to_thread(
-                db.ig_log_download, chat_id, requester_id, "error", "unknown", 0, 0, str(e)[:200]
-            )
+            await adb(db.ig_log_download(chat_id, requester_id, "error", "unknown", 0, 0, str(e)[:200]
+            ))
         except Exception:
             pass
         raise IGError("Something went wrong processing that link.") from e
@@ -468,15 +466,14 @@ async def igsettings_command(message: Message, bot: Bot, args: list) -> None:
     if args:
         if args[0] in {"auto", "autodl"} and len(args) >= 2:
             on = args[1] in {"on", "1", "true", "yes"}
-            await asyncio.to_thread(
-                db.ig_set_settings, chat_id, auto_download=1 if on else 0
-            )
+            await adb(db.ig_set_settings(chat_id, auto_download=1 if on else 0
+            ))
         elif args[0] == "max" and len(args) >= 2:
             try:
                 n = max(1, min(int(args[1]), 50))
             except ValueError:
                 n = ig_config.max_items
-            await asyncio.to_thread(db.ig_set_settings, chat_id, max_items=n)
+            await adb(db.ig_set_settings(chat_id, max_items=n))
 
     st = await asyncio.to_thread(_ig_settings, chat_id)
     auto = bool(st.get("auto_download"))
@@ -503,7 +500,7 @@ async def igstats_command(message: Message, bot: Bot) -> None:
         return
 
     snap = metrics.snapshot()
-    cst = cache_stats()
+    cst = await cache_stats()
     total_c = int(snap["cache_hits"]) + int(snap["cache_misses"])
     hit_rate = round(100 * int(snap["cache_hits"]) / total_c) if total_c else 0
 
@@ -539,14 +536,14 @@ async def igcache_command(message: Message, args: list) -> None:
 
     args = [a.lower() for a in (args or [])]
     if args and args[0] == "clear":
-        n = clear_cache()
+        n = await clear_cache()
         text = action_card(
             "Instagram Cache",
             [(E.CHECK, "Cleared", f"{n} DB row(s); L1 flushed")],
             icon=E.CHECK,
         )
     else:
-        cst = cache_stats()
+        cst = await cache_stats()
         text = action_card(
             "Instagram Cache",
             [
@@ -643,12 +640,12 @@ async def ig_callback(callback_query: CallbackQuery, bot: Bot) -> None:
         st = await asyncio.to_thread(_ig_settings, chat_id)
         if data == "ig:set:auto":
             new = 0 if st.get("auto_download") else 1
-            await asyncio.to_thread(db.ig_set_settings, chat_id, auto_download=new)
+            await adb(db.ig_set_settings(chat_id, auto_download=new))
         else:
             cur = int(st.get("max_items") or ig_config.max_items)
             order = [1, 5, 10, 20]
             nxt = order[(order.index(cur) + 1) % len(order)] if cur in order else 5
-            await asyncio.to_thread(db.ig_set_settings, chat_id, max_items=nxt)
+            await adb(db.ig_set_settings(chat_id, max_items=nxt))
 
         st = await asyncio.to_thread(_ig_settings, chat_id)
         auto = bool(st.get("auto_download"))

@@ -10,6 +10,7 @@ Candidate pipeline for /all:
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import List, Optional, Sequence, Set
 
@@ -21,7 +22,11 @@ from .presence import get_manager
 
 
 def on_join(chat_id: int, user) -> None:
-    """Immediate write — a join must be visible to the next /all."""
+    """Immediate write — a join must be visible to the next /all.
+
+    Blocking (raw MongoDB): callers must run this via
+    ``await asyncio.to_thread(member_registry.on_join, ...)``.
+    """
     name = " ".join(
         p for p in (
             getattr(user, "first_name", None) or "",
@@ -94,7 +99,7 @@ async def assemble_candidates(
     except Exception as e:
         logger.warning(f"Tagging member sync skipped: {e}")
 
-    rows = tdb.fetch_members(chat_id)
+    rows = await asyncio.to_thread(tdb.fetch_members, chat_id)
     candidates: List[Candidate] = []
     for row in rows:
         c = _row_to_candidate(row)

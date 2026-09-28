@@ -1,7 +1,15 @@
-"""Bind module handlers — /bind, /bindmenu, force-join gate, join tracking."""
+"""Bind module handlers — /bind, /bindmenu, force-join gate, join tracking.
+
+Every ``bdb.*`` call is synchronous, UNCACHED MongoDB I/O (``_find_one``
+bypasses bot.database's read cache).  This module therefore routes all of
+them through ``asyncio.to_thread`` — ``gate_message_handler`` runs for
+*every* group message in *every* chat, so a single blocking round trip
+here stalls the whole event loop and with it long-polling itself.
+"""
 
 import asyncio
 import logging
+import time
 from typing import Any, Dict, Optional
 
 from aiogram import Bot
@@ -13,10 +21,12 @@ from bot.reply import reply_text
 
 from . import database as bdb
 from .checks import (
+    gate_enabled,
     in_grace,
     is_bot_admin,
     is_channel_member,
     is_group_admin,
+    message_gates,
     should_enforce,
 )
 from .config import PLACEHOLDERS_HELP
@@ -29,6 +39,7 @@ from .utils import (
     spawn,
     user_mention_html,
 )
+from bot.async_bridge import adb
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +99,7 @@ async def bind_command(message: Message, bot: Bot, args: list, chat_data: dict) 
         )
         return
 
-    existing = bdb.get_settings(chat_id)
+    existing = await adb(bdb.get_settings(chat_id))
 
     # No argument → show status / usage.
     if not args:
@@ -139,7 +150,7 @@ async def bind_command(message: Message, bot: Bot, args: list, chat_data: dict) 
         return
 
     # One channel ↔ one group: reject if another GC already holds this channel.
-    other = bdb.find_other_binding(channel.id, chat_id)
+    other = await adb(bdb.find_other_binding(channel.id, chat_id))
     if other:
         await reply_text(message, _channel_taken_text(), parse_mode=ParseMode.HTML)
         return
@@ -162,7 +173,7 @@ async def bind_command(message: Message, bot: Bot, args: list, chat_data: dict) 
         )
         return
 
-    _apply_binding(message, channel, bound_by=user.id)
+    await _apply_binding(message, channel, bound_by=user.id)
 
 
 def _channel_taken_text() -> str:
@@ -173,24 +184,31 @@ def _channel_taken_text() -> str:
     )
 
 
-def _apply_binding(message: Message, channel, bound_by: int) -> None:
+def _write_binding(message: Message, channel, bound_by: int):
+    """Blocking Mongo writes for a bind — runs in a worker thread."""
     chat_id = message.chat.id
     link = _channel_link(channel)
+    bdb.upsert_binding(
+        chat_id,
+        channel.id,
+        channel_username=channel.username,
+        channel_title=channel.title,
+        channel_link=link,
+        bound_by=bound_by,
+    )
+    return chat_id, bdb.get_settings(chat_id)
+
+
+async def _apply_binding(message: Message, channel, bound_by: int) -> None:
     try:
-        bdb.upsert_binding(
-            chat_id,
-            channel.id,
-            channel_username=channel.username,
-            channel_title=channel.title,
-            channel_link=link,
-            bound_by=bound_by,
+        chat_id, settings = await asyncio.to_thread(
+            _write_binding, message, channel, bound_by
         )
     except ValueError as e:
         if str(e) == "CHANNEL_TAKEN":
             spawn(reply_text(message, _channel_taken_text(), parse_mode=ParseMode.HTML))
             return
         raise
-    settings = bdb.get_settings(chat_id)
     title = channel.title or (f"@{channel.username}" if channel.username else str(channel.id))
     text = (
         f"{E.CHECK} <b>Group bound successfully!</b>\n\n"
@@ -200,7 +218,6 @@ def _apply_binding(message: Message, channel, bound_by: int) -> None:
         f"{E.CLOCK} Grace: <b>{format_grace(settings.get('grace_minutes') or 0)}</b>\n\n"
         f"{E.SETTINGS} Open <code>/bindmenu</code> to configure gates and the message."
     )
-    # Fire reply first; heavy work already done above (sync SQLite is fine here).
     spawn(
         reply_text(
             message,
@@ -233,7 +250,7 @@ async def bindmenu_command(message: Message, bot: Bot, chat_data: dict) -> None:
         )
         return
 
-    settings = bdb.get_settings(chat_id)
+    settings = await adb(bdb.get_settings(chat_id))
     if not settings:
         await reply_text(
             message,
@@ -265,35 +282,74 @@ def _active_gate_count(settings: Dict[str, Any]) -> int:
     return sum(1 for col in GATES.values() if int(settings.get(col) or 0))
 
 
+def _gate_state(chat_id: int, user_id: int):
+    """Blocking reads behind one gate decision — MUST run in a worker thread.
+
+    Returns ``(settings, join_ts)``; ``settings`` is ``None`` when the chat
+    is unbound, in which case the join stamp is irrelevant.
+    """
+    settings = bdb.get_settings(chat_id)
+    if not settings:
+        return None, None
+    return settings, bdb.get_join_time(chat_id, user_id)
+
+
+def _record_gate_fail(chat_id: int, user_id: int) -> None:
+    """Blocking counter bumps — MUST run in a worker thread."""
+    try:
+        from bot.database import db as _pdb
+        _pdb.bump_bind_fails(chat_id, 1)
+        _pdb.record_reputation_event(user_id, "warning", 1)
+    except Exception as e:
+        logger.debug(f"bind fail counter: {e}")
+
+
 async def gate_message_handler(message: Message, bot: Bot) -> None:
-    """Enforce force-join / message-type gates on incoming group messages."""
+    """Enforce force-join / message-type gates on incoming group messages.
+
+    This is the hottest handler in the bot — it is registered at
+    ``HANDLER_GROUP`` for *every* group message in *every* chat.  Ordering
+    inside it is therefore deliberate:
+
+    1. one ``to_thread`` read (settings + join stamp together — the old
+       code issued three separate blocking round trips, one of them a
+       no-op), then
+    2. a pure-CPU gate precheck, so an unbound chat or a chat whose gates
+       cannot match never reaches the ``getChatMember`` round trip or a
+       single Mongo write.
+    """
     if not message:
         return
     chat = message.chat
     if not chat or chat.type == "private":
         return
-
-    chat_id = chat.id
-    settings = bdb.get_settings(chat_id)
-    if not settings or not settings.get("channel_id"):
-        return
-
-    # Never gate service/pin/poll-only noise we don't handle; still allow text/media.
     user = message.from_user
     if user is None:
         return
 
-    # Quick path: record first-seen for grace bookkeeping.
-    if not bdb.get_join_time(chat_id, user.id):
-        # Do NOT invent a grace window — leave unknown → no grace (see in_grace).
-        pass
+    chat_id = chat.id
+    settings, join_ts = await asyncio.to_thread(_gate_state, chat_id, user.id)
+    if not settings:
+        return
+
+    # Pure CPU — no I/O. Note: there is deliberately no second
+    # get_join_time() here; the old "quick path" block was a no-op (`pass`)
+    # that still paid for a full Mongo round trip on every message, and an
+    # unknown join stamp correctly yields no grace (see in_grace).
+    force = bool(int(settings.get("force_join") or 0))
+    if not force and not any(
+        gate_enabled(settings, g) for g in message_gates(message)
+    ):
+        return
+    if user.is_bot:
+        return
+    grace_ok = in_grace(join_ts, int(settings.get("grace_minutes") or 0))
+    if grace_ok:
+        return
 
     is_admin = False
     if int(settings.get("admin_bypass") or 1):
         is_admin = await is_group_admin(bot, chat_id, user.id)
-
-    join_ts = bdb.get_join_time(chat_id, user.id)
-    grace_ok = in_grace(join_ts, int(settings.get("grace_minutes") or 0))
 
     if not should_enforce(
         settings,
@@ -308,16 +364,11 @@ async def gate_message_handler(message: Message, bot: Bot) -> None:
     channel_id = settings["channel_id"]
     if await is_channel_member(bot, channel_id, user.id, fresh=False):
         # Cache said member — allow. Also persist join for future grace math.
-        bdb.record_join(chat_id, user.id)
+        await adb(bdb.record_join(chat_id, user.id))
         return
 
     # Not a member → gate: delete + warn.
-    try:
-        from bot.database import db as _pdb
-        _pdb.bump_bind_fails(chat_id, 1)
-        _pdb.record_reputation_event(user.id, "warning", 1)
-    except Exception as _e:
-        logger.debug(f"bind fail counter: {_e}")
+    await asyncio.to_thread(_record_gate_fail, chat_id, user.id)
 
     if not await is_bot_admin(bot, chat_id):
         # Can't delete; still try to warn once (best effort).
@@ -355,7 +406,7 @@ async def gate_message_handler(message: Message, bot: Bot) -> None:
             reply_markup=force_join_keyboard(channel_link, channel_title),
             disable_web_page_preview=True,
         )
-        bdb.add_warning(chat_id, warning.message_id, user.id)
+        await adb(bdb.add_warning(chat_id, warning.message_id, user.id))
         delay = int(settings.get("auto_delete_seconds") or 0)
         if delay > 0:
             spawn(_auto_delete(bot, chat_id, warning.message_id, delay))
@@ -371,9 +422,34 @@ async def _auto_delete(bot: Bot, chat_id: int, message_id: int, delay: int) -> N
         pass
     finally:
         try:
-            bdb.remove_warning(chat_id, message_id)
+            await adb(bdb.remove_warning(chat_id, message_id))
         except Exception:
             pass
+
+
+def _track_joins(
+    chat_id: int,
+    members,
+    left_member,
+    bot_id: int,
+    now: float,
+) -> None:
+    """Blocking join bookkeeping — MUST run in a worker thread.
+
+    Only writes when the chat is actually bound (saves writes), matching
+    the previous behaviour exactly.  Joins and leaves are handled
+    independently: a leave-only service message has no ``members`` but
+    must still clear the leaver's stamp, otherwise grace-period math
+    keeps using a join time from months ago.
+    """
+    if not bdb.get_settings(chat_id):
+        return
+    for member in members:
+        if member.is_bot or member.id == bot_id:
+            continue
+        bdb.record_join(chat_id, member.id, joined_at=now)
+    if left_member is not None and not left_member.is_bot:
+        bdb.clear_join(chat_id, left_member.id)
 
 
 async def join_tracker(message: Message, bot: Bot) -> None:
@@ -381,27 +457,24 @@ async def join_tracker(message: Message, bot: Bot) -> None:
     if not message or not message.chat or message.chat.type == "private":
         return
 
-    chat_id = message.chat.id
-    if not message.new_chat_members:
+    members = message.new_chat_members or ()
+    left = message.left_chat_member
+    # Telegram sends three shapes: join-only, leave-only, and
+    # join+leave (a change in username/photo sends neither).  Bail out
+    # only when there is genuinely nothing to record — the old
+    # `if not message.new_chat_members: return` dropped every
+    # leave-only message, so clear_join never ran for them.
+    if not members and left is None:
         return
 
-    # Only track when this chat is bound (saves writes).
-    if not bdb.get_settings(chat_id):
-        return
-
-    import time
-
-    now = time.time()
-    for member in message.new_chat_members:
-        if member.is_bot:
-            continue
-        if member.id == bot.id:
-            continue
-        bdb.record_join(chat_id, member.id, joined_at=now)
-
-    # left_chat_member → clear so rejoin gets a fresh stamp.
-    if message.left_chat_member and not message.left_chat_member.is_bot:
-        bdb.clear_join(chat_id, message.left_chat_member.id)
+    await asyncio.to_thread(
+        _track_joins,
+        message.chat.id,
+        members,
+        left,
+        bot.id,
+        time.time(),
+    )
 
 
 async def waiting_text_handler(message: Message, bot: Bot, chat_data: dict) -> None:
@@ -418,7 +491,7 @@ async def waiting_text_handler(message: Message, bot: Bot, chat_data: dict) -> N
     if not await is_group_admin(bot, chat_id, user.id):
         return
 
-    settings = bdb.get_settings(chat_id)
+    settings = await adb(bdb.get_settings(chat_id))
     if not settings:
         chat_data.pop("bind_wait", None)
         return
@@ -430,7 +503,7 @@ async def waiting_text_handler(message: Message, bot: Bot, chat_data: dict) -> N
             await reply_text(message, f"{E.ERROR} Empty message — send non-empty text or /bindmenu.", parse_mode=ParseMode.HTML)
             return
         # Show placeholders that survived / were typed.
-        bdb.update_field(chat_id, "custom_message", text)
+        await adb(bdb.update_field(chat_id, "custom_message", text))
         try:
             await message.delete()
         except Exception:
@@ -460,25 +533,25 @@ async def waiting_text_handler(message: Message, bot: Bot, chat_data: dict) -> N
                 parse_mode=ParseMode.HTML,
             )
             return
-        if bdb.find_other_binding(channel.id, chat_id):
+        if await adb(bdb.find_other_binding(channel.id, chat_id)):
             await bot.send_message(chat_id=message.chat.id, text=_channel_taken_text(), parse_mode=ParseMode.HTML)
             return
         link = _channel_link(channel)
         try:
-            bdb.upsert_binding(
+            await adb(bdb.upsert_binding(
                 chat_id,
                 channel.id,
                 channel_username=channel.username,
                 channel_title=channel.title,
                 channel_link=link,
                 bound_by=user.id,
-            )
+            ))
         except ValueError as e:
             if str(e) == "CHANNEL_TAKEN":
                 await bot.send_message(chat_id=message.chat.id, text=_channel_taken_text(), parse_mode=ParseMode.HTML)
                 return
             raise
-        fresh = bdb.get_settings(chat_id)
+        fresh = await adb(bdb.get_settings(chat_id))
         await bot.send_message(
             chat_id=message.chat.id,
             text=f"{E.CHECK} Channel replaced with <b>{channel.title or channel.username or channel.id}</b>.",

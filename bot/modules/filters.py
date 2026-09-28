@@ -3,7 +3,6 @@
 Uses SQLite database for storage.
 """
 
-import asyncio
 import json
 import logging
 from typing import Optional
@@ -19,6 +18,7 @@ from bot.emojis import E
 from bot.pipeline import GROUPS, cmd, on
 from bot.reply import (reply_text, reply_photo, reply_document, reply_animation,
                        reply_video, reply_sticker, reply_voice, reply_audio)
+from bot.async_bridge import adb
 
 logger = logging.getLogger(__name__)
 
@@ -129,9 +129,8 @@ async def add_filter(message: Message, bot: Bot, args: list):
         return
 
     buttons_json = json.dumps(buttons) if buttons else None
-    await asyncio.to_thread(
-        db.add_filter, chat_id, trigger, reply_body, buttons_json, media_type, media_id
-    )
+    await adb(db.add_filter(chat_id, trigger, reply_body, buttons_json, media_type, media_id
+    ))
 
     await reply_text(
         message,
@@ -159,7 +158,7 @@ async def stop_filter(message: Message, bot: Bot, args: list):
     trigger = args[0].lower()
     chat_id = message.chat.id
 
-    if await asyncio.to_thread(db.remove_filter, chat_id, trigger):
+    if await adb(db.remove_filter(chat_id, trigger)):
         await reply_text(message, f"{E.CHECK} Filter <b>{trigger}</b> removed.", parse_mode=ParseMode.HTML)
     else:
         await reply_text(message, f"{E.ERROR} Filter not found.",
@@ -173,7 +172,7 @@ async def filters_list(message: Message):
         return
 
     chat_id = message.chat.id
-    filters_data = await asyncio.to_thread(db.get_filters, chat_id)
+    filters_data = await adb(db.get_filters(chat_id))
 
     if not filters_data:
         await reply_text(message, f"{E.INFO} No filters set in this chat.",
@@ -194,7 +193,7 @@ async def check_filters(message: Message):
         return
 
     chat_id = message.chat.id
-    filters_data = await asyncio.to_thread(db.get_filters, chat_id)
+    filters_data = await adb(db.get_filters(chat_id))
     if not filters_data:
         return
 

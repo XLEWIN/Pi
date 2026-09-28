@@ -36,6 +36,7 @@ from bot.emojis import E
 from bot.pipeline import cmd, on
 from bot.reply import reply_text
 from bot.responses import action_card, field_extra, plain_error
+from bot.async_bridge import adb
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +84,7 @@ async def _flush_write_behinds() -> None:
     try:
         from bot.database import db
 
-        await asyncio.to_thread(db.flush_buffers)
+        await adb(db.flush_buffers())
     except Exception as e:  # noqa: BLE001 — restart must not be blocked
         logger.warning(f"restart: db buffer flush failed: {e}")
     try:

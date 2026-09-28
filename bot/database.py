@@ -22,7 +22,13 @@ thread-safe and pools connections process-wide.
 
 from __future__ import annotations
 
+from bot.async_bridge import bind_loop, box, make_facade, run_sync
+from bot.mongo_async import AsyncCursor, open_backend
+
 import atexit
+import asyncio
+import concurrent.futures
+import inspect
 import os
 import sys
 import threading
@@ -154,7 +160,7 @@ class _CollProxy:
 
     _READS = frozenset({
         "find", "find_one", "count_documents", "distinct", "aggregate",
-        "estimated_document_count",
+        "estimated_document_count", "index_information",
     })
     _WRITES = frozenset({
         "insert_one", "insert_many", "update_one", "update_many",
@@ -171,19 +177,31 @@ class _CollProxy:
     def __getattr__(self, attr: str):
         target = getattr(self._real, attr)
         if attr in self._READS:
-            def _read(*args, **kwargs):
+            async def _read(*args, **kwargs):
                 if self._name in _BUFFERED:
-                    self._owner.flush_buffers()
-                return target(*args, **kwargs)
-            return _read
+                    await self._owner.flush_buffers()
+                res = target(*args, **kwargs)
+                # `find`/`aggregate` hand back a cursor synchronously on
+                # both backends; the scalar reads return coroutines.
+                if inspect.isawaitable(res):
+                    res = await res
+                # Normalise to AsyncCursor so one object supports both
+                # `async for` (database.py) and plain `for` (the sync
+                # module databases, which run under to_thread).
+                if attr in ("find", "aggregate") and not isinstance(res, AsyncCursor):
+                    res = AsyncCursor(res)
+                return res
+            return lambda *a, **k: box(_read(*a, **k))
         if attr in self._WRITES:
-            def _write(*args, **kwargs):
+            async def _write(*args, **kwargs):
                 if self._name in _BUFFERED:
-                    self._owner.flush_buffers()
+                    await self._owner.flush_buffers()
                 result = target(*args, **kwargs)
+                if inspect.isawaitable(result):
+                    result = await result
                 self._owner._invalidate(self._name, op=attr)
                 return result
-            return _write
+            return lambda *a, **k: box(_write(*a, **k))
         return target
 
 
@@ -212,32 +230,14 @@ class Database:
 
     def __init__(self):
         uri = _resolve_uri()
-        if uri is None:
-            import mongomock
-
-            self._client = mongomock.MongoClient()
-            self._mongo = self._client["pi_bot_test"]
-            self.backend = "mongomock (tests)"
-        else:
-            from pymongo import MongoClient
-            from pymongo.errors import ConfigurationError
-
-            self._client = MongoClient(
-                uri,
-                serverSelectionTimeoutMS=8000,
-                appname="pi-bot",
-            )
-            try:
-                self._mongo = self._client.get_default_database()
-            except ConfigurationError:
-                # SRV URI without a /dbname — pymongo 4.x raises instead
-                # of returning None.
-                self._mongo = None
-            if self._mongo is None:
-                self._mongo = self._client["pi_bot"]
-            # Fail fast on a bad URI / unreachable cluster.
-            self._client.admin.command("ping")
-            self.backend = f"mongodb ({self._mongo.name})"
+        self._is_test = uri is None
+        # Construction is synchronous and non-blocking on both backends:
+        # Motor opens its sockets on the first `await`, so the client can
+        # be built here, before any event loop exists. The ping, the
+        # index build and the boot snapshot all moved to startup() so
+        # they run on the bot's own loop (Motor is loop-bound).
+        self._client, mongo, self.backend = open_backend(uri)
+        self._mongo = mongo
 
         # ── Perf layer: read cache + aggregate memos + write-behind ──
         # ONE re-entrant lock guards all of it (flush-on-read re-enters
@@ -251,6 +251,16 @@ class Database:
         self._buf_hourly: Dict[Tuple[int, str, int], int] = {}
         self._buf_msg: Dict[Tuple[int, int, str], int] = {}
         self._buf_groups: Dict[int, Dict[str, Any]] = {}
+        # Running totals for _buf_msg, so _pending_msg_sum() is O(1)
+        # instead of scanning every unflushed (chat, user, date) key.
+        # That scan ran up to 4x per group message WHILE HOLDING _lock,
+        # so it scaled with unflushed volume (5s of traffic) and turned
+        # into a per-message lock convoy. Maintained in _enqueue_msg and
+        # dropped in flush_buffers alongside _buf_msg itself.
+        self._sum_msg_all: int = 0
+        self._sum_msg_cu: Dict[Tuple[int, int], int] = {}
+        self._sum_msg_u: Dict[int, int] = {}
+        self._sum_msg_cd: Dict[Tuple[int, str], int] = {}
         # Fast-skip maps: per-message upserts that re-write identical
         # identity/activity rows (and no-op membership touches) on every
         # message are skipped for _SKIP_TTL seconds. Keyed by the exact
@@ -260,17 +270,39 @@ class Database:
         self._skip_member: Dict[Any, float] = {}
         self._flusher: Optional[threading.Thread] = None
         self._flusher_stop = threading.Event()
+        # Single-flight token for flush_buffers: the Future the in-flight
+        # flush completes when its writes have landed.  See flush_buffers.
+        self._flush_inflight: Optional[concurrent.futures.Future] = None
         self._real_mongo = self._mongo
         self._mongo = _MongoProxy(self, self._mongo)
         atexit.register(self._atexit_flush)
 
-        self._ensure_indexes()
+        if self._is_test:
+            # mongomock is in-memory and loop-agnostic, so the test
+            # process can build its indexes right here — there is no
+            # Motor loop to be bound to yet.
+            run_sync(self._ensure_indexes())
+
+    async def startup(self) -> None:
+        """Bind the driver to this loop and bring the schema up.
+
+        Called once from ``main.py`` after the event loop exists and
+        before polling starts.  ``bind_loop`` is what lets synchronous
+        call sites (the flusher thread, ``atexit``, the module databases)
+        submit their coroutines to *this* loop instead of the private
+        executor loop — Motor can only run where it is bound.
+        """
+        bind_loop(asyncio.get_running_loop())
+        if not self._is_test:
+            # Fail fast on a bad URI / unreachable cluster.
+            await self._client.admin.command("ping")
+        await self._ensure_indexes()
+        await self._log_snapshot()
         logger.info(f"Connected to database: {self.backend}")
-        self._log_snapshot()
 
     # ── internals ────────────────────────────────────────
 
-    def _log_snapshot(self) -> None:
+    async def _log_snapshot(self) -> None:
         """Boot-time row counts — make the real store unmistakable.
 
         A wrong-but-reachable ``MONGO_URI`` (valid cluster, empty or
@@ -283,10 +315,12 @@ class Database:
         if self.backend.startswith("mongomock"):
             return  # tests: counts are meaningless noise
         try:
-            counts = {
-                name: self._real_mongo[name].estimated_document_count()
-                for name in ("users", "groups", "daily_messages")
-            }
+            counts = {}
+            for name in ("users", "groups", "daily_messages"):
+                n = self._real_mongo[name].estimated_document_count()
+                # Motor/mongomock-shim hand back a coroutine; a test's
+                # fake collection may hand back an int.
+                counts[name] = await n if inspect.isawaitable(n) else n
             line = ", ".join(f"{name}={n}" for name, n in counts.items())
             logger.info(f"Database snapshot at boot: {line}")
             if not any(counts.values()):
@@ -311,18 +345,20 @@ class Database:
         doc.pop("_id", None)
         return doc
 
-    def _find(self, name: str, flt: Optional[Dict[str, Any]] = None,
+    async def _find(self, name: str, flt: Optional[Dict[str, Any]] = None,
               projection: Optional[Dict[str, int]] = None,
               sort: Optional[List[Tuple[str, int]]] = None,
               limit: int = 0) -> List[Dict[str, Any]]:
-        cur = self._mongo[name].find(flt or {}, projection or {})
+        cur = await self._mongo[name].find(flt or {}, projection or {})
         if sort:
             cur = cur.sort(sort)
         if limit:
             cur = cur.limit(limit)
-        return [self._clean(d) for d in cur]
+        # Cursors are async-iterable on both backends (Motor natively,
+        # AsyncCursor over mongomock), so this must be an async comp.
+        return [self._clean(d) async for d in cur]
 
-    def _find_one(self, name: str, flt: Optional[Dict[str, Any]] = None,
+    async def _find_one(self, name: str, flt: Optional[Dict[str, Any]] = None,
                   projection: Optional[Dict[str, int]] = None,
                   sort: Optional[List[Tuple[str, int]]] = None) -> Optional[Dict[str, Any]]:
         kwargs: Dict[str, Any] = {}
@@ -330,15 +366,15 @@ class Database:
             kwargs["projection"] = projection
         if sort:
             kwargs["sort"] = sort
-        return self._clean(self._mongo[name].find_one(flt or {}, **kwargs))
+        return self._clean(await self._mongo[name].find_one(flt or {}, **kwargs))
 
-    def _next_id(self, coll_name: str) -> int:
+    async def _next_id(self, coll_name: str) -> int:
         """AUTOINCREMENT replacement — monotonic per collection, in-process."""
         with _SEQ_LOCK:
-            self._mongo["counters"].update_one(
+            await self._mongo["counters"].update_one(
                 {"_id": coll_name}, {"$inc": {"seq": 1}}, upsert=True
             )
-            doc = self._mongo["counters"].find_one({"_id": coll_name})
+            doc = await self._mongo["counters"].find_one({"_id": coll_name})
             return int(doc["seq"]) if doc else 1
 
     @staticmethod
@@ -367,6 +403,10 @@ class Database:
         "get_sudo_users": ("sudo_users",),
         "get_welcome_settings": ("welcome_settings",),
         "get_welcome_message": ("welcome_messages",),
+        # bind module (bot/modules/bind/database.py) — read on every
+        # group message by gate_message_handler.
+        "get_bind_settings": ("bind_settings",),
+        "find_other_binding": ("bind_settings",),
     }
 
     @staticmethod
@@ -378,7 +418,7 @@ class Database:
             return list(value)
         return value
 
-    def _cached_read(self, method: str, key: tuple, loader,
+    async def _cached_read(self, method: str, key: tuple, loader,
                      ttl: float = _CACHE_TTL) -> Any:
         """Read-through cache: loader runs at most once per TTL window.
 
@@ -391,11 +431,28 @@ class Database:
             if hit is not None and hit[0] > now:
                 return self._copy_cached(hit[1])
             gen = self._cache_gen
-        value = loader()
+        # The loader is a nested coroutine (it awaits _find_one). box()
+        # makes this work whether the loader returns a coroutine or an
+        # already-final value.
+        value = await box(loader())
         with self._lock:
             if self._cache_gen == gen:
                 self._read_cache[(method, key)] = (now + ttl, value)
         return self._copy_cached(value)
+
+    def peek_cached(self, method: str, key: tuple) -> Tuple[bool, Any]:
+        """Synchronous cache probe — returns ``(found, value)``.
+
+        Lets a hot path check an already-warm read WITHOUT paying an
+        ``asyncio.to_thread`` round-trip to the executor: after the first
+        load, ``is_spam_blocked`` and friends are answered from a dict.
+        The thread hop stays as the miss path.
+        """
+        with self._lock:
+            hit = self._read_cache.get((method, key))
+            if hit is not None and hit[0] > time.monotonic():
+                return True, self._copy_cached(hit[1])
+        return False, None
 
     def _invalidate(self, coll: str, op: str = "") -> None:
         """Drop cache entries + aggregate memos fed by `coll`.
@@ -451,9 +508,12 @@ class Database:
     def _flush_loop(self) -> None:
         while not self._flusher_stop.wait(_FLUSH_INTERVAL):
             try:
-                self.flush_buffers()
+                # Runs on a thread; run_sync routes the coroutine to
+                # whichever loop owns the driver (the bot loop once
+                # startup() has bound it, the private loop in tests).
+                run_sync(self.flush_buffers())
                 self._prune_skips()
-            except Exception as e:  # pragma: no cover — defensive
+            except Exception as e:  # pragma: no cover - defensive
                 logger.warning(f"background flush failed: {e}")
 
     def _prune_skips(self) -> None:
@@ -467,8 +527,8 @@ class Database:
     def _atexit_flush(self) -> None:
         self._flusher_stop.set()
         try:
-            self.flush_buffers()
-        except Exception:  # pragma: no cover — process is exiting
+            run_sync(self.flush_buffers())
+        except Exception:  # pragma: no cover - process is exiting
             pass
 
     def _enqueue_daily(self, chat_id: int, date_str: str,
@@ -489,14 +549,59 @@ class Database:
     def _enqueue_msg(self, chat_id: int, user_id: int,
                      date_str: str, n: int) -> None:
         with self._lock:
+            n = int(n)
             k = (chat_id, user_id, date_str)
-            self._buf_msg[k] = self._buf_msg.get(k, 0) + int(n)
+            self._buf_msg[k] = self._buf_msg.get(k, 0) + n
+            self._sum_msg_all += n
+            cu = (chat_id, user_id)
+            self._sum_msg_cu[cu] = self._sum_msg_cu.get(cu, 0) + n
+            self._sum_msg_u[user_id] = self._sum_msg_u.get(user_id, 0) + n
+            cd = (chat_id, date_str)
+            self._sum_msg_cd[cd] = self._sum_msg_cd.get(cd, 0) + n
         self._ensure_flusher()
+
+    def _drop_msg_sums(self) -> None:
+        """Zero the running totals (caller holds _lock)."""
+        self._sum_msg_all = 0
+        self._sum_msg_cu.clear()
+        self._sum_msg_u.clear()
+        self._sum_msg_cd.clear()
+
+    def _add_msg_sums(self, msgs: Dict[Tuple[int, int, str], int]) -> None:
+        """Re-credit totals after a failed flush (caller holds _lock)."""
+        for (c, u, d), n in msgs.items():
+            self._sum_msg_all += n
+            cu = (c, u)
+            self._sum_msg_cu[cu] = self._sum_msg_cu.get(cu, 0) + n
+            self._sum_msg_u[u] = self._sum_msg_u.get(u, 0) + n
+            cd = (c, d)
+            self._sum_msg_cd[cd] = self._sum_msg_cd.get(cd, 0) + n
 
     def _pending_msg_sum(self, chat_id: Optional[int] = None,
                          user_id: Optional[int] = None,
                          date_str: Optional[str] = None) -> int:
-        """Unflushed message counts (call with self._lock held)."""
+        """Unflushed message counts (call with self._lock held).
+
+        O(1) via the running totals maintained in ``_enqueue_msg``. The
+        old implementation walked ``_buf_msg`` — O(unflushed keys) while
+        holding the process-wide lock — and ran up to 4x per message on
+        the counting path, so cost grew with message volume instead of
+        staying flat.
+        """
+        if chat_id is None and user_id is None and date_str is None:
+            return self._sum_msg_all
+        if user_id is None and date_str is None:
+            return self._sum_msg_cu.get((chat_id, user_id), 0)
+        if user_id is None and chat_id is None:
+            # date only — no dedicated index; rare (not on a hot path)
+            return sum(n for (c, u, d), n in self._buf_msg.items()
+                       if d == date_str)
+        if date_str is None and chat_id is None:
+            return self._sum_msg_u.get(user_id, 0)
+        if user_id is None:
+            return self._sum_msg_cd.get((chat_id, date_str), 0)
+        # All three filters (or chat-only): not used by any current call
+        # site, so keep the exact original semantics for safety.
         total = 0
         for (c, u, d), n in self._buf_msg.items():
             if chat_id is not None and c != chat_id:
@@ -509,42 +614,77 @@ class Database:
         return total
 
     @staticmethod
-    def _apply_ops(coll, pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]]) -> None:
+    async def _apply_ops(coll, pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]]) -> None:
         """$inc upserts: one bulk round-trip when possible."""
         try:
             from pymongo import UpdateOne
-            coll.bulk_write(
+            res = coll.bulk_write(
                 [UpdateOne(f, u, upsert=True) for f, u in pairs], ordered=False
             )
+            if inspect.isawaitable(res):
+                await res
         except Exception:
             for f, u in pairs:
-                coll.update_one(f, u, upsert=True)
+                res = coll.update_one(f, u, upsert=True)
+                if inspect.isawaitable(res):
+                    await res
 
-    def flush_buffers(self) -> None:
+    async def flush_buffers(self) -> None:
         """Write pending counters/groups to Mongo.
 
-        Holds the perf lock for the whole write: any reader that gets
-        past this call sees an exact, fully-flushed view (this is how
-        tests and /stats-style commands keep read-your-writes).
+        **Single-flight.**  Exactly one flush writes at a time and every
+        other caller waits for it.  The buffers are *claimed* (copied and
+        cleared) under the perf lock before any I/O, so a second flush
+        finds nothing to do — but a reader that arrives mid-write must
+        still wait, or it would see neither the claimed rows (already
+        removed from the buffer) nor the Mongo rows (not written yet) and
+        would memoize a stale total.  That is the read-your-writes
+        guarantee tests and /stats-style commands rely on.
+
+        The I/O deliberately runs *outside* the RLock.  Holding it across
+        an ``await`` looks safe because it re-entrantly succeeds from
+        another coroutine on the same loop — which is exactly the bug:
+        the second coroutine sails straight past the guard while the
+        first is still writing.  A worker thread, by contrast, would
+        block on it, so the lock still serializes every synchronous
+        mutator (``_enqueue_msg``, memo invalidation, buffer reads).
         """
-        with self._lock:
-            daily = dict(self._buf_daily)
-            self._buf_daily.clear()
-            hourly = dict(self._buf_hourly)
-            self._buf_hourly.clear()
-            msgs = dict(self._buf_msg)
-            self._buf_msg.clear()
-            groups = dict(self._buf_groups)
-            self._buf_groups.clear()
-            if not (daily or hourly or msgs or groups):
-                return
-            if msgs:
-                # daily_messages aggregates must refetch their bases.
-                self._memos.clear()
+        for _attempt in range(1000):
+            with self._lock:
+                inflight = self._flush_inflight
+                if inflight is not None:
+                    mine = None
+                else:
+                    daily = dict(self._buf_daily)
+                    self._buf_daily.clear()
+                    hourly = dict(self._buf_hourly)
+                    self._buf_hourly.clear()
+                    msgs = dict(self._buf_msg)
+                    self._buf_msg.clear()
+                    self._drop_msg_sums()
+                    groups = dict(self._buf_groups)
+                    self._buf_groups.clear()
+                    if not (daily or hourly or msgs or groups):
+                        return          # idle: nothing claimed, nothing owed
+                    if msgs:
+                        # daily_messages aggregates must refetch their bases.
+                        self._memos.clear()
+                    mine = concurrent.futures.Future()
+                    self._flush_inflight = mine
+
+            if mine is None:
+                # Another flush is mid-write (possibly on another loop).
+                # Wait for it, then re-check: fresh rows may be pending.
+                try:
+                    await asyncio.wrap_future(inflight)
+                except Exception:       # noqa: BLE001 — waiter must not crash
+                    pass
+                continue
+
             real = self._real_mongo
             try:
                 if msgs:
-                    self._apply_ops(real["daily_messages"], [
+                    await self._apply_ops(real["daily_messages"], [
                         ({"chat_id": c, "user_id": u, "date": d},
                          {"$inc": {"messages": n}})
                         for (c, u, d), n in msgs.items()
@@ -555,23 +695,23 @@ class Database:
                         inc = merged.setdefault((c, d), {})
                         inc[field] = inc.get(field, 0) + n
                     for (c, d), inc in merged.items():
-                        real["chat_daily_stats"].update_one(
+                        await real["chat_daily_stats"].update_one(
                             {"chat_id": c, "date": d},
                             {"$inc": inc}, upsert=True,
                         )
                 if hourly:
-                    self._apply_ops(real["chat_hourly_stats"], [
+                    await self._apply_ops(real["chat_hourly_stats"], [
                         ({"chat_id": c, "date": d, "hour": h},
                          {"$inc": {"messages": n}})
                         for (c, d, h), n in hourly.items()
                     ])
                 for cid, doc in groups.items():
-                    res = real["groups"].update_one(
+                    res = await real["groups"].update_one(
                         {"chat_id": cid}, {"$set": doc}
                     )
                     if res.matched_count == 0:
                         now = doc.get("last_active")
-                        real["groups"].insert_one({
+                        await real["groups"].insert_one({
                             "chat_id": cid,
                             "chat_title": doc.get("chat_title"),
                             "member_count": 0,
@@ -580,18 +720,30 @@ class Database:
                             "is_active": 1,
                         })
             except Exception as e:
-                # Nothing is lost — re-queue and retry on the next flush.
+                # Nothing is lost - re-queue and retry on the next flush.
                 for k, v in daily.items():
                     self._buf_daily[k] = self._buf_daily.get(k, 0) + v
                 for k, v in hourly.items():
                     self._buf_hourly[k] = self._buf_hourly.get(k, 0) + v
                 for k, v in msgs.items():
                     self._buf_msg[k] = self._buf_msg.get(k, 0) + v
+                self._add_msg_sums(msgs)
                 for k, v in groups.items():
                     self._buf_groups[k] = v
                 logger.warning(f"flush_buffers failed: {e}")
+            finally:
+                # Idle first, then wake: a waiter that resumes must see
+                # _flush_inflight is None so it does not wait again.
+                with self._lock:
+                    self._flush_inflight = None
+                mine.set_result(None)
+            return
 
-    def _ensure_indexes(self) -> None:
+        logger.warning(
+            "flush_buffers: gave up after 1000 waits for an in-flight flush"
+        )
+
+    async def _ensure_indexes(self) -> None:
         """Create the indexes backing the old PRIMARY KEYs/UNIQUEs."""
         indexes: Dict[str, List[Tuple[Dict[str, int], Dict[str, Any]]]] = {
             "users": [
@@ -673,6 +825,9 @@ class Database:
             ],
             "raid_events": [
                 ({"chat_id": 1, "id": -1}, {}),
+                # Backs log_raid_event's trim-head lookup, which sorts
+                # by id across all chats.
+                ({"id": -1}, {}),
             ],
             "ig_file_cache": [
                 ({"cache_key": 1}, {"unique": True}),
@@ -693,19 +848,19 @@ class Database:
                     key_list = (
                         list(keys.items()) if isinstance(keys, dict) else list(keys)
                     )
-                    self._mongo[name].create_index(key_list, **opts)
+                    await self._mongo[name].create_index(key_list, **opts)
                 except Exception as e:  # pragma: no cover — index quirk
                     logger.warning(f"Index {name} {keys} skipped: {e}")
         logger.info("Database indexes created/verified")
 
     # ── Instagram cache / settings / log ─────────────────
-    def ig_get_file_ids(self, keys: List[str]) -> Dict[str, Tuple[str, str]]:
+    async def ig_get_file_ids(self, keys: List[str]) -> Dict[str, Tuple[str, str]]:
         """Return {key: (file_id, media_kind)} for the requested keys."""
         if not keys:
             return {}
         try:
             out: Dict[str, Tuple[str, str]] = {}
-            for d in self._mongo["ig_file_cache"].find(
+            async for d in await self._mongo["ig_file_cache"].find(
                 {"cache_key": {"$in": list(keys)}},
                 {"cache_key": 1, "file_id": 1, "media_kind": 1, "_id": 0},
             ):
@@ -715,11 +870,11 @@ class Database:
             logger.error(f"ig_get_file_ids: {e}")
             return {}
 
-    def ig_put_file_id(
+    async def ig_put_file_id(
         self, cache_key: str, file_id: str, media_kind: str, source_url: str = ""
     ) -> None:
         try:
-            self._mongo["ig_file_cache"].update_one(
+            await self._mongo["ig_file_cache"].update_one(
                 {"cache_key": cache_key},
                 {
                     "$set": {
@@ -735,41 +890,42 @@ class Database:
         except Exception as e:
             logger.error(f"ig_put_file_id: {e}")
 
-    def ig_touch_file_id(self, cache_key: str) -> None:
+    async def ig_touch_file_id(self, cache_key: str) -> None:
         try:
-            self._mongo["ig_file_cache"].update_one(
+            await self._mongo["ig_file_cache"].update_one(
                 {"cache_key": cache_key},
                 {"$inc": {"hits": 1}, "$set": {"last_used": self._ts()}},
             )
         except Exception as e:
             logger.error(f"ig_touch_file_id: {e}")
 
-    def ig_clear_file_cache(self) -> int:
+    async def ig_clear_file_cache(self) -> int:
         try:
-            n = self._mongo["ig_file_cache"].count_documents({})
-            self._mongo["ig_file_cache"].delete_many({})
+            n = await self._mongo["ig_file_cache"].count_documents({})
+            await self._mongo["ig_file_cache"].delete_many({})
             return int(n)
         except Exception as e:
             logger.error(f"ig_clear_file_cache: {e}")
             return 0
 
-    def ig_cache_stats(self) -> Dict[str, int]:
+    async def ig_cache_stats(self) -> Dict[str, int]:
         try:
-            rows = self._mongo["ig_file_cache"].count_documents({})
-            hits = sum(
-                int(d.get("hits") or 0)
-                for d in self._mongo["ig_file_cache"].find(
+            rows = await self._mongo["ig_file_cache"].count_documents({})
+            docs = [
+                d
+                async for d in await self._mongo["ig_file_cache"].find(
                     {}, {"hits": 1, "_id": 0}
                 )
-            )
+            ]
+            hits = sum(int(d.get("hits") or 0) for d in docs)
             return {"rows": int(rows), "hits": int(hits)}
         except Exception as e:
             logger.error(f"ig_cache_stats: {e}")
             return {"rows": 0, "hits": 0}
 
-    def ig_get_settings(self, chat_id: int) -> Optional[Dict[str, Any]]:
+    async def ig_get_settings(self, chat_id: int) -> Optional[Dict[str, Any]]:
         try:
-            doc = self._find_one("ig_settings", {"chat_id": chat_id})
+            doc = await self._find_one("ig_settings", {"chat_id": chat_id})
             if doc is None:
                 return None
             # sqlite SELECT * materialized schema defaults for partial rows.
@@ -782,13 +938,13 @@ class Database:
             logger.error(f"ig_get_settings: {e}")
             return None
 
-    def ig_set_settings(self, chat_id: int, **fields: int) -> None:
+    async def ig_set_settings(self, chat_id: int, **fields: int) -> None:
         allowed = {"auto_download", "max_items", "send_spoiler"}
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
             return
         try:
-            self._mongo["ig_settings"].update_one(
+            await self._mongo["ig_settings"].update_one(
                 {"chat_id": chat_id},
                 {"$set": {**updates, "updated_at": self._ts()}},
                 upsert=True,
@@ -796,7 +952,7 @@ class Database:
         except Exception as e:
             logger.error(f"ig_set_settings: {e}")
 
-    def ig_log_download(
+    async def ig_log_download(
         self,
         chat_id: int,
         user_id: int,
@@ -807,9 +963,9 @@ class Database:
         error: Optional[str],
     ) -> None:
         try:
-            self._mongo["ig_download_log"].insert_one(
+            await self._mongo["ig_download_log"].insert_one(
                 {
-                    "id": self._next_id("ig_download_log"),
+                    "id": await self._next_id("ig_download_log"),
                     "chat_id": chat_id,
                     "user_id": user_id,
                     "status": status,
@@ -824,56 +980,56 @@ class Database:
             logger.error(f"ig_log_download: {e}")
 
     # ── Analytics counters ───────────────────────────────
-    def _bump_daily(self, chat_id: int, **cols: int) -> None:
+    async def _bump_daily(self, chat_id: int, **cols: int) -> None:
         """Increment per-chat daily counters (write-behind, flushed in background)."""
         inc = {k: int(v) for k, v in cols.items()}
         if inc:
             self._enqueue_daily(chat_id, date.today().isoformat(), inc)
 
-    def bump_messages(self, chat_id: int, n: int = 1) -> None:
+    async def bump_messages(self, chat_id: int, n: int = 1) -> None:
         try:
-            self._bump_daily(chat_id, messages=n)
+            await self._bump_daily(chat_id, messages=n)
         except Exception as e:
             logger.error(f"bump_messages: {e}")
 
-    def bump_new_members(self, chat_id: int, n: int = 1) -> None:
+    async def bump_new_members(self, chat_id: int, n: int = 1) -> None:
         try:
-            self._bump_daily(chat_id, new_members=n)
+            await self._bump_daily(chat_id, new_members=n)
         except Exception as e:
             logger.error(f"bump_new_members: {e}")
 
-    def bump_left_members(self, chat_id: int, n: int = 1) -> None:
+    async def bump_left_members(self, chat_id: int, n: int = 1) -> None:
         try:
-            self._bump_daily(chat_id, left_members=n)
+            await self._bump_daily(chat_id, left_members=n)
         except Exception as e:
             logger.error(f"bump_left_members: {e}")
 
-    def bump_spam_attempts(self, chat_id: int, n: int = 1) -> None:
+    async def bump_spam_attempts(self, chat_id: int, n: int = 1) -> None:
         try:
-            self._bump_daily(chat_id, spam_attempts=n)
+            await self._bump_daily(chat_id, spam_attempts=n)
         except Exception as e:
             logger.error(f"bump_spam_attempts: {e}")
 
-    def bump_mod_actions(self, chat_id: int, n: int = 1) -> None:
+    async def bump_mod_actions(self, chat_id: int, n: int = 1) -> None:
         try:
-            self._bump_daily(chat_id, mod_actions=n)
+            await self._bump_daily(chat_id, mod_actions=n)
         except Exception as e:
             logger.error(f"bump_mod_actions: {e}")
 
-    def bump_bind_fails(self, chat_id: int, n: int = 1) -> None:
+    async def bump_bind_fails(self, chat_id: int, n: int = 1) -> None:
         try:
-            self._bump_daily(chat_id, bind_fails=n)
+            await self._bump_daily(chat_id, bind_fails=n)
         except Exception as e:
             logger.error(f"bump_bind_fails: {e}")
 
-    def bump_hourly(self, chat_id: int, hour: int, n: int = 1) -> None:
+    async def bump_hourly(self, chat_id: int, hour: int, n: int = 1) -> None:
         today = date.today().isoformat()
         try:
             self._enqueue_hourly(chat_id, today, hour, n)
         except Exception as e:
             logger.error(f"bump_hourly: {e}")
 
-    def get_daily_stats(self, chat_id: int, days: int = 1) -> Dict[str, int]:
+    async def get_daily_stats(self, chat_id: int, days: int = 1) -> Dict[str, int]:
         """Sum chat_daily_stats over the last N days (inclusive of today)."""
         start = (date.today() - timedelta(days=max(days - 1, 0))).isoformat()
         keys = (
@@ -882,7 +1038,7 @@ class Database:
         )
         sums: Dict[str, int] = {k: 0 for k in keys}
         try:
-            for d in self._mongo["chat_daily_stats"].find(
+            async for d in await self._mongo["chat_daily_stats"].find(
                 {"chat_id": chat_id, "date": {"$gte": start}},
                 {"_id": 0},
             ):
@@ -893,38 +1049,39 @@ class Database:
             logger.error(f"get_daily_stats: {e}")
             return sums
 
-    def get_active_member_count(self, chat_id: int, days: int = 1) -> int:
+    async def get_active_member_count(self, chat_id: int, days: int = 1) -> int:
         start = (date.today() - timedelta(days=max(days - 1, 0))).isoformat()
         try:
-            ids = self._mongo["daily_messages"].distinct(
+            ids = await self._mongo["daily_messages"].distinct(
                 "user_id", {"chat_id": chat_id, "date": {"$gte": start}}
             )
             return len(ids)
         except Exception:
             return 0
 
-    def sum_daily_messages(self, chat_id: int, start: str,
+    async def sum_daily_messages(self, chat_id: int, start: str,
                            end: Optional[str] = None) -> int:
         """Sum daily_messages.messages: ``start <= date < end`` (end optional)."""
         flt: Dict[str, Any] = {"chat_id": chat_id, "date": {"$gte": start}}
         if end is not None:
             flt["date"]["$lt"] = end
         try:
-            return sum(
-                int(d.get("messages") or 0)
-                for d in self._mongo["daily_messages"].find(
+            docs = [
+                d
+                async for d in await self._mongo["daily_messages"].find(
                     flt, {"messages": 1, "_id": 0}
                 )
-            )
+            ]
+            return sum(int(d.get("messages") or 0) for d in docs)
         except Exception as e:
             logger.error(f"sum_daily_messages: {e}")
             return 0
 
-    def get_peak_hours(self, chat_id: int, days: int = 7, limit: int = 5) -> List[Dict[str, Any]]:
+    async def get_peak_hours(self, chat_id: int, days: int = 7, limit: int = 5) -> List[Dict[str, Any]]:
         start = (date.today() - timedelta(days=max(days - 1, 0))).isoformat()
         try:
             totals: Dict[int, int] = {}
-            for d in self._mongo["chat_hourly_stats"].find(
+            async for d in await self._mongo["chat_hourly_stats"].find(
                 {"chat_id": chat_id, "date": {"$gte": start}},
                 {"hour": 1, "messages": 1, "_id": 0},
             ):
@@ -936,9 +1093,9 @@ class Database:
             return []
 
     # ── Reputation ───────────────────────────────────────
-    def _ensure_reputation(self, user_id: int) -> Dict[str, Any]:
+    async def _ensure_reputation(self, user_id: int) -> Dict[str, Any]:
         now = self._now()
-        self._mongo["user_reputation"].update_one(
+        await self._mongo["user_reputation"].update_one(
             {"user_id": user_id},
             {
                 "$setOnInsert": {
@@ -951,7 +1108,7 @@ class Database:
             },
             upsert=True,
         )
-        doc = self._find_one("user_reputation", {"user_id": user_id})
+        doc = await self._find_one("user_reputation", {"user_id": user_id})
         if doc:
             return doc
         return {
@@ -963,10 +1120,10 @@ class Database:
             "updated_at": now,
         }
 
-    def record_reputation_event(self, user_id: int, kind: str, delta: int = 1) -> None:
+    async def record_reputation_event(self, user_id: int, kind: str, delta: int = 1) -> None:
         """kind: positive | warning | restriction"""
         try:
-            self._ensure_reputation(user_id)
+            await self._ensure_reputation(user_id)
             col = {
                 "positive": "positive_actions",
                 "warning": "warnings_total",
@@ -974,21 +1131,21 @@ class Database:
             }.get(kind)
             if not col:
                 return
-            cur = self._find_one("user_reputation", {"user_id": user_id}) or {}
+            cur = await self._find_one("user_reputation", {"user_id": user_id}) or {}
             new = max(0, int(cur.get(col) or 0) + int(delta))
-            self._mongo["user_reputation"].update_one(
+            await self._mongo["user_reputation"].update_one(
                 {"user_id": user_id},
                 {"$set": {col: new, "updated_at": self._now()}},
             )
         except Exception as e:
             logger.error(f"record_reputation_event: {e}")
 
-    def get_reputation(self, user_id: int) -> Dict[str, Any]:
+    async def get_reputation(self, user_id: int) -> Dict[str, Any]:
         """Computed reputation score + component counters."""
-        self._ensure_reputation(user_id)
+        await self._ensure_reputation(user_id)
         try:
-            row = self._find_one("user_reputation", {"user_id": user_id}) or {}
-            messages = self.get_user_messages(user_id)
+            row = await self._find_one("user_reputation", {"user_id": user_id}) or {}
+            messages = await self.get_user_messages(user_id)
             pos = int(row.get("positive_actions") or 0)
             warns = int(row.get("warnings_total") or 0)
             restr = int(row.get("restrictions_total") or 0)
@@ -1011,10 +1168,10 @@ class Database:
                 "first_seen": None,
             }
 
-    def get_active_days(self, user_id: int) -> int:
+    async def get_active_days(self, user_id: int) -> int:
         """Days since first_seen (users collection)."""
         try:
-            doc = self._find_one("users", {"user_id": user_id},
+            doc = await self._find_one("users", {"user_id": user_id},
                                  projection={"first_seen": 1, "_id": 0})
             if not doc or not doc.get("first_seen"):
                 return 0
@@ -1024,10 +1181,10 @@ class Database:
             return 0
 
     # ── Shield / anti-raid ───────────────────────────────
-    def get_shield_settings(self, chat_id: int) -> Dict[str, Any]:
+    async def get_shield_settings(self, chat_id: int) -> Dict[str, Any]:
         try:
-            def _load() -> Dict[str, Any]:
-                doc = self._find_one("shield_settings", {"chat_id": chat_id})
+            async def _load() -> Dict[str, Any]:
+                doc = await self._find_one("shield_settings", {"chat_id": chat_id})
                 if doc:
                     return doc
                 return {
@@ -1042,20 +1199,20 @@ class Database:
                     "updated_at": None,
                 }
 
-            return self._cached_read(
+            return await self._cached_read(
                 "get_shield_settings", (chat_id,), _load
             )
         except Exception as e:
             logger.error(f"get_shield_settings: {e}")
             return {}
 
-    def set_shield_settings(self, chat_id: int, **fields: Any) -> Dict[str, Any]:
-        current = self.get_shield_settings(chat_id)
+    async def set_shield_settings(self, chat_id: int, **fields: Any) -> Dict[str, Any]:
+        current = await self.get_shield_settings(chat_id)
         current.update(fields)
         current["chat_id"] = chat_id
         current["updated_at"] = self._now()
         try:
-            self._mongo["shield_settings"].replace_one(
+            await self._mongo["shield_settings"].replace_one(
                 {"chat_id": chat_id},
                 {
                     "chat_id": chat_id,
@@ -1075,12 +1232,12 @@ class Database:
             logger.error(f"set_shield_settings: {e}")
             return current
 
-    def log_raid_event(self, chat_id: int, kind: str, detail: str, count: int = 1) -> None:
+    async def log_raid_event(self, chat_id: int, kind: str, detail: str, count: int = 1) -> None:
         try:
             coll = self._mongo["raid_events"]
-            coll.insert_one(
+            await coll.insert_one(
                 {
-                    "id": self._next_id("raid_events"),
+                    "id": await self._next_id("raid_events"),
                     "chat_id": chat_id,
                     "kind": kind,
                     "detail": detail,
@@ -1089,17 +1246,21 @@ class Database:
                 }
             )
             # Keep log bounded (same global id LIMIT 500 as before).
-            ids = sorted(
-                d["id"] for d in coll.find({}, {"id": 1, "_id": 0}) if "id" in d
+            # One indexed point-read for the newest id instead of
+            # loading + sorting every row in the collection on each
+            # insert (the old code re-read all 500 rows per raid event
+            # just to decide whether to trim).
+            head = await coll.find_one(
+                {}, sort=[("id", -1)], projection={"id": 1, "_id": 0}
             )
-            if len(ids) > 500:
-                coll.delete_many({"id": {"$in": ids[: len(ids) - 500]}})
+            if head and int(head.get("id") or 0) > 500:
+                await coll.delete_many({"id": {"$lte": int(head["id"]) - 500}})
         except Exception as e:
             logger.error(f"log_raid_event: {e}")
 
-    def get_raid_events(self, chat_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+    async def get_raid_events(self, chat_id: int, limit: int = 10) -> List[Dict[str, Any]]:
         try:
-            return self._find("raid_events", {"chat_id": chat_id},
+            return await self._find("raid_events", {"chat_id": chat_id},
                               sort=[("id", -1)], limit=limit)
         except Exception:
             return []
@@ -1119,7 +1280,7 @@ class Database:
         with self._lock:
             bucket[key] = time.monotonic() + _SKIP_TTL
 
-    def _upsert_user_row(self, user_id: int, username: Optional[str],
+    async def _upsert_user_row(self, user_id: int, username: Optional[str],
                          first_name: Optional[str], last_name: Optional[str],
                          is_bot: bool, now: str) -> bool:
         """One update+maybe-insert pass. Returns True when a row was created."""
@@ -1130,11 +1291,11 @@ class Database:
             sets["first_name"] = first_name
         if last_name is not None:
             sets["last_name"] = last_name
-        res = self._mongo["users"].update_one(
+        res = await self._mongo["users"].update_one(
             {"user_id": user_id}, {"$set": sets}
         )
         if res.matched_count == 0:
-            self._mongo["users"].insert_one(
+            await self._mongo["users"].insert_one(
                 {
                     "user_id": user_id,
                     "username": username,
@@ -1152,7 +1313,7 @@ class Database:
             return True
         return False
 
-    def add_user(self, user_id: int, username: str = None, first_name: str = None,
+    async def add_user(self, user_id: int, username: str = None, first_name: str = None,
                  last_name: str = None, is_bot: bool = False) -> bool:
         """Add or update a user in the database.
 
@@ -1164,7 +1325,7 @@ class Database:
         if self._skip_hit(self._skip_reg, key):
             return True
         try:
-            self._upsert_user_row(
+            await self._upsert_user_row(
                 user_id, username, first_name, last_name, is_bot, self._now()
             )
             self._skip_mark(self._skip_reg, key)
@@ -1173,7 +1334,7 @@ class Database:
             logger.error(f"Error adding user {user_id}: {e}")
             return False
 
-    def register_user(self, user_id: int, username: str = None,
+    async def register_user(self, user_id: int, username: str = None,
                       first_name: str = None, last_name: str = None,
                       is_bot: bool = False) -> bool:
         """Add-or-update a user in ONE round trip (chatstats first contact).
@@ -1186,7 +1347,7 @@ class Database:
         if self._skip_hit(self._skip_reg, key):
             return False  # registered moments ago — row exists, not new
         try:
-            created = self._upsert_user_row(
+            created = await self._upsert_user_row(
                 user_id, username, first_name, last_name, is_bot, self._now()
             )
             self._skip_mark(self._skip_reg, key)
@@ -1195,23 +1356,23 @@ class Database:
             logger.error(f"Error registering user {user_id}: {e}")
             return False
 
-    def get_user(self, user_id: int) -> Optional[Dict[str, Any]]:
+    async def get_user(self, user_id: int) -> Optional[Dict[str, Any]]:
         """Get user data by ID."""
         try:
-            return self._find_one("users", {"user_id": user_id})
+            return await self._find_one("users", {"user_id": user_id})
         except Exception as e:
             logger.error(f"Error getting user {user_id}: {e}")
             return None
 
-    def get_user_by_username(self, username: str) -> Optional[Dict[str, Any]]:
+    async def get_user_by_username(self, username: str) -> Optional[Dict[str, Any]]:
         """Get user data by username."""
         try:
-            return self._find_one("users", {"username": username})
+            return await self._find_one("users", {"username": username})
         except Exception as e:
             logger.error(f"Error getting user by username {username}: {e}")
             return None
 
-    def update_user_activity(self, user_id: int, action: str, chat_id: int = None,
+    async def update_user_activity(self, user_id: int, action: str, chat_id: int = None,
                              chat_title: str = None, details: str = None,
                              dedupe: bool = False):
         """Log user activity.
@@ -1228,12 +1389,12 @@ class Database:
         try:
             now = self._now()
             # Update last_seen (no upsert — mirrors SQL UPDATE).
-            self._mongo["users"].update_one(
+            await self._mongo["users"].update_one(
                 {"user_id": user_id}, {"$set": {"last_seen": now}}
             )
-            self._mongo["user_activity"].insert_one(
+            await self._mongo["user_activity"].insert_one(
                 {
-                    "id": self._next_id("user_activity"),
+                    "id": await self._next_id("user_activity"),
                     "user_id": user_id,
                     "action": action,
                     "chat_id": chat_id,
@@ -1247,16 +1408,16 @@ class Database:
         except Exception as e:
             logger.error(f"Error updating user activity: {e}")
 
-    def add_group(self, chat_id: int, chat_title: str) -> bool:
+    async def add_group(self, chat_id: int, chat_title: str) -> bool:
         """Add or update a group."""
         try:
             now = self._now()
-            res = self._mongo["groups"].update_one(
+            res = await self._mongo["groups"].update_one(
                 {"chat_id": chat_id},
                 {"$set": {"chat_title": chat_title, "last_active": now}},
             )
             if res.matched_count == 0:
-                self._mongo["groups"].insert_one(
+                await self._mongo["groups"].insert_one(
                     {
                         "chat_id": chat_id,
                         "chat_title": chat_title,
@@ -1271,10 +1432,10 @@ class Database:
             logger.error(f"Error adding group {chat_id}: {e}")
             return False
 
-    def add_group_member(self, chat_id: int, user_id: int, role: str = "member"):
+    async def add_group_member(self, chat_id: int, user_id: int, role: str = "member"):
         """Add a user to a group's member list (replace — fresh joined_at)."""
         try:
-            self._mongo["group_members"].replace_one(
+            await self._mongo["group_members"].replace_one(
                 {"chat_id": chat_id, "user_id": user_id},
                 {
                     "chat_id": chat_id,
@@ -1287,7 +1448,7 @@ class Database:
         except Exception as e:
             logger.error(f"Error adding group member: {e}")
 
-    def cache_group_member(self, chat_id: int, user_id: int,
+    async def cache_group_member(self, chat_id: int, user_id: int,
                            role: str = "member") -> bool:
         """Group-members cache touch (chatstats first-contact path).
 
@@ -1300,7 +1461,7 @@ class Database:
         if self._skip_hit(self._skip_member, key):
             return False
         try:
-            res = self._mongo["group_members"].update_one(
+            res = await self._mongo["group_members"].update_one(
                 {"chat_id": chat_id, "user_id": user_id},
                 {"$setOnInsert": {"role": role, "joined_at": self._ts()}},
                 upsert=True,
@@ -1311,13 +1472,13 @@ class Database:
             logger.error(f"Error caching group member: {e}")
             return False
 
-    def log_moderation(self, moderator_id: int, target_id: int, action: str,
+    async def log_moderation(self, moderator_id: int, target_id: int, action: str,
                        reason: str, chat_id: int, chat_title: str, duration: str = None):
         """Log a moderation action."""
         try:
-            self._mongo["moderation_log"].insert_one(
+            await self._mongo["moderation_log"].insert_one(
                 {
-                    "id": self._next_id("moderation_log"),
+                    "id": await self._next_id("moderation_log"),
                     "moderator_id": moderator_id,
                     "target_id": target_id,
                     "action": action,
@@ -1331,61 +1492,62 @@ class Database:
         except Exception as e:
             logger.error(f"Error logging moderation action: {e}")
 
-    def get_user_count(self) -> int:
+    async def get_user_count(self) -> int:
         """Get total number of registered users."""
         try:
-            return self._mongo["users"].count_documents({"is_bot": 0})
+            return await self._mongo["users"].count_documents({"is_bot": 0})
         except Exception as e:
             logger.error(f"Error getting user count: {e}")
             return 0
 
-    def get_group_count(self) -> int:
+    async def get_group_count(self) -> int:
         """Get total number of groups."""
         try:
-            return self._mongo["groups"].count_documents({})
+            return await self._mongo["groups"].count_documents({})
         except Exception as e:
             logger.error(f"Error getting group count: {e}")
             return 0
 
-    def get_all_groups(self) -> List[Dict[str, Any]]:
+    async def get_all_groups(self) -> List[Dict[str, Any]]:
         """All tracked groups — ``chat_id`` + ``chat_title`` (``/mychats``)."""
         try:
-            return list(
-                self._mongo["groups"]
-                .find({}, {"_id": 0, "chat_id": 1, "chat_title": 1})
-                .sort("chat_title", 1)
+            cur = await self._mongo["groups"].find(
+                {}, {"_id": 0, "chat_id": 1, "chat_title": 1}
             )
+            # Sorting happens on the cursor (both backends chain it
+            # synchronously); iteration is the async part.
+            return [d async for d in cur.sort("chat_title", 1)]
         except Exception as e:
             logger.error(f"Error listing groups: {e}")
             return []
 
     # ── /bstats counters ──────────────────────────────────────────
 
-    def count_filters(self) -> int:
+    async def count_filters(self) -> int:
         """Total filter triggers across all chats (``/bstats``)."""
         try:
-            return self._mongo["filters"].count_documents({})
+            return await self._mongo["filters"].count_documents({})
         except Exception as e:
             logger.error(f"Error counting filters: {e}")
             return 0
 
-    def count_gmuted(self) -> int:
+    async def count_gmuted(self) -> int:
         """Globally muted users (``/bstats``) — 0 until gmute ships."""
         try:
-            return self._mongo["gmuted_users"].count_documents({})
+            return await self._mongo["gmuted_users"].count_documents({})
         except Exception as e:
             logger.error(f"Error counting gmuted users: {e}")
             return 0
 
-    def get_lock_stats(self) -> Tuple[int, int]:
+    async def get_lock_stats(self) -> Tuple[int, int]:
         """``(chats_with_locks, total_locks)`` for ``/bstats``.
 
         Reads the ``locks`` collection (``{chat_id, lock_type}``);
         returns ``(0, 0)`` until a locks feature creates it.
         """
         try:
-            total = self._mongo["locks"].count_documents({})
-            chats = len(self._mongo["locks"].distinct("chat_id"))
+            total = await self._mongo["locks"].count_documents({})
+            chats = len(await self._mongo["locks"].distinct("chat_id"))
             return chats, total
         except Exception as e:
             logger.error(f"Error getting lock stats: {e}")
@@ -1393,36 +1555,36 @@ class Database:
 
     # ── /broadcast targets ────────────────────────────────────────
 
-    def get_all_chat_ids(self) -> List[int]:
+    async def get_all_chat_ids(self) -> List[int]:
         """Every tracked chat id — broadcast group targets."""
         try:
-            return list(self._mongo["groups"].distinct("chat_id"))
+            return list(await self._mongo["groups"].distinct("chat_id"))
         except Exception as e:
             logger.error(f"Error listing chat ids: {e}")
             return []
 
-    def get_all_user_ids(self) -> List[int]:
+    async def get_all_user_ids(self) -> List[int]:
         """Every non-bot user id — broadcast user targets."""
         try:
-            return list(self._mongo["users"].distinct("user_id", {"is_bot": 0}))
+            return list(await self._mongo["users"].distinct("user_id", {"is_bot": 0}))
         except Exception as e:
             logger.error(f"Error listing user ids: {e}")
             return []
 
-    def count_user_groups(self, user_id: int) -> int:
+    async def count_user_groups(self, user_id: int) -> int:
         """Number of tracked groups a user is a member of."""
         try:
             return len(
-                self._mongo["group_members"].distinct("chat_id", {"user_id": user_id})
+                await self._mongo["group_members"].distinct("chat_id", {"user_id": user_id})
             )
         except Exception as e:
             logger.error(f"Error counting user groups: {e}")
             return 0
 
-    def get_recent_activity(self, limit: int = 10) -> List[Dict[str, Any]]:
+    async def get_recent_activity(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Get recent user activity (LEFT JOIN users for identity)."""
         try:
-            rows = self._find(
+            rows = await self._find(
                 "user_activity",
                 sort=[("timestamp", -1), ("_id", 1)],
                 limit=limit,
@@ -1432,7 +1594,7 @@ class Database:
             if uids:
                 users = {
                     u["user_id"]: u
-                    for u in self._find(
+                    for u in await self._find(
                         "users",
                         {"user_id": {"$in": uids}},
                         projection={"user_id": 1, "username": 1, "first_name": 1},
@@ -1447,10 +1609,10 @@ class Database:
             logger.error(f"Error getting recent activity: {e}")
             return []
 
-    def get_moderation_log(self, limit: int = 10) -> List[Dict[str, Any]]:
+    async def get_moderation_log(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Get recent moderation actions."""
         try:
-            return self._find(
+            return await self._find(
                 "moderation_log",
                 sort=[("timestamp", -1), ("_id", 1)],
                 limit=limit,
@@ -1460,13 +1622,13 @@ class Database:
             return []
 
     # ── Filters ───────────────────────────────────────────
-    def add_filter(self, chat_id: int, trigger: str, text: str = None,
+    async def add_filter(self, chat_id: int, trigger: str, text: str = None,
                    buttons_json: str = None, media_type: str = None, media_id: str = None) -> bool:
         try:
-            self._mongo["filters"].replace_one(
+            await self._mongo["filters"].replace_one(
                 {"chat_id": chat_id, "trigger_word": trigger.lower()},
                 {
-                    "id": self._next_id("filters"),
+                    "id": await self._next_id("filters"),
                     "chat_id": chat_id,
                     "trigger_word": trigger.lower(),
                     "reply_text": text,
@@ -1481,29 +1643,29 @@ class Database:
             logger.error(f"Error adding filter: {e}")
             return False
 
-    def get_filters(self, chat_id: int) -> List[Dict[str, Any]]:
+    async def get_filters(self, chat_id: int) -> List[Dict[str, Any]]:
         try:
-            return self._cached_read(
-                "get_filters", (chat_id,),
-                lambda: self._find("filters", {"chat_id": chat_id},
-                                   sort=[("id", 1)]),
-            )
+            async def _load():
+                return await self._find("filters", {"chat_id": chat_id},
+                                        sort=[("id", 1)])
+
+            return await self._cached_read("get_filters", (chat_id,), _load)
         except Exception as e:
             logger.error(f"Error getting filters: {e}")
             return []
 
-    def get_filter(self, chat_id: int, trigger: str) -> Optional[Dict[str, Any]]:
+    async def get_filter(self, chat_id: int, trigger: str) -> Optional[Dict[str, Any]]:
         try:
-            return self._find_one(
+            return await self._find_one(
                 "filters", {"chat_id": chat_id, "trigger_word": trigger.lower()}
             )
         except Exception as e:
             logger.error(f"Error getting filter: {e}")
             return None
 
-    def remove_filter(self, chat_id: int, trigger: str) -> bool:
+    async def remove_filter(self, chat_id: int, trigger: str) -> bool:
         try:
-            res = self._mongo["filters"].delete_one(
+            res = await self._mongo["filters"].delete_one(
                 {"chat_id": chat_id, "trigger_word": trigger.lower()}
             )
             return res.deleted_count > 0
@@ -1512,12 +1674,12 @@ class Database:
             return False
 
     # ── Blocklist ─────────────────────────────────────────
-    def add_blocklist_word(self, chat_id: int, word: str, action: str = "delete", reason: str = "Blocked word") -> bool:
+    async def add_blocklist_word(self, chat_id: int, word: str, action: str = "delete", reason: str = "Blocked word") -> bool:
         try:
-            self._mongo["blocklist"].replace_one(
+            await self._mongo["blocklist"].replace_one(
                 {"chat_id": chat_id, "word": word.lower()},
                 {
-                    "id": self._next_id("blocklist"),
+                    "id": await self._next_id("blocklist"),
                     "chat_id": chat_id,
                     "word": word.lower(),
                     "action": action,
@@ -1530,20 +1692,20 @@ class Database:
             logger.error(f"Error adding blocklist word: {e}")
             return False
 
-    def get_blocklist(self, chat_id: int) -> List[Dict[str, Any]]:
+    async def get_blocklist(self, chat_id: int) -> List[Dict[str, Any]]:
         try:
-            return self._cached_read(
-                "get_blocklist", (chat_id,),
-                lambda: self._find("blocklist", {"chat_id": chat_id},
-                                   sort=[("id", 1)]),
-            )
+            async def _load():
+                return await self._find("blocklist", {"chat_id": chat_id},
+                                        sort=[("id", 1)])
+
+            return await self._cached_read("get_blocklist", (chat_id,), _load)
         except Exception as e:
             logger.error(f"Error getting blocklist: {e}")
             return []
 
-    def remove_blocklist_word(self, chat_id: int, word: str) -> bool:
+    async def remove_blocklist_word(self, chat_id: int, word: str) -> bool:
         try:
-            res = self._mongo["blocklist"].delete_one(
+            res = await self._mongo["blocklist"].delete_one(
                 {"chat_id": chat_id, "word": word.lower()}
             )
             return res.deleted_count > 0
@@ -1551,33 +1713,33 @@ class Database:
             logger.error(f"Error removing blocklist word: {e}")
             return False
 
-    def clear_blocklist(self, chat_id: int) -> int:
+    async def clear_blocklist(self, chat_id: int) -> int:
         try:
-            res = self._mongo["blocklist"].delete_many({"chat_id": chat_id})
+            res = await self._mongo["blocklist"].delete_many({"chat_id": chat_id})
             return res.deleted_count
         except Exception as e:
             logger.error(f"Error clearing blocklist: {e}")
             return 0
 
-    def set_blocklist_action(self, chat_id: int, action: str):
+    async def set_blocklist_action(self, chat_id: int, action: str):
         try:
-            self._mongo["blocklist"].update_many(
+            await self._mongo["blocklist"].update_many(
                 {"chat_id": chat_id}, {"$set": {"action": action}}
             )
         except Exception as e:
             logger.error(f"Error setting blocklist action: {e}")
 
-    def set_blocklist_reason(self, chat_id: int, reason: str):
+    async def set_blocklist_reason(self, chat_id: int, reason: str):
         try:
-            self._mongo["blocklist"].update_many(
+            await self._mongo["blocklist"].update_many(
                 {"chat_id": chat_id}, {"$set": {"reason": reason}}
             )
         except Exception as e:
             logger.error(f"Error setting blocklist reason: {e}")
 
-    def exempt_blocklist_user(self, chat_id: int, user_id: int):
+    async def exempt_blocklist_user(self, chat_id: int, user_id: int):
         try:
-            self._mongo["blocklist_exemptions"].update_one(
+            await self._mongo["blocklist_exemptions"].update_one(
                 {"chat_id": chat_id, "user_id": user_id},
                 {"$setOnInsert": {"chat_id": chat_id, "user_id": user_id}},
                 upsert=True,
@@ -1585,21 +1747,24 @@ class Database:
         except Exception as e:
             logger.error(f"Error exempting user: {e}")
 
-    def is_blocklist_exempt(self, chat_id: int, user_id: int) -> bool:
+    async def is_blocklist_exempt(self, chat_id: int, user_id: int) -> bool:
         try:
-            return bool(self._cached_read(
-                "is_blocklist_exempt", (chat_id, user_id),
-                lambda: self._mongo["blocklist_exemptions"].count_documents(
+            async def _load():
+                n = await self._mongo["blocklist_exemptions"].count_documents(
                     {"chat_id": chat_id, "user_id": user_id}, limit=1
-                ) > 0,
+                )
+                return n > 0
+
+            return bool(await self._cached_read(
+                "is_blocklist_exempt", (chat_id, user_id), _load,
             ))
         except Exception:
             return False
 
     # ── Sudo users ────────────────────────────────────────
-    def add_sudo_user(self, user_id: int, added_by: int = None) -> bool:
+    async def add_sudo_user(self, user_id: int, added_by: int = None) -> bool:
         try:
-            self._mongo["sudo_users"].replace_one(
+            await self._mongo["sudo_users"].replace_one(
                 {"user_id": user_id},
                 {"user_id": user_id, "added_by": added_by, "added_at": self._ts()},
                 upsert=True,
@@ -1609,44 +1774,42 @@ class Database:
             logger.error(f"Error adding sudo user: {e}")
             return False
 
-    def remove_sudo_user(self, user_id: int) -> bool:
+    async def remove_sudo_user(self, user_id: int) -> bool:
         try:
-            res = self._mongo["sudo_users"].delete_one({"user_id": user_id})
+            res = await self._mongo["sudo_users"].delete_one({"user_id": user_id})
             return res.deleted_count > 0
         except Exception as e:
             logger.error(f"Error removing sudo user: {e}")
             return False
 
-    def get_sudo_users(self) -> List[int]:
+    async def get_sudo_users(self) -> List[int]:
         try:
-            return self._cached_read(
-                "get_sudo_users", (),
-                lambda: [
-                    d["user_id"]
-                    for d in self._mongo["sudo_users"].find(
-                        {}, {"user_id": 1, "_id": 0}
-                    )
-                ],
-            )
+            async def _load():
+                cur = await self._mongo["sudo_users"].find(
+                    {}, {"user_id": 1, "_id": 0}
+                )
+                return [d["user_id"] async for d in cur]
+
+            return await self._cached_read("get_sudo_users", (), _load)
         except Exception as e:
             logger.error(f"Error getting sudo users: {e}")
             return []
 
-    def is_sudo_user(self, user_id: int) -> bool:
+    async def is_sudo_user(self, user_id: int) -> bool:
         try:
             # Same result as the old count_documents — backed by the cache.
-            return user_id in self.get_sudo_users()
+            return user_id in await self.get_sudo_users()
         except Exception:
             return False
 
     # ── Anti-flood state (bot/modules/antispam.py) ────────
-    def spam_bump_offence(self, user_id: int, offence_day: str) -> int:
+    async def spam_bump_offence(self, user_id: int, offence_day: str) -> int:
         """Count one offence for this IST day; resets on a new day.
 
         Returns the offence number: 1st, 2nd, 3rd… (24h refresh = IST date).
         """
         try:
-            row = self._find_one(
+            row = await self._find_one(
                 "spam_protection",
                 {"user_id": user_id},
                 projection={"offence_day": 1, "offences": 1, "_id": 0},
@@ -1655,7 +1818,7 @@ class Database:
                 offences = 1
             else:
                 offences = int(row.get("offences") or 0) + 1
-            self._mongo["spam_protection"].update_one(
+            await self._mongo["spam_protection"].update_one(
                 {"user_id": user_id},
                 {
                     "$set": {
@@ -1671,14 +1834,14 @@ class Database:
             logger.error(f"Error recording spam offence: {e}")
             return 1
 
-    def spam_set_block(self, user_id: int, blocked_until_iso: str) -> bool:
+    async def spam_set_block(self, user_id: int, blocked_until_iso: str) -> bool:
         """Block the user until the given aware-UTC ISO timestamp."""
         try:
-            res = self._mongo["spam_protection"].update_one(
+            res = await self._mongo["spam_protection"].update_one(
                 {"user_id": user_id}, {"$set": {"blocked_until": blocked_until_iso}}
             )
             if res.matched_count == 0:
-                self._mongo["spam_protection"].update_one(
+                await self._mongo["spam_protection"].update_one(
                     {"user_id": user_id},
                     {
                         "$set": {
@@ -1693,7 +1856,24 @@ class Database:
             logger.error(f"Error setting spam block: {e}")
             return False
 
-    def is_spam_blocked(self, user_id: int) -> bool:
+    @staticmethod
+    def _spam_row_blocks(row: Any) -> bool:
+        """Apply the ``blocked_until`` expiry test to a cached/loaded row.
+
+        Deliberately synchronous: it is pure clock arithmetic on a row
+        that is already in memory, and ``peek_spam_blocked`` must stay
+        callable straight from the message loop with no executor hop.
+
+        Shared by ``is_spam_blocked`` and ``peek_spam_blocked`` so a warm
+        cache and a cold load can never disagree. The comparison always
+        uses a fresh clock — only the row is cached, never the verdict.
+        """
+        if not row or not row.get("blocked_until"):
+            return False
+        until = datetime.fromisoformat(row["blocked_until"])
+        return until > datetime.now(timezone.utc)
+
+    async def is_spam_blocked(self, user_id: int) -> bool:
         """True while the user's block is still active (UTC compare).
 
         The cached row is the raw ``blocked_until`` value — the expiry
@@ -1701,34 +1881,53 @@ class Database:
         ``spam_clear`` invalidate the entry immediately.
         """
         try:
-            row = self._cached_read(
-                "is_spam_blocked", (user_id,),
-                lambda: self._find_one(
+            async def _load():
+                return await self._find_one(
                     "spam_protection",
                     {"user_id": user_id},
                     projection={"blocked_until": 1, "_id": 0},
-                ),
+                )
+
+            row = await self._cached_read(
+                "is_spam_blocked", (user_id,), _load,
             )
-            if row is None or not row.get("blocked_until"):
-                return False
-            until = datetime.fromisoformat(row["blocked_until"])
-            return until > datetime.now(timezone.utc)
+            return self._spam_row_blocks(row)
         except Exception as e:
             logger.error(f"Error checking spam block: {e}")
             return False
 
-    def spam_clear(self, user_id: int) -> bool:
+    def peek_spam_blocked(self, user_id: int) -> Tuple[bool, bool]:
+        """``(cache_hit, blocked)`` answered from memory — performs no I/O.
+
+        Lets per-message handlers skip the ``asyncio.to_thread`` hop when
+        the row is already cached (it is, after the first message in each
+        window); the caller falls back to ``is_spam_blocked`` on a miss.
+        Never returns a stale verdict: the expiry test runs against the
+        current clock, exactly as ``is_spam_blocked`` does.
+
+        Stays synchronous on purpose — this is the fast path every group
+        message takes, and it only ever reads a dict under the lock.
+        """
+        found, row = self.peek_cached("is_spam_blocked", (user_id,))
+        if not found:
+            return False, False
+        try:
+            return True, self._spam_row_blocks(row)
+        except Exception:
+            return True, False
+
+    async def spam_clear(self, user_id: int) -> bool:
         """Wipe warnings + block (/free). Returns True if anything existed."""
         try:
-            res = self._mongo["spam_protection"].delete_one({"user_id": user_id})
+            res = await self._mongo["spam_protection"].delete_one({"user_id": user_id})
             return res.deleted_count > 0
         except Exception as e:
             logger.error(f"Error clearing spam state: {e}")
             return False
 
-    def spam_get(self, user_id: int) -> Optional[Dict[str, Any]]:
+    async def spam_get(self, user_id: int) -> Optional[Dict[str, Any]]:
         try:
-            doc = self._find_one(
+            doc = await self._find_one(
                 "spam_protection",
                 {"user_id": user_id},
                 projection={
@@ -1750,9 +1949,9 @@ class Database:
             return None
 
     # ── Gbanned users ─────────────────────────────────────
-    def add_gban(self, user_id: int, reason: str = "No reason provided", banned_by: int = None) -> bool:
+    async def add_gban(self, user_id: int, reason: str = "No reason provided", banned_by: int = None) -> bool:
         try:
-            self._mongo["gbanned_users"].replace_one(
+            await self._mongo["gbanned_users"].replace_one(
                 {"user_id": user_id},
                 {
                     "user_id": user_id,
@@ -1767,25 +1966,25 @@ class Database:
             logger.error(f"Error adding gban: {e}")
             return False
 
-    def remove_gban(self, user_id: int) -> bool:
+    async def remove_gban(self, user_id: int) -> bool:
         try:
-            res = self._mongo["gbanned_users"].delete_one({"user_id": user_id})
+            res = await self._mongo["gbanned_users"].delete_one({"user_id": user_id})
             return res.deleted_count > 0
         except Exception as e:
             logger.error(f"Error removing gban: {e}")
             return False
 
-    def get_gbanned_users(self) -> List[Dict[str, Any]]:
+    async def get_gbanned_users(self) -> List[Dict[str, Any]]:
         try:
-            return self._find("gbanned_users", sort=[("banned_at", 1)])
+            return await self._find("gbanned_users", sort=[("banned_at", 1)])
         except Exception as e:
             logger.error(f"Error getting gbanned users: {e}")
             return []
 
-    def is_gbanned(self, user_id: int) -> bool:
+    async def is_gbanned(self, user_id: int) -> bool:
         try:
             return (
-                self._mongo["gbanned_users"].count_documents(
+                await self._mongo["gbanned_users"].count_documents(
                     {"user_id": user_id}, limit=1
                 )
                 > 0
@@ -1794,12 +1993,12 @@ class Database:
             return False
 
     # ── Watch words ───────────────────────────────────────
-    def add_watch_word(self, chat_id: int, admin_id: int, word: str, mode: str = "copy") -> bool:
+    async def add_watch_word(self, chat_id: int, admin_id: int, word: str, mode: str = "copy") -> bool:
         try:
-            self._mongo["watch_words"].replace_one(
+            await self._mongo["watch_words"].replace_one(
                 {"chat_id": chat_id, "admin_id": admin_id, "word": word.lower()},
                 {
-                    "id": self._next_id("watch_words"),
+                    "id": await self._next_id("watch_words"),
                     "chat_id": chat_id,
                     "admin_id": admin_id,
                     "word": word.lower(),
@@ -1812,9 +2011,9 @@ class Database:
             logger.error(f"Error adding watch word: {e}")
             return False
 
-    def remove_watch_word(self, chat_id: int, admin_id: int, word: str) -> bool:
+    async def remove_watch_word(self, chat_id: int, admin_id: int, word: str) -> bool:
         try:
-            res = self._mongo["watch_words"].delete_one(
+            res = await self._mongo["watch_words"].delete_one(
                 {"chat_id": chat_id, "admin_id": admin_id, "word": word.lower()}
             )
             return res.deleted_count > 0
@@ -1822,28 +2021,28 @@ class Database:
             logger.error(f"Error removing watch word: {e}")
             return False
 
-    def get_watch_words(self, chat_id: int, admin_id: int) -> List[str]:
+    async def get_watch_words(self, chat_id: int, admin_id: int) -> List[str]:
         try:
-            return self._cached_read(
-                "get_watch_words", (chat_id, admin_id),
-                lambda: [
-                    d["word"]
-                    for d in self._mongo["watch_words"].find(
-                        {"chat_id": chat_id, "admin_id": admin_id},
-                        {"word": 1, "_id": 0},
-                    )
-                ],
+            async def _load():
+                cur = await self._mongo["watch_words"].find(
+                    {"chat_id": chat_id, "admin_id": admin_id},
+                    {"word": 1, "_id": 0},
+                )
+                return [d["word"] async for d in cur]
+
+            return await self._cached_read(
+                "get_watch_words", (chat_id, admin_id), _load
             )
         except Exception as e:
             logger.error(f"Error getting watch words: {e}")
             return []
 
-    def get_all_watch_words(self, chat_id: int) -> Dict[int, List[str]]:
+    async def get_all_watch_words(self, chat_id: int) -> Dict[int, List[str]]:
         """Get all watch words for a chat, grouped by admin_id."""
         try:
-            def _load() -> Dict[int, List[str]]:
+            async def _load() -> Dict[int, List[str]]:
                 result: Dict[int, List[str]] = {}
-                for d in self._mongo["watch_words"].find(
+                async for d in await self._mongo["watch_words"].find(
                     {"chat_id": chat_id},
                     {"admin_id": 1, "word": 1, "id": 1, "_id": 0},
                 ):
@@ -1852,17 +2051,17 @@ class Database:
                     words.sort()
                 return result
 
-            return self._cached_read(
+            return await self._cached_read(
                 "get_all_watch_words", (chat_id,), _load
             )
         except Exception as e:
             logger.error(f"Error getting all watch words: {e}")
             return {}
 
-    def get_watch_mode(self, chat_id: int, admin_id: int) -> str:
+    async def get_watch_mode(self, chat_id: int, admin_id: int) -> str:
         try:
-            def _load() -> str:
-                doc = self._find_one(
+            async def _load() -> str:
+                doc = await self._find_one(
                     "watch_words",
                     {"chat_id": chat_id, "admin_id": admin_id},
                     projection={"mode": 1, "_id": 0},
@@ -1870,15 +2069,15 @@ class Database:
                 )
                 return doc["mode"] if doc else "copy"
 
-            return self._cached_read(
+            return await self._cached_read(
                 "get_watch_mode", (chat_id, admin_id), _load
             )
         except Exception:
             return "copy"
 
-    def set_watch_mode(self, chat_id: int, admin_id: int, mode: str):
+    async def set_watch_mode(self, chat_id: int, admin_id: int, mode: str):
         try:
-            self._mongo["watch_words"].update_many(
+            await self._mongo["watch_words"].update_many(
                 {"chat_id": chat_id, "admin_id": admin_id},
                 {"$set": {"mode": mode}},
             )
@@ -1886,10 +2085,10 @@ class Database:
             logger.error(f"Error setting watch mode: {e}")
 
     # ── Welcome/Goodbye ──────────────────────────────────
-    def get_welcome_settings(self, chat_id: int) -> Dict[str, Any]:
+    async def get_welcome_settings(self, chat_id: int) -> Dict[str, Any]:
         try:
-            def _load() -> Dict[str, Any]:
-                doc = self._find_one("welcome_settings", {"chat_id": chat_id})
+            async def _load() -> Dict[str, Any]:
+                doc = await self._find_one("welcome_settings", {"chat_id": chat_id})
                 if doc:
                     return doc
                 return {"chat_id": chat_id, "welcome_enabled": 1,
@@ -1898,17 +2097,17 @@ class Database:
                         "last_welcome_msg_id": None,
                         "last_goodbye_msg_id": None}
 
-            return self._cached_read(
+            return await self._cached_read(
                 "get_welcome_settings", (chat_id,), _load
             )
         except Exception as e:
             logger.error(f"Error getting welcome settings: {e}")
             return {}
 
-    def _replace_welcome_settings(self, chat_id: int, enabled_col: str,
+    async def _replace_welcome_settings(self, chat_id: int, enabled_col: str,
                                   enabled: int, keep_last: bool = True) -> None:
         """Full-row replace — replicates INSERT OR REPLACE semantics."""
-        settings = self.get_welcome_settings(chat_id)
+        settings = await self.get_welcome_settings(chat_id)
         doc: Dict[str, Any] = {
             "chat_id": chat_id,
             "welcome_enabled": int(settings.get("welcome_enabled", 1)),
@@ -1922,47 +2121,47 @@ class Database:
             # Preserve tracked msg ids (update_last_* callers set both).
             doc["last_welcome_msg_id"] = settings.get("last_welcome_msg_id")
             doc["last_goodbye_msg_id"] = settings.get("last_goodbye_msg_id")
-        self._mongo["welcome_settings"].replace_one(
+        await self._mongo["welcome_settings"].replace_one(
             {"chat_id": chat_id}, doc, upsert=True
         )
 
-    def set_welcome_enabled(self, chat_id: int, enabled: bool):
+    async def set_welcome_enabled(self, chat_id: int, enabled: bool):
         try:
             # Original INSERT OR REPLACE omitted the last_* columns → NULL reset.
-            self._replace_welcome_settings(
+            await self._replace_welcome_settings(
                 chat_id, "welcome_enabled", 1 if enabled else 0, keep_last=False
             )
         except Exception as e:
             logger.error(f"Error setting welcome enabled: {e}")
 
-    def set_goodbye_enabled(self, chat_id: int, enabled: bool):
+    async def set_goodbye_enabled(self, chat_id: int, enabled: bool):
         try:
-            self._replace_welcome_settings(
+            await self._replace_welcome_settings(
                 chat_id, "goodbye_enabled", 1 if enabled else 0, keep_last=False
             )
         except Exception as e:
             logger.error(f"Error setting goodbye enabled: {e}")
 
-    def set_clean_welcome(self, chat_id: int, enabled: bool):
+    async def set_clean_welcome(self, chat_id: int, enabled: bool):
         try:
-            self._replace_welcome_settings(
+            await self._replace_welcome_settings(
                 chat_id, "clean_welcome", 1 if enabled else 0, keep_last=False
             )
         except Exception as e:
             logger.error(f"Error setting clean welcome: {e}")
 
-    def set_clean_goodbye(self, chat_id: int, enabled: bool):
+    async def set_clean_goodbye(self, chat_id: int, enabled: bool):
         try:
-            self._replace_welcome_settings(
+            await self._replace_welcome_settings(
                 chat_id, "clean_goodbye", 1 if enabled else 0, keep_last=False
             )
         except Exception as e:
             logger.error(f"Error setting clean goodbye: {e}")
 
-    def update_last_welcome_msg(self, chat_id: int, msg_id: int):
+    async def update_last_welcome_msg(self, chat_id: int, msg_id: int):
         try:
-            settings = self.get_welcome_settings(chat_id)
-            self._mongo["welcome_settings"].replace_one(
+            settings = await self.get_welcome_settings(chat_id)
+            await self._mongo["welcome_settings"].replace_one(
                 {"chat_id": chat_id},
                 {
                     "chat_id": chat_id,
@@ -1979,10 +2178,10 @@ class Database:
         except Exception as e:
             logger.error(f"Error updating last welcome msg: {e}")
 
-    def update_last_goodbye_msg(self, chat_id: int, msg_id: int):
+    async def update_last_goodbye_msg(self, chat_id: int, msg_id: int):
         try:
-            settings = self.get_welcome_settings(chat_id)
-            self._mongo["welcome_settings"].replace_one(
+            settings = await self.get_welcome_settings(chat_id)
+            await self._mongo["welcome_settings"].replace_one(
                 {"chat_id": chat_id},
                 {
                     "chat_id": chat_id,
@@ -1999,10 +2198,10 @@ class Database:
         except Exception as e:
             logger.error(f"Error updating last goodbye msg: {e}")
 
-    def get_welcome_message(self, chat_id: int) -> Dict[str, Any]:
+    async def get_welcome_message(self, chat_id: int) -> Dict[str, Any]:
         try:
-            def _load() -> Dict[str, Any]:
-                doc = self._find_one("welcome_messages", {"chat_id": chat_id})
+            async def _load() -> Dict[str, Any]:
+                doc = await self._find_one("welcome_messages", {"chat_id": chat_id})
                 if doc:
                     return doc
                 return {"chat_id": chat_id,
@@ -2013,17 +2212,17 @@ class Database:
                         "goodbye_buttons": None, "goodbye_media": None,
                         "goodbye_media_type": None}
 
-            return self._cached_read(
+            return await self._cached_read(
                 "get_welcome_message", (chat_id,), _load
             )
         except Exception as e:
             logger.error(f"Error getting welcome message: {e}")
             return {}
 
-    def set_welcome_text(self, chat_id: int, text: str):
+    async def set_welcome_text(self, chat_id: int, text: str):
         try:
-            msg = self.get_welcome_message(chat_id)
-            self._mongo["welcome_messages"].replace_one(
+            msg = await self.get_welcome_message(chat_id)
+            await self._mongo["welcome_messages"].replace_one(
                 {"chat_id": chat_id},
                 {
                     "chat_id": chat_id,
@@ -2041,10 +2240,10 @@ class Database:
         except Exception as e:
             logger.error(f"Error setting welcome text: {e}")
 
-    def set_goodbye_text(self, chat_id: int, text: str):
+    async def set_goodbye_text(self, chat_id: int, text: str):
         try:
-            msg = self.get_welcome_message(chat_id)
-            self._mongo["welcome_messages"].replace_one(
+            msg = await self.get_welcome_message(chat_id)
+            await self._mongo["welcome_messages"].replace_one(
                 {"chat_id": chat_id},
                 {
                     "chat_id": chat_id,
@@ -2062,17 +2261,17 @@ class Database:
         except Exception as e:
             logger.error(f"Error setting goodbye text: {e}")
 
-    def reset_welcome(self, chat_id: int):
-        self.set_welcome_text(chat_id, "Hey {first}, welcome to {chatname}! 👋")
+    async def reset_welcome(self, chat_id: int):
+        await self.set_welcome_text(chat_id, "Hey {first}, welcome to {chatname}! 👋")
 
-    def reset_goodbye(self, chat_id: int):
-        self.set_goodbye_text(chat_id, "Sad to see you leaving {first}. Take Care! 👋")
+    async def reset_goodbye(self, chat_id: int):
+        await self.set_goodbye_text(chat_id, "Sad to see you leaving {first}. Take Care! 👋")
 
     # ── Join requests ────────────────────────────────────
-    def set_join_requests(self, chat_id: int, enabled: bool):
+    async def set_join_requests(self, chat_id: int, enabled: bool):
         """Enable/disable the join-request approval card for a chat."""
         try:
-            self._mongo["join_request_settings"].replace_one(
+            await self._mongo["join_request_settings"].replace_one(
                 {"chat_id": chat_id},
                 {
                     "chat_id": chat_id,
@@ -2084,10 +2283,10 @@ class Database:
         except Exception as e:
             logger.error(f"Error setting join requests: {e}")
 
-    def get_join_requests(self, chat_id: int) -> bool:
+    async def get_join_requests(self, chat_id: int) -> bool:
         """Whether join-request approval is enabled for a chat."""
         try:
-            doc = self._find_one(
+            doc = await self._find_one(
                 "join_request_settings",
                 {"chat_id": chat_id},
                 projection={"enabled": 1, "_id": 0},
@@ -2098,9 +2297,9 @@ class Database:
             return False
 
     # ── Leveling system ──────────────────────────────────
-    def get_user_level(self, user_id: int) -> Dict[str, Any]:
+    async def get_user_level(self, user_id: int) -> Dict[str, Any]:
         try:
-            doc = self._find_one("user_level", {"user_id": user_id})
+            doc = await self._find_one("user_level", {"user_id": user_id})
             if doc:
                 return doc
             return {"user_id": user_id, "global_level": 1, "global_xp": 0, "global_messages": 0,
@@ -2110,28 +2309,41 @@ class Database:
             logger.error(f"Error getting user level: {e}")
             return {}
 
-    def update_user_level(self, user_id: int, **kwargs):
+    async def update_user_level(self, user_id: int, **kwargs):
+        """Apply only the caller's fields, in one round trip.
+
+        The old shape was read-modify-replace: ``get_user_level`` read
+        the row, all 8 fields were rebuilt from that snapshot, then
+        ``replace_one`` wrote the lot back. That cost 2 round trips per
+        award AND silently reverted any field a concurrent writer had
+        changed between the read and the write.
+
+        ``$set`` touches exactly what was passed; ``$setOnInsert``
+        materialises the same defaults the old code derived from the
+        (empty) snapshot, so a brand-new row is byte-for-byte what it
+        was before.
+        """
+        defaults = {
+            "global_level": 1, "global_xp": 0, "global_messages": 0,
+            "template": 1, "streak_current": 0, "streak_best": 0,
+            "last_message_date": None, "last_streak_date": None,
+        }
         try:
-            existing = self.get_user_level(user_id)
-            self._mongo["user_level"].replace_one(
-                {"user_id": user_id},
-                {
-                    "user_id": user_id,
-                    "global_level": kwargs.get("global_level", existing.get("global_level", 1)),
-                    "global_xp": kwargs.get("global_xp", existing.get("global_xp", 0)),
-                    "global_messages": kwargs.get("global_messages", existing.get("global_messages", 0)),
-                    "template": kwargs.get("template", existing.get("template", 1)),
-                    "streak_current": kwargs.get("streak_current", existing.get("streak_current", 0)),
-                    "streak_best": kwargs.get("streak_best", existing.get("streak_best", 0)),
-                    "last_message_date": kwargs.get("last_message_date", existing.get("last_message_date")),
-                    "last_streak_date": kwargs.get("last_streak_date", existing.get("last_streak_date")),
-                },
-                upsert=True,
+            provided = dict(kwargs)
+            set_on_insert = {k: v for k, v in defaults.items()
+                             if k not in provided}
+            update: Dict[str, Any] = {
+                "$set": {**provided, "user_id": user_id},
+            }
+            if set_on_insert:
+                update["$setOnInsert"] = set_on_insert
+            await self._mongo["user_level"].update_one(
+                {"user_id": user_id}, update, upsert=True,
             )
         except Exception as e:
             logger.error(f"Error updating user level: {e}")
 
-    def add_message_xp(self, user_id: int, chat_id: int) -> Tuple[int, int, bool]:
+    async def add_message_xp(self, user_id: int, chat_id: int) -> Tuple[int, int, bool]:
         """Award XP + advance the daily streak for one message.
 
         ``chat_id`` stays in the signature for callers but is unused:
@@ -2144,7 +2356,7 @@ class Database:
         """
         today = ist_date()
 
-        user = self.get_user_level(user_id)
+        user = await self.get_user_level(user_id)
         global_xp = user.get("global_xp", 0)
 
         # Add XP per message (10-20 XP)
@@ -2170,7 +2382,7 @@ class Database:
         # global_level / global_messages are intentionally NOT written:
         # they are legacy columns (frozen values) — every reader uses
         # get_user_messages()/get_user_rank_info() over daily_messages.
-        self.update_user_level(user_id,
+        await self.update_user_level(user_id,
             global_xp=global_xp,
             streak_current=streak_current,
             streak_best=streak_best,
@@ -2186,17 +2398,17 @@ class Database:
     # frozen history, never read for ranks anymore.
 
     @staticmethod
-    def chat_rank_for(messages: int) -> int:
+    async def chat_rank_for(messages: int) -> int:
         """Chat rank ladder: 100 messages → +1 rank (1 at 0 msgs)."""
         return int(messages) // CHAT_RANK_MESSAGES + 1
 
     @staticmethod
-    def global_rank_for(messages: int) -> int:
+    async def global_rank_for(messages: int) -> int:
         """Global rank ladder: 250 messages → +1 rank (1 at 0 msgs)."""
         return int(messages) // GLOBAL_RANK_MESSAGES + 1
 
     @staticmethod
-    def _position_in(totals: List[Tuple[int, int]], user_id: int,
+    async def _position_in(totals: List[Tuple[int, int]], user_id: int,
                      mine: int) -> int:
         """1-based position: higher totals first, ties → lower user_id."""
         pos = 1
@@ -2207,43 +2419,87 @@ class Database:
                 pos += 1
         return pos
 
-    def _totals_by_user(self, extra: Optional[Dict[str, Any]] = None) -> List[Tuple[int, int]]:
+    async def _sum_msgs(self, match: Dict[str, Any]) -> int:
+        """One server-side ``$sum`` over ``daily_messages`` for ``match``.
+
+        Replaces ``sum(d["messages"] for d in find(...))``, which pulled
+        every matching message-day document across the wire just to add
+        them up here. Returns one number in one round trip; the
+        ``(user_id, date)`` / ``(chat_id, user_id, date)`` indexes back
+        the ``$match``.
+        """
+        rows = [d async for d in await self._mongo["daily_messages"].aggregate([
+            {"$match": match},
+            {"$group": {"_id": None, "total": {"$sum": "$messages"}}},
+        ])]
+        return int(rows[0].get("total") or 0) if rows else 0
+
+    async def _distinct_users(self, match: Dict[str, Any]) -> int:
+        """Distinct ``user_id`` count for ``match`` — one row back."""
+        rows = [d async for d in await self._mongo["daily_messages"].aggregate([
+            {"$match": match},
+            {"$group": {"_id": "$user_id"}},
+            {"$count": "n"},
+        ])]
+        return int(rows[0]["n"]) if rows else 0
+
+    async def _rank_position(self, match: Dict[str, Any], user_id: int,
+                       mine: int, by: str = "user_id") -> int:
+        """1-based position for ``mine`` — server-side count-of-above.
+
+        Same ordering as ``_position_in`` (higher total first, ties by
+        key ascending), but returns a single count instead of pulling
+        every user's total to the client and scanning it in Python.
+        This is what ``get_user_rank_info`` did twice per call.
+        """
+        rows = [d async for d in await self._mongo["daily_messages"].aggregate([
+            {"$match": match},
+            {"$group": {"_id": f"${by}", "total": {"$sum": "$messages"}}},
+            {"$match": {"$or": [
+                {"total": {"$gt": mine}},
+                {"total": mine, "_id": {"$lt": user_id}},
+            ]}},
+            {"$count": "above"},
+        ])]
+        return (int(rows[0]["above"]) + 1) if rows else 1
+
+    async def _totals_by_user(self, extra: Optional[Dict[str, Any]] = None) -> List[Tuple[int, int]]:
         """Every user's total (global, or one chat when ``extra`` says so).
 
         Server-side ``$group`` on daily_messages — 1 round trip instead
         of streaming every row into Python (the /rank position calc
         calls this twice per card; all-time global = every row ever).
         """
-        return self._totals_rows(dict(extra or {}))
+        return await self._totals_rows(dict(extra or {}))
 
-    def _totals_rows(self, match: Dict[str, Any],
+    async def _totals_rows(self, match: Dict[str, Any],
                      by: str = "user_id") -> List[Tuple[int, int]]:
         """Server-side ``$group`` on daily_messages — 1 round trip.
 
         ``by`` names the grouping key (``user_id``/``chat_id``).
         """
-        rows = list(self._mongo["daily_messages"].aggregate([
+        rows = [d async for d in await self._mongo["daily_messages"].aggregate([
             {"$match": match},
             {"$group": {"_id": f"${by}", "total": {"$sum": "$messages"}}},
-        ]))
+        ])]
         return [(int(r["_id"]), int(r.get("total") or 0)) for r in rows]
 
-    def _totals_sorted(self, match: Dict[str, Any], limit: int,
+    async def _totals_sorted(self, match: Dict[str, Any], limit: int,
                        by: str = "user_id") -> List[Tuple[int, int]]:
         """``_totals_rows`` + server-side sort/limit.
 
         Order matches the old Python ``sorted(-total, key)`` exactly:
         totals descending, ties by the grouped key ascending.
         """
-        rows = list(self._mongo["daily_messages"].aggregate([
+        rows = [d async for d in await self._mongo["daily_messages"].aggregate([
             {"$match": match},
             {"$group": {"_id": f"${by}", "total": {"$sum": "$messages"}}},
             {"$sort": {"total": -1, "_id": 1}},
             {"$limit": int(limit)},
-        ]))
+        ])]
         return [(int(r["_id"]), int(r.get("total") or 0)) for r in rows]
 
-    def get_user_messages(self, user_id: int) -> int:
+    async def get_user_messages(self, user_id: int) -> int:
         """A user's message total across all groups — daily_messages sum.
 
         Memoized: the first call per window flushes + scans once, later
@@ -2255,20 +2511,15 @@ class Database:
                 fresh, base = self._memo_get(key)
                 if fresh:
                     return base + self._pending_msg_sum(user_id=user_id)
-                self.flush_buffers()
-                base = sum(
-                    int(d.get("messages") or 0)
-                    for d in self._mongo["daily_messages"].find(
-                        {"user_id": user_id}, {"messages": 1, "_id": 0}
-                    )
-                )
+                await self.flush_buffers()
+                base = await self._sum_msgs({"user_id": user_id})
                 self._memo_set(key, base)
                 return base + self._pending_msg_sum(user_id=user_id)
         except Exception as e:
             logger.error(f"Error totalling user messages: {e}")
             return 0
 
-    def get_user_message_totals(self, chat_id: int,
+    async def get_user_message_totals(self, chat_id: int,
                                 user_id: int) -> Tuple[int, int]:
         """(chat, global) message totals — same rows /rankings counts."""
         try:
@@ -2276,24 +2527,20 @@ class Database:
             with self._lock:
                 fresh, chat_msgs = self._memo_get(ckey)
                 if not fresh:
-                    self.flush_buffers()
-                    chat_msgs = sum(
-                        int(d.get("messages") or 0)
-                        for d in self._mongo["daily_messages"].find(
-                            {"chat_id": chat_id, "user_id": user_id},
-                            {"messages": 1, "_id": 0},
-                        )
+                    await self.flush_buffers()
+                    chat_msgs = await self._sum_msgs(
+                        {"chat_id": chat_id, "user_id": user_id}
                     )
                     self._memo_set(ckey, chat_msgs)
                 return (
                     chat_msgs + self._pending_msg_sum(chat_id, user_id, None),
-                    self.get_user_messages(user_id),
+                    await self.get_user_messages(user_id),
                 )
         except Exception as e:
             logger.error(f"Error totalling user messages: {e}")
             return 0, 0
 
-    def get_user_rank_info(self, user_id: int,
+    async def get_user_rank_info(self, user_id: int,
                            chat_id: Optional[int] = None) -> Dict[str, Any]:
         """Unified rank info — what every rank surface displays.
 
@@ -2313,28 +2560,34 @@ class Database:
         }
         try:
             # Global: every chatter across all groups, all time.
-            rows = self._totals_by_user()
-            mine = dict(rows).get(user_id, 0)
+            # Each step below returns ONE document — no full-$group list
+            # is transferred and no Python scan of every user. (This used
+            # to be _totals_by_user() twice per card + two O(users) walks
+            # in _position_in, i.e. a full-collection aggregation per
+            # /rank, /info, /profile, /nextlevel.)
+            mine = await self._sum_msgs({"user_id": user_id})
             info["global_messages"] = mine
-            info["global_members"] = len(rows)
+            info["global_members"] = await self._distinct_users({})
             if mine > 0:
-                info["global_rank"] = self.global_rank_for(mine)
-                info["global_position"] = self._position_in(rows, user_id, mine)
+                info["global_rank"] = await self.global_rank_for(mine)
+                info["global_position"] = await self._rank_position(
+                    {}, user_id, mine
+                )
 
             # Chat scope (groups only — skip for DM callers).
             if chat_id is not None:
-                crows = self._totals_by_user({"chat_id": chat_id})
-                cmine = dict(crows).get(user_id, 0)
+                match = {"chat_id": chat_id}
+                cmine = await self._sum_msgs({**match, "user_id": user_id})
                 info["chat_messages"] = cmine
-                info["chat_members"] = len(crows)
+                info["chat_members"] = await self._distinct_users(match)
                 if cmine > 0:
-                    info["chat_rank"] = self.chat_rank_for(cmine)
-                    info["chat_position"] = self._position_in(
-                        crows, user_id, cmine
+                    info["chat_rank"] = await self.chat_rank_for(cmine)
+                    info["chat_position"] = await self._rank_position(
+                        match, user_id, cmine
                     )
 
             # Presentation extras (template / xp / streaks — no counters).
-            lvl = self.get_user_level(user_id)
+            lvl = await self.get_user_level(user_id)
             info["template"] = int(lvl.get("template") or 1)
             info["global_xp"] = int(lvl.get("global_xp") or 0)
             info["streak_current"] = int(lvl.get("streak_current") or 0)
@@ -2343,20 +2596,20 @@ class Database:
             logger.error(f"Error building rank info: {e}")
         return info
 
-    def get_leaderboard(self, chat_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+    async def get_leaderboard(self, chat_id: int, limit: int = 10) -> List[Dict[str, Any]]:
         """Chat leaderboard — derives from get_chat_top (same counts,
         same order as /rankings) and adds the derived chat rank."""
-        rows = self.get_chat_top(chat_id, limit=limit)
+        rows = await self.get_chat_top(chat_id, limit=limit)
         for row in rows:
             msgs = int(row.get("total_messages") or 0)
             row["messages"] = msgs
-            row["rank"] = self.chat_rank_for(msgs)
+            row["rank"] = await self.chat_rank_for(msgs)
         return rows
 
-    def get_daily_top(self, chat_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+    async def get_daily_top(self, chat_id: int, limit: int = 10) -> List[Dict[str, Any]]:
         today = ist_date()  # IST day — same window as /rankings Today
         try:
-            rows = self._find(
+            rows = await self._find(
                 "daily_messages",
                 {"chat_id": chat_id, "date": today},
                 sort=[("messages", -1), ("_id", 1)],
@@ -2367,7 +2620,7 @@ class Database:
             if uids:
                 users = {
                     u["user_id"]: u
-                    for u in self._find(
+                    for u in await self._find(
                         "users",
                         {"user_id": {"$in": uids}},
                         projection={"user_id": 1, "username": 1, "first_name": 1},
@@ -2381,10 +2634,10 @@ class Database:
         except Exception:
             return []
 
-    def get_period_top(self, chat_id: int, since: str, limit: int = 10) -> List[Dict[str, Any]]:
+    async def get_period_top(self, chat_id: int, since: str, limit: int = 10) -> List[Dict[str, Any]]:
         """Top senders since an inclusive date (IST windows: week/month)."""
         try:
-            top = self._totals_sorted(
+            top = await self._totals_sorted(
                 {"chat_id": chat_id, "date": {"$gte": since}}, limit
             )
             uids = [u for u, _ in top]
@@ -2392,7 +2645,7 @@ class Database:
             if uids:
                 users = {
                     u["user_id"]: u
-                    for u in self._find(
+                    for u in await self._find(
                         "users",
                         {"user_id": {"$in": uids}},
                         projection={"user_id": 1, "username": 1, "first_name": 1},
@@ -2413,7 +2666,7 @@ class Database:
 
     # ── Chat message rankings (bot/modules/chatstats.py) ──────
 
-    def count_message(self, chat_id: int, user_id: int, date: str,
+    async def count_message(self, chat_id: int, user_id: int, date: str,
                       chat_title: Optional[str] = None) -> bool:
         """Count one text message into daily_messages (+ refresh group title).
 
@@ -2439,7 +2692,7 @@ class Database:
             logger.error(f"Error counting message: {e}")
             return False
 
-    def get_chat_top(self, chat_id: int, since: Optional[str] = None,
+    async def get_chat_top(self, chat_id: int, since: Optional[str] = None,
                      limit: int = 10) -> List[Dict[str, Any]]:
         """Top senders in one chat (since = inclusive ISO lower bound)."""
         try:
@@ -2447,13 +2700,13 @@ class Database:
             if since is not None:
                 flt["date"] = {"$gte": since}
             # Totals grouped/sorted/limited on the server (1 round trip).
-            top = self._totals_sorted(flt, limit)
+            top = await self._totals_sorted(flt, limit)
             uids = [u for u, _ in top]
             users: Dict[int, Dict[str, Any]] = {}
             if uids:
                 users = {
                     u["user_id"]: u
-                    for u in self._find(
+                    for u in await self._find(
                         "users",
                         {"user_id": {"$in": uids}},
                         projection={
@@ -2477,23 +2730,23 @@ class Database:
             logger.error(f"Error ranking chat: {e}")
             return []
 
-    def get_chat_message_total(self, chat_id: int,
+    async def get_chat_message_total(self, chat_id: int,
                                since: Optional[str] = None) -> int:
         """Total messages in a chat (all senders, same window as get_chat_top)."""
         try:
             flt: Dict[str, Any] = {"chat_id": chat_id}
             if since is not None:
                 flt["date"] = {"$gte": since}
-            rows = list(self._mongo["daily_messages"].aggregate([
+            rows = [d async for d in await self._mongo["daily_messages"].aggregate([
                 {"$match": flt},
                 {"$group": {"_id": None, "total": {"$sum": "$messages"}}},
-            ]))
+            ])]
             return int(rows[0].get("total") or 0) if rows else 0
         except Exception as e:
             logger.error(f"Error totalling chat: {e}")
             return 0
 
-    def get_chat_day_total(self, chat_id: int, date: str) -> int:
+    async def get_chat_day_total(self, chat_id: int, date: str) -> int:
         """One chat's total on one date — milestone threshold checks.
 
         Memoized with pending-merge (same exactness as get_user_messages).
@@ -2506,13 +2759,11 @@ class Database:
                     return base + self._pending_msg_sum(
                         chat_id=chat_id, date_str=date
                     )
-                self.flush_buffers()
-                base = sum(
-                    int(d.get("messages") or 0)
-                    for d in self._mongo["daily_messages"].find(
-                        {"chat_id": chat_id, "date": date},
-                        {"messages": 1, "_id": 0},
-                    )
+                await self.flush_buffers()
+                # Server-side $sum — one row back instead of streaming
+                # every message-day doc (see _sum_msgs).
+                base = await self._sum_msgs(
+                    {"chat_id": chat_id, "date": date}
                 )
                 self._memo_set(key, base)
                 return base + self._pending_msg_sum(
@@ -2522,7 +2773,7 @@ class Database:
             logger.error(f"Error totalling chat day: {e}")
             return 0
 
-    def get_user_top_groups(self, user_id: int, since: Optional[str] = None,
+    async def get_user_top_groups(self, user_id: int, since: Optional[str] = None,
                             limit: int = 10) -> List[Dict[str, Any]]:
         """A user's groups ranked by how much they chatted in each."""
         try:
@@ -2530,13 +2781,13 @@ class Database:
             if since is not None:
                 flt["date"] = {"$gte": since}
             # Group by chat_id server-side (1 round trip), same tie order.
-            top = self._totals_sorted(flt, limit, by="chat_id")
+            top = await self._totals_sorted(flt, limit, by="chat_id")
             cids = [c for c, _ in top]
             groups: Dict[int, Dict[str, Any]] = {}
             if cids:
                 groups = {
                     g["chat_id"]: g
-                    for g in self._find(
+                    for g in await self._find(
                         "groups",
                         {"chat_id": {"$in": cids}},
                         projection={"chat_id": 1, "chat_title": 1},
@@ -2557,7 +2808,7 @@ class Database:
 
     # ── AFK (bot/modules/afk.py) ────────────────────────────────────
 
-    def set_afk(self, user_id: int, first_name: Optional[str],
+    async def set_afk(self, user_id: int, first_name: Optional[str],
                 username: Optional[str], reason: Optional[str],
                 start_time: str, media_id: Optional[str] = None,
                 media_type: Optional[str] = None) -> None:
@@ -2567,7 +2818,7 @@ class Database:
         matches Telegram's case-insensitive @mentions.
         """
         try:
-            self._mongo["afk"].update_one(
+            await self._mongo["afk"].update_one(
                 {"user_id": user_id},
                 {"$set": {
                     "user_id": user_id,
@@ -2583,32 +2834,33 @@ class Database:
         except Exception as e:
             logger.error(f"Error setting AFK for {user_id}: {e}")
 
-    def get_afk(self, user_id: int) -> Optional[Dict[str, Any]]:
+    async def get_afk(self, user_id: int) -> Optional[Dict[str, Any]]:
         """AFK row for ``user_id`` or None."""
         try:
-            return self._find_one("afk", {"user_id": user_id})
+            return await self._find_one("afk", {"user_id": user_id})
         except Exception as e:
             logger.error(f"Error reading AFK for {user_id}: {e}")
             return None
 
-    def get_afk_by_username(self, username: str) -> Optional[Dict[str, Any]]:
+    async def get_afk_by_username(self, username: str) -> Optional[Dict[str, Any]]:
         """AFK row by @username (case-insensitive - stored lowercase)."""
         try:
-            return self._find_one("afk", {"username": (username or "").lower()})
+            return await self._find_one("afk", {"username": (username or "").lower()})
         except Exception as e:
             logger.error(f"Error reading AFK by username {username!r}: {e}")
             return None
 
-    def clear_afk(self, user_id: int) -> None:
+    async def clear_afk(self, user_id: int) -> None:
         """Remove this user's single AFK row (their own document only)."""
         try:
-            self._mongo["afk"].delete_one({"user_id": user_id})
+            await self._mongo["afk"].delete_one({"user_id": user_id})
         except Exception as e:
             logger.error(f"Error clearing AFK for {user_id}: {e}")
 
-    def set_template(self, user_id: int, template: int):
-        self.update_user_level(user_id, template=template)
+    async def set_template(self, user_id: int, template: int):
+        await self.update_user_level(user_id, template=template)
 
 
 # Global database instance
-db = Database()
+
+db = make_facade(Database())

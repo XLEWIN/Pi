@@ -111,7 +111,7 @@ async def all_command(message: Message, bot: Bot) -> None:
         await _reply(message, plain_error(config.MSG_ADMIN_FETCH_FAIL))
         return
 
-    st = settings_mod.get(chat.id)
+    st = await asyncio.to_thread(settings_mod.get, chat.id)
     source = message.reply_to_message
 
     # Status card exists before the session (session needs its message id).
@@ -119,8 +119,12 @@ async def all_command(message: Message, bot: Bot) -> None:
 
     db_id = 0
     try:
-        db_id = tdb.create_session(
-            chat.id, user.id, mode=st.mode, window_hours=st.window_hours
+        db_id = await asyncio.to_thread(
+            tdb.create_session,
+            chat.id,
+            user.id,
+            mode=st.mode,
+            window_hours=st.window_hours,
         )
         session = sess_mod.create(
             chat_id=chat.id,
@@ -135,7 +139,9 @@ async def all_command(message: Message, bot: Bot) -> None:
         # Lost a race at an await point — clean up the just-made row.
         if db_id:
             try:
-                tdb.finish_session(db_id, "aborted", error="duplicate start")
+                await asyncio.to_thread(
+                    tdb.finish_session, db_id, "aborted", error="duplicate start"
+                )
             except Exception:
                 pass
         try:
@@ -148,7 +154,9 @@ async def all_command(message: Message, bot: Bot) -> None:
         logger.error(f"Tagging session create failed chat={chat.id}", exc_info=e)
         if db_id:
             try:
-                tdb.finish_session(db_id, "failed", error=type(e).__name__)
+                await asyncio.to_thread(
+                    tdb.finish_session, db_id, "failed", error=type(e).__name__
+                )
             except Exception:
                 pass
         try:
@@ -212,14 +220,14 @@ async def allsettings_command(message: Message, bot: Bot, args: list) -> None:
 
     args = args or []
     if not args:
-        st = settings_mod.get(chat.id)
+        st = await asyncio.to_thread(settings_mod.get, chat.id)
         await _reply(message, settings_card(st), reply_markup=settings_keyboard(st))
         return
 
     key_raw = args[0].lower()
     value = " ".join(args[1:]).strip()
     try:
-        st = settings_mod.apply_arg(chat.id, key_raw, value)
+        st = await asyncio.to_thread(settings_mod.apply_arg, chat.id, key_raw, value)
     except ValueError as e:
         await _reply(message, plain_error(str(e)))
         return
@@ -249,12 +257,18 @@ async def tagstats_command(message: Message, bot: Bot) -> None:
         await _reply(message, plain_error(config.MSG_NOT_ADMIN))
         return
 
-    st = settings_mod.get(chat.id)
-    stats = tdb.session_stats(chat.id)
-    members = tdb.count_members(chat.id)
+    def _stats() -> tuple:
+        # Four blocking Mongo reads — one worker round-trip, not four stalls.
+        return (
+            tdb.session_stats(chat.id),
+            tdb.count_members(chat.id),
+            tdb.count_active(chat.id, now - config.PRESENCE_TTL),
+            tdb.count_active(chat.id, now - config.ACTIVITY_RANK_DAY),
+        )
+
+    st = await asyncio.to_thread(settings_mod.get, chat.id)
     now = time.time()
-    active_now = tdb.count_active(chat.id, now - config.PRESENCE_TTL)
-    active_day = tdb.count_active(chat.id, now - config.ACTIVITY_RANK_DAY)
+    stats, members, active_now, active_day = await asyncio.to_thread(_stats)
 
     card = action_card(
         "Mass Tag Stats",
@@ -337,7 +351,7 @@ async def _handle_set_click(
         await _safe_answer(query, config.MSG_NOT_ADMIN, alert=True)
         return
     try:
-        st = settings_mod.cycle(chat.id, key)
+        st = await asyncio.to_thread(settings_mod.cycle, chat.id, key)
     except ValueError:
         await _safe_answer(query, "Unknown setting.", alert=True)
         return
@@ -378,10 +392,10 @@ async def member_observer(message: Message) -> None:
         return
     chat = message.chat
     for u in message.new_chat_members or ():
-        member_registry.on_join(chat.id, u)
+        await asyncio.to_thread(member_registry.on_join, chat.id, u)
     left = message.left_chat_member
     if left is not None:
-        member_registry.on_leave(chat.id, left)
+        await asyncio.to_thread(member_registry.on_leave, chat.id, left)
 
 
 async def chat_member_observer(chat_member: ChatMemberUpdated) -> None:
@@ -396,9 +410,9 @@ async def chat_member_observer(chat_member: ChatMemberUpdated) -> None:
     )
     left = new.status in ("left", "kicked", "banned")
     if joined:
-        member_registry.on_join(change.chat.id, new.user)
+        await asyncio.to_thread(member_registry.on_join, change.chat.id, new.user)
     elif left:
-        member_registry.on_leave(change.chat.id, new.user)
+        await asyncio.to_thread(member_registry.on_leave, change.chat.id, new.user)
 
 
 async def callback_activity_observer(callback_query: CallbackQuery) -> None:

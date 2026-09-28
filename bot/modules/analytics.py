@@ -24,6 +24,7 @@ from bot.database import db
 from bot.emojis import E
 from bot.responses import action_card, field_extra
 from bot.timeutils import ist_date, ist_monday, ist_month_start
+from bot.async_bridge import adb
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +79,6 @@ async def track_message_analytics(
         except Exception as e:
             logger.warning(f"analytics message track failed: {e}")
 
-    import asyncio
     asyncio.get_running_loop().run_in_executor(None, _db)
 
 
@@ -100,7 +100,6 @@ async def track_join(
         except Exception as e:
             logger.warning(f"analytics join track failed: {e}")
 
-    import asyncio
     asyncio.get_running_loop().run_in_executor(None, _db)
 
 
@@ -122,7 +121,6 @@ async def track_leave(
         except Exception as e:
             logger.warning(f"analytics leave track failed: {e}")
 
-    import asyncio
     asyncio.get_running_loop().run_in_executor(None, _db)
 
 
@@ -147,16 +145,16 @@ async def stats_command(message: Message, bot: Bot, args: list):
         period = args[0].lower()
     days = _PERIOD_DAYS.get(period, 1)
 
-    stats = await asyncio.to_thread(db.get_daily_stats, chat_id, days=days)
+    stats = await adb(db.get_daily_stats(chat_id, days=days))
     # Prefer daily_messages for message volume (leveling already tracks it).
     from datetime import date, timedelta as td
     start = (date.today() - td(days=days - 1)).isoformat()
     try:
-        msg_sum = await asyncio.to_thread(db.sum_daily_messages, chat_id, start)
+        msg_sum = await adb(db.sum_daily_messages(chat_id, start))
     except Exception:
         msg_sum = stats.get("messages", 0)
 
-    active = await asyncio.to_thread(db.get_active_member_count, chat_id, days=days)
+    active = await adb(db.get_active_member_count(chat_id, days=days))
     label = period.capitalize()
 
     # Trend: compare to previous equal window when we have history.
@@ -164,7 +162,7 @@ async def stats_command(message: Message, bot: Bot, args: list):
     if days >= 1:
         prev_start = (date.today() - td(days=days * 2 - 1)).isoformat()
         try:
-            prev = await asyncio.to_thread(db.sum_daily_messages, chat_id, prev_start, start)
+            prev = await adb(db.sum_daily_messages(chat_id, prev_start, start))
             if prev > 0:
                 delta = msg_sum - prev
                 pct = int(abs(delta) / prev * 100)
@@ -214,9 +212,8 @@ async def topactive_command(message: Message, bot: Bot, args: list):
         "month": ist_month_start(),
     }.get(period, ist_monday())
 
-    top = await asyncio.to_thread(
-        db.get_period_top, chat_id, since=since, limit=10
-    )
+    top = await adb(db.get_period_top(chat_id, since=since, limit=10
+    ))
     if not top:
         await reply_text(message,
             f"{E.INFO} No activity recorded yet.", parse_mode=ParseMode.HTML
@@ -253,7 +250,7 @@ async def peakhours_command(message: Message, bot: Bot, args: list):
         except ValueError:
             pass
 
-    peaks = await asyncio.to_thread(db.get_peak_hours, chat_id, days=days, limit=5)
+    peaks = await adb(db.get_peak_hours(chat_id, days=days, limit=5))
     if not peaks:
         await reply_text(message,
             f"{E.INFO} No hourly data yet.", parse_mode=ParseMode.HTML

@@ -1,6 +1,12 @@
 """Two-level cache: L1 in-memory + L3 SQLite file_id store (via bot.database).
 
 Also holds a short-TTL resolve cache so repeat URLs skip yt-dlp extraction.
+
+The L3-touching helpers are ``async def``: they talk to Mongo, so they
+must be awaited on the event loop (through :func:`adb`, which yields the
+plain value when the caller's loop is not the driver's).  Written as sync
+wrappers they would hand back a lazy box that nobody drives — the write
+would be silently dropped and the read would raise.
 """
 
 from __future__ import annotations
@@ -10,6 +16,7 @@ from collections import OrderedDict
 from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 
+from bot.async_bridge import adb
 from bot.database import db
 
 from .metrics import metrics
@@ -44,7 +51,7 @@ def _l1_put(key: str, file_id: str, kind: str) -> None:
             _L1.popitem(last=False)
 
 
-def get_file_ids(keys: List[str]) -> Dict[str, Tuple[str, str]]:
+async def get_file_ids(keys: List[str]) -> Dict[str, Tuple[str, str]]:
     """Return {key: (file_id, kind)} for keys present in L1 or L3."""
     out: Dict[str, Tuple[str, str]] = {}
     missing: List[str] = []
@@ -57,7 +64,7 @@ def get_file_ids(keys: List[str]) -> Dict[str, Tuple[str, str]]:
             missing.append(k)
     if missing:
         try:
-            rows = db.ig_get_file_ids(missing)
+            rows = await adb(db.ig_get_file_ids(missing))
         except Exception:
             rows = {}
         for k, (file_id, kind) in rows.items():
@@ -68,10 +75,10 @@ def get_file_ids(keys: List[str]) -> Dict[str, Tuple[str, str]]:
     return out
 
 
-def put_file_id(key: str, file_id: str, kind: str, source_url: str = "") -> None:
+async def put_file_id(key: str, file_id: str, kind: str, source_url: str = "") -> None:
     _l1_put(key, file_id, kind)
     try:
-        db.ig_put_file_id(key, file_id, kind, source_url)
+        await adb(db.ig_put_file_id(key, file_id, kind, source_url))
     except Exception:
         # L3 failure must not break delivery — L1 still serves this process.
         pass
@@ -104,20 +111,20 @@ def invalidate_resolved(url_key: str) -> None:
         _RESOLVE.pop(url_key, None)
 
 
-def clear_cache() -> int:
+async def clear_cache() -> int:
     with _L1_LOCK:
         _L1.clear()
     with _RESOLVE_LOCK:
         _RESOLVE.clear()
     try:
-        return db.ig_clear_file_cache()
+        return await adb(db.ig_clear_file_cache())
     except Exception:
         return 0
 
 
-def cache_stats() -> Dict[str, int]:
+async def cache_stats() -> Dict[str, int]:
     try:
-        db_stats = db.ig_cache_stats()
+        db_stats = await adb(db.ig_cache_stats())
     except Exception:
         db_stats = {"rows": 0, "hits": 0}
     with _L1_LOCK:

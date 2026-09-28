@@ -24,3 +24,9 @@ uvloop>=0.21; sys_platform != "win32"
 
 # Test-only
 mongomock>=4.3.0
+
+# Async Mongo driver (pinned to the same minor as pymongo so the two
+# never disagree on wire protocol / BSON behaviour).  bot/mongo_async.py
+# opens an AsyncIOMotorClient in production and falls back to a
+# mongomock shim in tests, so this is required on the Railway worker.
+motor>=3.7.1,<3.8

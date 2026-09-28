@@ -171,21 +171,15 @@ def _cover_resize(img, size):
     return img.crop((left, top, left + tw, top + th))
 
 
-def _ambient_artwork(avatar_img):
-    """Return the heavily-darkened, blurred, red-tinted artwork layer."""
-    src = None
-    for path in (BG_IMAGE_PATH, BG_IMAGE_PATH_ALT):
-        if os.path.exists(path):
-            try:
-                src = Image.open(path).convert("RGB")
-                break
-            except Exception:
-                pass
-    if src is None and avatar_img is not None:
-        src = avatar_img.convert("RGB").resize((760, 760), Image.LANCZOS)
-    if src is None:
-        return None
+# The background artwork depends only on the PNG on disk, never on the
+# user, so it is built once and reused. Fonts already had this (:106);
+# the artwork did not — every /rank re-opened the template, then paid
+# cover-resize + GaussianBlur(7) + two ImageEnhance passes + a blend.
+_BG_ART_CACHE = {}
+_BG_ART_LOCK = threading.Lock()
 
+
+def _build_ambient(src):
     art = _cover_resize(src, (CANVAS_W, CANVAS_H))
     art = art.filter(ImageFilter.GaussianBlur(7))
     art = ImageEnhance.Brightness(art).enhance(0.42)
@@ -193,6 +187,35 @@ def _ambient_artwork(avatar_img):
     tint = Image.new("RGB", art.size, COLOR_BURGUNDY)
     art = Image.blend(art, tint, 0.32)
     return art
+
+
+def _ambient_artwork(avatar_img):
+    """Return the heavily-darkened, blurred, red-tinted artwork layer.
+
+    PIL images are mutable, so callers get a copy of the cached layer —
+    one card's draw can never corrupt another's.
+    """
+    for path in (BG_IMAGE_PATH, BG_IMAGE_PATH_ALT):
+        if not os.path.exists(path):
+            continue
+        with _BG_ART_LOCK:
+            hit = _BG_ART_CACHE.get(path)
+        if hit is not None:
+            return hit.copy()
+        try:
+            src = Image.open(path).convert("RGB")
+        except Exception:
+            continue
+        art = _build_ambient(src)
+        with _BG_ART_LOCK:
+            _BG_ART_CACHE[path] = art
+        return art.copy()
+
+    # No usable template: fall back to the avatar (per-user, not cached).
+    if avatar_img is not None:
+        src = avatar_img.convert("RGB").resize((760, 760), Image.LANCZOS)
+        return _build_ambient(src)
+    return None
 
 
 _CONST_LOCK = threading.Lock()

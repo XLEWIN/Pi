@@ -27,6 +27,7 @@ Environment isolation (BEFORE any bot import):
 
 from __future__ import annotations
 
+import asyncio
 import atexit
 import os
 import shutil
@@ -375,6 +376,79 @@ class TestIdentityFastSkip(_PerfBase):
             self.assertNotIn(("stale",), db._skip_reg)
             self.assertIn(("fresh",), db._skip_reg)
             db._skip_reg.pop(("fresh",), None)
+
+
+class TestFlushSingleFlight(unittest.IsolatedAsyncioTestCase):
+    """A reader must never observe a half-written flush.
+
+    The async conversion made ``flush_buffers`` await Mongo while holding
+    the perf RLock.  RLocks are per-thread, so a *second coroutine on the
+    same loop* re-enters it re-entrantly, sees the buffers already
+    claimed (cleared) by the first flush, returns immediately, and then
+    reads a Mongo that does not have the rows yet — memoizing 0 as the
+    truth.  ``flush_buffers`` is therefore single-flight: anyone who
+    arrives mid-write waits for it to land.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._clean()
+
+    def _clean(self):
+        for name in _PerfBase._COLLS:
+            db.collection(name).delete_many({})
+        db._read_cache.clear()
+        db._memos.clear()
+        with db._lock:
+            db._buf_daily.clear()
+            db._buf_hourly.clear()
+            db._buf_msg.clear()
+            db._buf_groups.clear()
+            db._drop_msg_sums()
+
+    async def test_reader_arriving_mid_flush_waits_for_the_write(self):
+        raw = db._target                       # the real Database, not the facade
+        db.count_message(CHAT, USER, TODAY, "Single Flight")
+        self.assertGreater(len(db._buf_msg), 0)
+
+        original = raw._apply_ops
+        writing = asyncio.Event()
+
+        async def slow_apply(coll, ops):
+            writing.set()
+            await asyncio.sleep(0.05)          # hold the flush open
+            return await original(coll, ops)
+
+        raw._apply_ops = slow_apply
+        first = asyncio.create_task(raw.flush_buffers())
+        try:
+            await asyncio.wait_for(writing.wait(), 5)
+            self.assertIsNotNone(raw._flush_inflight)   # claim taken
+
+            # This is the read-your-writes guarantee: by the time this
+            # returns, the rows must actually be in Mongo.  Without
+            # single-flight it returns instantly and finds 0 rows.
+            await asyncio.wait_for(raw.flush_buffers(), 5)
+            self.assertIsNone(raw._flush_inflight)
+            self.assertEqual(
+                db.collection("daily_messages").count_documents(
+                    {"chat_id": CHAT, "date": TODAY}
+                ),
+                1,
+            )
+        finally:
+            raw.__dict__.pop("_apply_ops", None)
+            await first
+
+    async def test_concurrent_flushes_apply_the_increment_exactly_once(self):
+        raw = db._target
+        for _ in range(5):
+            db.count_message(CHAT, USER, TODAY, "Single Flight")
+        await asyncio.gather(raw.flush_buffers(), raw.flush_buffers())
+        rows = list(db.collection("daily_messages").find(
+            {"chat_id": CHAT, "date": TODAY}
+        ))
+        self.assertEqual(sum(int(r["messages"]) for r in rows), 5)
 
 
 if __name__ == "__main__":

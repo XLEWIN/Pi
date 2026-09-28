@@ -3,7 +3,6 @@
 Adapted from boa2 for Pi bot. Enabled by default.
 """
 
-import asyncio
 import logging
 from html import escape
 
@@ -16,6 +15,7 @@ from bot.database import db
 from bot.emojis import E
 from bot.pipeline import on, GROUPS, cmd
 from bot.reply import reply_text
+from bot.async_bridge import adb
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +99,7 @@ async def setwelcome_command(message: Message, bot: Bot, args: list):
         return
 
     chat_id = message.chat.id
-    await asyncio.to_thread(db.set_welcome_text, chat_id, text)
+    await adb(db.set_welcome_text(chat_id, text))
     await reply_text(message, f"{E.CHECK} Welcome message saved!",
             parse_mode=ParseMode.HTML)
 
@@ -145,7 +145,7 @@ async def setgoodbye_command(message: Message, bot: Bot, args: list):
         return
 
     chat_id = message.chat.id
-    await asyncio.to_thread(db.set_goodbye_text, chat_id, text)
+    await adb(db.set_goodbye_text(chat_id, text))
     await reply_text(message, f"{E.CHECK} Goodbye message saved!",
             parse_mode=ParseMode.HTML)
 
@@ -160,7 +160,7 @@ async def resetwelcome_command(message: Message, bot: Bot):
         await reply_text(message, "Only admins can reset welcome.")
         return
 
-    await asyncio.to_thread(db.reset_welcome, message.chat.id)
+    await adb(db.reset_welcome(message.chat.id))
     await reply_text(message, f"{E.CHECK} Welcome message reset to default!",
             parse_mode=ParseMode.HTML)
 
@@ -175,7 +175,7 @@ async def resetgoodbye_command(message: Message, bot: Bot):
         await reply_text(message, "Only admins can reset goodbye.")
         return
 
-    await asyncio.to_thread(db.reset_goodbye, message.chat.id)
+    await adb(db.reset_goodbye(message.chat.id))
     await reply_text(message, f"{E.CHECK} Goodbye message reset to default!",
             parse_mode=ParseMode.HTML)
 
@@ -191,18 +191,18 @@ async def welcome_command(message: Message, bot: Bot, args: list):
         return
 
     chat_id = message.chat.id
-    settings = await asyncio.to_thread(db.get_welcome_settings, chat_id)
-    msg = await asyncio.to_thread(db.get_welcome_message, chat_id)
+    settings = await adb(db.get_welcome_settings(chat_id))
+    msg = await adb(db.get_welcome_message(chat_id))
 
     if args:
         arg = args[0].lower()
         if arg == "on":
-            await asyncio.to_thread(db.set_welcome_enabled, chat_id, True)
+            await adb(db.set_welcome_enabled(chat_id, True))
             await reply_text(message, f"{E.CHECK} Welcome messages enabled!",
             parse_mode=ParseMode.HTML)
             return
         elif arg == "off":
-            await asyncio.to_thread(db.set_welcome_enabled, chat_id, False)
+            await adb(db.set_welcome_enabled(chat_id, False))
             await reply_text(message, f"{E.CROSS} Welcome messages disabled!",
             parse_mode=ParseMode.HTML)
             return
@@ -240,18 +240,18 @@ async def goodbye_command(message: Message, bot: Bot, args: list):
         return
 
     chat_id = message.chat.id
-    settings = await asyncio.to_thread(db.get_welcome_settings, chat_id)
-    msg = await asyncio.to_thread(db.get_welcome_message, chat_id)
+    settings = await adb(db.get_welcome_settings(chat_id))
+    msg = await adb(db.get_welcome_message(chat_id))
 
     if args:
         arg = args[0].lower()
         if arg == "on":
-            await asyncio.to_thread(db.set_goodbye_enabled, chat_id, True)
+            await adb(db.set_goodbye_enabled(chat_id, True))
             await reply_text(message, f"{E.CHECK} Goodbye messages enabled!",
             parse_mode=ParseMode.HTML)
             return
         elif arg == "off":
-            await asyncio.to_thread(db.set_goodbye_enabled, chat_id, False)
+            await adb(db.set_goodbye_enabled(chat_id, False))
             await reply_text(message, f"{E.CROSS} Goodbye messages disabled!",
             parse_mode=ParseMode.HTML)
             return
@@ -288,18 +288,18 @@ async def cleanwelcome_command(message: Message, bot: Bot, args: list):
         return
 
     if not args:
-        settings = await asyncio.to_thread(db.get_welcome_settings, message.chat.id)
+        settings = await adb(db.get_welcome_settings(message.chat.id))
         await reply_text(message, f"{E.SETTINGS} Clean welcome: {'ON' if settings.get('clean_welcome') else 'OFF'}",
             parse_mode=ParseMode.HTML)
         return
 
     arg = args[0].lower()
     if arg == "on":
-        await asyncio.to_thread(db.set_clean_welcome, message.chat.id, True)
+        await adb(db.set_clean_welcome(message.chat.id, True))
         await reply_text(message, f"{E.CHECK} Clean welcome enabled! Old welcome messages will be deleted.",
             parse_mode=ParseMode.HTML)
     elif arg == "off":
-        await asyncio.to_thread(db.set_clean_welcome, message.chat.id, False)
+        await adb(db.set_clean_welcome(message.chat.id, False))
         await reply_text(message, f"{E.CROSS} Clean welcome disabled!",
             parse_mode=ParseMode.HTML)
     else:
@@ -320,18 +320,18 @@ async def cleangoodbye_command(message: Message, bot: Bot, args: list):
         return
 
     if not args:
-        settings = await asyncio.to_thread(db.get_welcome_settings, message.chat.id)
+        settings = await adb(db.get_welcome_settings(message.chat.id))
         await reply_text(message, f"{E.SETTINGS} Clean goodbye: {'ON' if settings.get('clean_goodbye') else 'OFF'}",
             parse_mode=ParseMode.HTML)
         return
 
     arg = args[0].lower()
     if arg == "on":
-        await asyncio.to_thread(db.set_clean_goodbye, message.chat.id, True)
+        await adb(db.set_clean_goodbye(message.chat.id, True))
         await reply_text(message, f"{E.CHECK} Clean goodbye enabled! Old goodbye messages will be deleted.",
             parse_mode=ParseMode.HTML)
     elif arg == "off":
-        await asyncio.to_thread(db.set_clean_goodbye, message.chat.id, False)
+        await adb(db.set_clean_goodbye(message.chat.id, False))
         await reply_text(message, f"{E.CROSS} Clean goodbye disabled!",
             parse_mode=ParseMode.HTML)
     else:
@@ -346,12 +346,12 @@ async def new_member_handler(message: Message, bot: Bot):
         return
 
     chat_id = message.chat.id
-    settings = await asyncio.to_thread(db.get_welcome_settings, chat_id)
+    settings = await adb(db.get_welcome_settings(chat_id))
 
     if not settings.get("welcome_enabled", True):
         return
 
-    msg_data = await asyncio.to_thread(db.get_welcome_message, chat_id)
+    msg_data = await adb(db.get_welcome_message(chat_id))
     welcome_text = msg_data.get("welcome_text", f"{E.WAVE} Hey {{first}}, welcome to {{chatname}}!")
 
     for user in message.new_chat_members:
@@ -380,7 +380,7 @@ async def new_member_handler(message: Message, bot: Bot):
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
-            await asyncio.to_thread(db.update_last_welcome_msg, chat_id, sent.message_id)
+            await adb(db.update_last_welcome_msg(chat_id, sent.message_id))
         except Exception as e:
             logger.warning(f"Welcome message error: {e}")
 
@@ -391,7 +391,7 @@ async def left_member_handler(message: Message, bot: Bot):
         return
 
     chat_id = message.chat.id
-    settings = await asyncio.to_thread(db.get_welcome_settings, chat_id)
+    settings = await adb(db.get_welcome_settings(chat_id))
 
     if not settings.get("goodbye_enabled", True):
         return
@@ -400,7 +400,7 @@ async def left_member_handler(message: Message, bot: Bot):
     if not user or user.is_bot:
         return
 
-    msg_data = await asyncio.to_thread(db.get_welcome_message, chat_id)
+    msg_data = await adb(db.get_welcome_message(chat_id))
     goodbye_text = msg_data.get("goodbye_text", f"{E.GOODBYE} Sad to see you leaving {{first}}. Take Care!")
 
     # Clean old goodbye message
@@ -419,7 +419,7 @@ async def left_member_handler(message: Message, bot: Bot):
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
-        await asyncio.to_thread(db.update_last_goodbye_msg, chat_id, sent.message_id)
+        await adb(db.update_last_goodbye_msg(chat_id, sent.message_id))
     except Exception as e:
         logger.warning(f"Goodbye message error: {e}")
 

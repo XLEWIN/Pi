@@ -79,13 +79,19 @@ def _ensure_task() -> None:
 async def _flush_loop() -> None:
     while not _stop:
         await asyncio.sleep(config.FLUSH_INTERVAL)
-        flush_now()
+        # Off the loop: a flush is two bulk_write round-trips.
+        await flush_async()
 
 
-def flush_now() -> int:
-    """Persist the buffer immediately; returns number of entries flushed."""
+def _drain():
+    """Atomically move the buffer into write lists. No I/O.
+
+    MUST stay on the event loop: ``touch()`` also runs there, so a drain
+    and a touch can never interleave. Returns None when there is nothing
+    buffered, otherwise (members, counters).
+    """
     if not _buffer:
-        return 0
+        return None
     snapshot = dict(_buffer)
     _buffer.clear()
     members = []
@@ -98,17 +104,40 @@ def flush_now() -> int:
             int(entry.is_bot), entry.last_ts,
         ))
         counters.append((chat_id, user_id, entry.count, entry.last_ts))
+    return members, counters
+
+
+def _persist(members, counters) -> None:
+    """Blocking MongoDB writes — MUST run in a worker thread."""
     try:
         tdb.bulk_observe(members)   # identity + last_active (1 commit)
         tdb.flush_activity(counters)  # counters (1 commit)
     except Exception as e:
         logger.warning(f"Tagging activity flush error: {e}")
+
+
+def flush_now() -> int:
+    """Persist the buffer immediately; returns number of entries flushed."""
+    drained = _drain()
+    if drained is None:
+        return 0
+    members, counters = drained
+    _persist(members, counters)
     return len(counters)
 
 
 async def flush_async() -> int:
-    """flush_now() off the event loop (batching is small — belt & braces)."""
-    return await asyncio.to_thread(flush_now)
+    """flush_now() with the blocking writes moved off the event loop.
+
+    The drain still happens here (see _drain) — only the two bulk_write
+    round-trips run in the worker thread.
+    """
+    drained = _drain()
+    if drained is None:
+        return 0
+    members, counters = drained
+    await asyncio.to_thread(_persist, members, counters)
+    return len(counters)
 
 
 def pending() -> int:

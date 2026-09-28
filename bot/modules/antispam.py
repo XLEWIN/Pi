@@ -43,6 +43,7 @@ from bot.emojis import E
 from bot.modules.bans import is_sudo
 from bot.responses import mention, plain_error, plain_ok
 from bot.timeutils import ist_date
+from bot.async_bridge import adb
 
 logger = logging.getLogger(__name__)
 
@@ -99,18 +100,22 @@ async def flood_watch(message: Message) -> None:
         return
 
     # Already blocked: ignore (no new offence while the block runs).
-    if await asyncio.to_thread(db.is_spam_blocked, user.id):
+    # Warm cache = in-process answer (no executor hop); only a cache miss
+    # pays asyncio.to_thread. This handler runs on every group message.
+    hit, blocked = db.peek_spam_blocked(user.id)
+    if not hit:
+        blocked = await adb(db.is_spam_blocked(user.id))
+    if blocked:
         return
 
     if not _track(chat.id, user.id):
         return
 
-    offence = await asyncio.to_thread(db.spam_bump_offence, user.id, ist_date())
+    offence = await adb(db.spam_bump_offence(user.id, ist_date()))
     minutes = block_minutes(offence)
     until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
-    await asyncio.to_thread(
-        db.spam_set_block, user.id, until.isoformat(timespec="seconds")
-    )
+    await adb(db.spam_set_block(user.id, until.isoformat(timespec="seconds")
+    ))
 
     try:
         await reply_text(message,
@@ -175,7 +180,7 @@ async def free_command(message: Message, args: list) -> None:
         )
         return
     user_id, label = target
-    if await asyncio.to_thread(db.spam_clear, user_id):
+    if await adb(db.spam_clear(user_id)):
         await reply_text(msg,
             plain_ok(f"<b>{label}</b> is free — warnings and block cleared."),
             parse_mode=ParseMode.HTML,

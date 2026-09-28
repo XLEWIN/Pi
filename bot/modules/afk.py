@@ -39,6 +39,7 @@ from bot.emojis import E
 from bot.pipeline import cmd, on
 from bot.reply import reply_text
 from bot.responses import action_card
+from bot.async_bridge import adb
 
 # New handler groups - 0..21 are taken by the other modules.
 MENTION_GROUP = 22  # ping/reply notices for AFK users
@@ -177,7 +178,7 @@ def _resolve_afk_target(message: Message) -> Optional[dict]:
 
 async def _welcome_back(message: Message, user, doc: dict) -> None:  # noqa: ANN001
     """Clear the AFK row and reply with the shared welcome-back card."""
-    await asyncio.to_thread(db.clear_afk, user.id)
+    await adb(db.clear_afk(user.id))
     fields = [
         (E.USER, "User", _sender_mention(user)),
         (E.TIME, "Away", _duration_since(doc.get("afk_start_time"))),
@@ -195,7 +196,7 @@ async def afk_command(message: Message) -> None:
     if user is None or user.is_bot:
         return
 
-    existing = await asyncio.to_thread(db.get_afk, user.id)
+    existing = await adb(db.get_afk(user.id))
     if existing:
         await _welcome_back(message, user, existing)
         return
@@ -209,11 +210,10 @@ async def afk_command(message: Message) -> None:
         reason = parts[1].strip()
 
     media_id, media_type = _replied_media(message)
-    await asyncio.to_thread(
-        db.set_afk,
+    await adb(db.set_afk(
         user.id, user.first_name, user.username, reason,
         datetime.now().isoformat(), media_id, media_type,
-    )
+    ))
 
     fields = [(E.USER, "User", _sender_mention(user))]
     if reason:
@@ -273,7 +273,7 @@ async def afk_return_handler(message: Message) -> None:
     user = message.from_user
     if user is None or user.is_bot:
         return
-    doc = await asyncio.to_thread(db.get_afk, user.id)
+    doc = await adb(db.get_afk(user.id))
     if not doc:
         return
     await _welcome_back(message, user, doc)

@@ -23,6 +23,7 @@ from bot.keyboards.colored import btn_danger, btn_primary, build_keyboard
 from bot.pipeline import on, cmd
 from bot.reply import reply_text
 from bot.responses import action_card, field_extra, rank_value
+from bot.async_bridge import adb
 
 logger = logging.getLogger(__name__)
 
@@ -311,8 +312,8 @@ async def userstats_command(message: Message):
 
     # Counts are Mongo round trips — keep them off the event loop so
     # other chats' replies stay instant while /userstats loads.
-    user_count = await asyncio.to_thread(db.get_user_count)
-    group_count = await asyncio.to_thread(db.get_group_count)
+    user_count = await adb(db.get_user_count())
+    group_count = await adb(db.get_group_count())
 
     stats_text = f"""{E.CHART} Bot Statistics
 
@@ -370,14 +371,14 @@ async def _build_info_text(bot, target, chat_id: Optional[int] = None) -> str:
         else f"{photos} photo{'s' if photos != '1' else ''}"
     )
 
-    user_row = (await asyncio.to_thread(db.get_user, uid)) or {}
+    user_row = (await adb(db.get_user(uid))) or {}
     warnings = int(user_row.get("warnings") or 0)
     health = max(0, 100 - 25 * min(warnings, 4))
     filled = health // 10
     bar = "▰" * filled + "▱" * (10 - filled)
 
     # Unified rank info — same source as /rank, /rankings and /profile.
-    rank_info = await asyncio.to_thread(db.get_user_rank_info, uid, chat_id)
+    rank_info = await adb(db.get_user_rank_info(uid, chat_id))
 
     fields = [
         field_extra(custom_emoji("💭", EID.INFO), "ID", f"<code>{uid}</code>"),
@@ -406,8 +407,8 @@ async def _build_info_text(bot, target, chat_id: Optional[int] = None) -> str:
                        rank_info["global_members"], rank_info["global_messages"]),
         ),
         field_extra(E.TIME, "AFK Status", "No"),
-        field_extra(E.FOLDER, "Common Groups", str(await asyncio.to_thread(db.count_user_groups, uid))),
-        field_extra(E.CROSS, "Globally Banned", "Yes" if await asyncio.to_thread(db.is_gbanned, uid) else "No"),
+        field_extra(E.FOLDER, "Common Groups", str(await adb(db.count_user_groups(uid)))),
+        field_extra(E.CROSS, "Globally Banned", "Yes" if await adb(db.is_gbanned(uid)) else "No"),
         field_extra(E.MUTE, "Globally Muted", "Yes" if user_row.get("is_muted") else "No"),
     ])
 
@@ -607,7 +608,7 @@ async def recentactivity_command(message: Message, bot: Bot):
             parse_mode=ParseMode.HTML)
         return
 
-    activity = await asyncio.to_thread(db.get_recent_activity, limit=5)
+    activity = await adb(db.get_recent_activity(limit=5))
 
     if not activity:
         await reply_text(message, f"{E.INFO} No recent activity.",

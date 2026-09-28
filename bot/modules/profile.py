@@ -6,7 +6,6 @@ positives/warnings/restrictions. Ranks derive from daily_messages —
 the same counts /rankings and /rank display.
 """
 
-import asyncio
 import logging
 from datetime import datetime
 from html import escape
@@ -21,6 +20,7 @@ from bot.emojis import E
 from bot.pipeline import cmd, on
 from bot.reply import reply_text
 from bot.responses import action_card, field_extra, field_user, rank_value, user_label
+from bot.async_bridge import adb
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +52,7 @@ async def _resolve_target(
                     is_bot = False
                     full_name = None
                 u = _U()
-                row = await asyncio.to_thread(db.get_user, uid)
+                row = await adb(db.get_user(uid))
                 if row:
                     u.first_name = row.get("first_name")
                     u.last_name = row.get("last_name")
@@ -79,21 +79,21 @@ async def profile_command(message: Message, bot: Bot, args: list):
 
     uid = target.id
     # Ensure row exists for reputation math.
-    await asyncio.to_thread(db._ensure_reputation, uid)
-    rep = await asyncio.to_thread(db.get_reputation, uid)
-    active_days = await asyncio.to_thread(db.get_active_days, uid)
+    await adb(db._ensure_reputation(uid))
+    rep = await adb(db.get_reputation(uid))
+    active_days = await adb(db.get_active_days(uid))
 
     # Chat context only in groups — ranks are derived from daily_messages.
     chat = message.chat
     chat_id = None
     if chat is not None and getattr(chat, "type", None) not in (None, "private"):
         chat_id = chat.id
-    info = await asyncio.to_thread(db.get_user_rank_info, uid, chat_id)
+    info = await adb(db.get_user_rank_info(uid, chat_id))
 
     # Prefer display name; fall back to DB if Telegram user is sparse.
     display_user = target
     if not getattr(target, "first_name", None) and not getattr(target, "username", None):
-        row = await asyncio.to_thread(db.get_user, uid)
+        row = await adb(db.get_user(uid))
         if row:
             class _U:
                 id = uid

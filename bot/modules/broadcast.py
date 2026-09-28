@@ -35,6 +35,7 @@ from bot.emojis import E, EID
 from bot.keyboards.colored import btn_danger, build_keyboard
 from bot.pipeline import cmd, on
 from bot.reply import reply_text
+from bot.async_bridge import adb
 
 logger = logging.getLogger(__name__)
 
@@ -194,9 +195,9 @@ async def broadcast_command(message: Message,
     groups: List[int] = []
     users: List[int] = []
     if target in ("all", "chat"):
-        groups = await asyncio.to_thread(db.get_all_chat_ids)
+        groups = await adb(db.get_all_chat_ids())
     if target in ("all", "user"):
-        users = await asyncio.to_thread(db.get_all_user_ids)
+        users = await adb(db.get_all_user_ids())
     if not groups and not users:
         await reply_text(
             msg,

@@ -72,9 +72,20 @@ def _row_to_settings(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def get_settings(chat_id: int) -> Optional[Dict[str, Any]]:
-    """Return bind settings for a group, or None if unbound."""
+    """Return bind settings for a group, or None if unbound.
+
+    Cached through ``_db._cached_read``: this runs on EVERY group
+    message (``gate_message_handler``) and used to be a raw
+    ``_find_one`` — one Mongo round-trip per message even though
+    bindings change rarely. Writes to ``bind_settings`` invalidate
+    it via ``_CACHE_SOURCES``.
+    """
     try:
-        raw = _db._find_one("bind_settings", {"chat_id": chat_id})
+        raw = _db._cached_read(
+            "get_bind_settings",
+            (chat_id,),
+            lambda: _db._find_one("bind_settings", {"chat_id": chat_id}),
+        )
         if raw is None:
             return None
         d = _row_to_settings(raw)
@@ -89,9 +100,13 @@ def get_settings(chat_id: int) -> Optional[Dict[str, Any]]:
 def find_other_binding(channel_id: int, exclude_chat_id: int) -> Optional[Dict[str, Any]]:
     """Settings row for a *different* group already bound to this channel."""
     try:
-        raw = _db._find_one(
-            "bind_settings",
-            {"channel_id": channel_id, "chat_id": {"$ne": exclude_chat_id}},
+        raw = _db._cached_read(
+            "find_other_binding",
+            (channel_id, exclude_chat_id),
+            lambda: _db._find_one(
+                "bind_settings",
+                {"channel_id": channel_id, "chat_id": {"$ne": exclude_chat_id}},
+            ),
         )
         return _row_to_settings(raw) if raw else None
     except Exception as e:

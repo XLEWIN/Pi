@@ -4,7 +4,6 @@ Uses SQLite database for storage.
 Sends colored buttons via pure PTB.
 """
 
-import asyncio
 import logging
 
 from aiogram import Bot, F
@@ -18,6 +17,7 @@ from bot.keyboards.colored import btn_url, build_keyboard
 from bot.emojis import E, EID
 from bot.pipeline import on, GROUPS, cmd
 from bot.reply import reply_text
+from bot.async_bridge import adb
 
 logger = logging.getLogger(__name__)
 
@@ -65,12 +65,12 @@ async def watch_command(message: Message, bot: Bot, args: list):
     admin_id = message.from_user.id
     word = " ".join(args).lower().strip()
 
-    existing = await asyncio.to_thread(db.get_watch_words, chat_id, admin_id)
+    existing = await adb(db.get_watch_words(chat_id, admin_id))
     if word in existing:
         await reply_text(message, f"{E.WARNING} <b>{word}</b> is already being watched.", parse_mode=ParseMode.HTML)
         return
 
-    await asyncio.to_thread(db.add_watch_word, chat_id, admin_id, word)
+    await adb(db.add_watch_word(chat_id, admin_id, word))
     await reply_text(
         message,
         f"{E.CHECK} Added <b>{word}</b> to your watch list.\nI'll notify you in DM when someone uses it.",
@@ -95,7 +95,7 @@ async def unwatch_command(message: Message, bot: Bot, args: list):
     admin_id = message.from_user.id
     word = " ".join(args).lower().strip()
 
-    if await asyncio.to_thread(db.remove_watch_word, chat_id, admin_id, word):
+    if await adb(db.remove_watch_word(chat_id, admin_id, word)):
         await reply_text(message, f"{E.CHECK} Removed <b>{word}</b> from your watch list.", parse_mode=ParseMode.HTML)
     else:
         await reply_text(message, f"{E.WARNING} Word not found in your watch list.",
@@ -109,7 +109,7 @@ async def watchlist_command(message: Message):
 
     chat_id = message.chat.id
     admin_id = message.from_user.id
-    words = await asyncio.to_thread(db.get_watch_words, chat_id, admin_id)
+    words = await adb(db.get_watch_words(chat_id, admin_id))
 
     if not words:
         await reply_text(
@@ -149,7 +149,7 @@ async def watchmode_command(message: Message, bot: Bot, args: list):
     chat_id = message.chat.id
     admin_id = message.from_user.id
     mode = args[0].lower()
-    await asyncio.to_thread(db.set_watch_mode, chat_id, admin_id, mode)
+    await adb(db.set_watch_mode(chat_id, admin_id, mode))
     await reply_text(message, f"{E.CHECK} Watch mode set to: <b>{mode}</b>", parse_mode=ParseMode.HTML)
 
 
@@ -164,7 +164,7 @@ async def watch_check(message: Message, bot: Bot):
     if not text:
         return
 
-    admins_words = await asyncio.to_thread(db.get_all_watch_words, chat_id)
+    admins_words = await adb(db.get_all_watch_words(chat_id))
     if not admins_words:
         return
 
@@ -183,7 +183,7 @@ async def watch_check(message: Message, bot: Bot):
                     else:
                         msg_link = None
 
-                    mode = await asyncio.to_thread(db.get_watch_mode, chat_id, admin_id)
+                    mode = await adb(db.get_watch_mode(chat_id, admin_id))
 
                     if mode == "copy":
                         match_text = text[:300] + ("..." if len(text) > 300 else "")

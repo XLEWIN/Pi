@@ -236,3 +236,8 @@ __marimo__/
 _o.txt
 _e.txt
 temp_profiles/
+
+# Pre-migration checkpoints. Redundant since the migration itself is
+# committed (HEAD already holds the pre-async code), so they are kept on
+# disk only - not in git.
+_backup/

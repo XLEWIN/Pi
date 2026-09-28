@@ -12,7 +12,6 @@ from datetime import datetime
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.enums import UpdateType
 from aiogram.client.default import DefaultBotProperties
 
 from bot import pipeline
@@ -59,7 +58,7 @@ async def _flush() -> None:
     """post_shutdown parity — persist write-behind buffers on exit."""
     try:
         from bot.database import db
-        await asyncio.to_thread(db.flush_buffers)
+        await db.flush_buffers()
     except Exception as e:
         logger.warning(f"final buffer flush failed: {e}")
     try:
@@ -144,9 +143,20 @@ def main() -> None:
     json_kind = "orjson" if hooks else "json (stdlib)"
 
     # Regular Bot API HTTP timeouts (sendMessage, etc.).
+    #
+    # `timeout` is the per-request budget for everything EXCEPT getUpdates:
+    # aiogram's start_polling overrides it for getUpdates with
+    # `int(session.timeout + polling_timeout)` (dispatcher.py), i.e.
+    # 30 + 30 = 60s, so a long poll never trips its own client timeout.
+    # Leave both alone — raising `timeout` also slows down failure
+    # detection on real API calls.
+    #
+    # `limit` is the aiohttp connector cap (aiogram default 100). It was
+    # pinned at 20, which serialized concurrent API calls behind the one
+    # connection getUpdates holds open for the whole 30s long poll.
     bot = Bot(
         token=settings.bot_token,
-        session=AiohttpSession(timeout=30.0, limit=20, **hooks),
+        session=AiohttpSession(timeout=30.0, limit=100, **hooks),
         default=DefaultBotProperties(parse_mode=None),
     )
     dp = Dispatcher()
@@ -195,6 +205,13 @@ def main() -> None:
                 on_stop=lambda: sigterm.__setitem__("hit", True),
             )
 
+            # Bind Motor to THIS loop and build the indexes before any
+            # handler can run.  Startup is deliberately not boxed (see
+            # async_bridge._Facade._UNBOXED): boxing it would hand it to
+            # the private executor loop and Motor would be bound there
+            # for the life of the process.
+            await db.startup()
+
             me = await bot.get_me()
             pipeline.BOT_DATA["username"] = me.username
             pipeline.BOT_DATA["name"] = me.full_name
@@ -217,9 +234,26 @@ def main() -> None:
             # backlog and detach any webhook before long-polling.
             await bot.delete_webhook(drop_pending_updates=True)
 
+            # Subscribe only to update types that actually have handlers.
+            # `UpdateType` has 27 members; 22 of them (message_reaction,
+            # message_reaction_count, edited_message, channel_post, poll,
+            # business_*, inline_query, chat_boost, ...) were being
+            # requested with no observer registered anywhere — pure
+            # payload + JSON-parse cost on every getUpdates for updates
+            # that were immediately discarded.
+            #
+            # Derived from the registration queue so this can't drift
+            # when a module is added. chat_member is opt-in only: Telegram
+            # never delivers it unless allowed_updates lists it, so an
+            # unspecified setting would silently kill the tagging
+            # membership observers.
+            used_updates = sorted({e.event for e in pipeline.entries()})
+            if not used_updates:
+                used_updates = ["message"]
+
             await dp.start_polling(
                 bot,
-                allowed_updates=[t.value for t in UpdateType],
+                allowed_updates=used_updates,
                 polling_timeout=30,
             )
         except asyncio.CancelledError:

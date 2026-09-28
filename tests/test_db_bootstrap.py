@@ -21,7 +21,14 @@ from pathlib import Path
 from unittest import mock
 
 import bot.database as bdb
+from bot.async_bridge import run_sync
 from bot.database import db
+
+# ``_ensure_indexes`` / ``_log_snapshot`` became coroutines when the
+# Mongo layer went async.  They are internal, so these tests drive them
+# through the bridge rather than through the ``db`` facade.
+_ensure_indexes = lambda inst: run_sync(inst._ensure_indexes())  # noqa: E731
+_log_snapshot = lambda inst: run_sync(inst._log_snapshot())       # noqa: E731
 
 
 class TestResolveUri(unittest.TestCase):
@@ -101,10 +108,10 @@ class TestEnsureIndexes(unittest.TestCase):
     def test_index_creation_logs_no_warnings(self):
         # regression: dict-form keys → mongomock TypeError on every boot
         with self.assertNoLogs(logger="phi", level=logging.WARNING):
-            self.fresh._ensure_indexes()
+            _ensure_indexes(self.fresh)
 
     def test_expected_indexes_exist_and_are_unique(self):
-        self.fresh._ensure_indexes()
+        _ensure_indexes(self.fresh)
         users = self.fresh._mongo["users"].index_information()
         self.assertIn("user_id_1", users)
         self.assertTrue(
@@ -149,7 +156,7 @@ class TestBootSnapshot(unittest.TestCase):
         inst = bdb.Database()
         self.assertIn("mongomock", inst.backend)
         with self.assertNoLogs(logger="phi", level=logging.INFO):
-            inst._log_snapshot()
+            _log_snapshot(inst)
 
     def test_snapshot_logs_counts(self):
         inst = self._prod_instance()
@@ -157,7 +164,7 @@ class TestBootSnapshot(unittest.TestCase):
             {"users": 5, "groups": 2, "daily_messages": 100}
         )
         with self.assertLogs("phi", logging.INFO) as cm:
-            inst._log_snapshot()
+            _log_snapshot(inst)
         joined = "\n".join(cm.output)
         self.assertIn("users=5", joined)
         self.assertIn("groups=2", joined)
@@ -168,7 +175,7 @@ class TestBootSnapshot(unittest.TestCase):
         inst = self._prod_instance()
         inst._real_mongo = self._FakeMongo({})
         with self.assertLogs("phi", logging.WARNING) as cm:
-            inst._log_snapshot()
+            _log_snapshot(inst)
         joined = "\n".join(cm.output)
         self.assertIn("EMPTY", joined)
         self.assertIn("MONGO_URI", joined)
@@ -182,7 +189,7 @@ class TestBootSnapshot(unittest.TestCase):
 
         inst._real_mongo = _Boom()
         with self.assertLogs("phi", logging.WARNING) as cm:
-            inst._log_snapshot()  # must not raise
+            _log_snapshot(inst)  # must not raise
         self.assertIn("snapshot failed", "\n".join(cm.output))
 
 

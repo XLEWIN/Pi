@@ -4,6 +4,7 @@ Works in groups only. Requires admin permissions.
 Success replies use bot.responses action cards (Pi emoji set).
 """
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
@@ -302,6 +303,23 @@ async def reset_all_warnings(chat_id: int) -> int:
     return 0
 
 
+def _record_moderation_action(chat_id: int, user_id: int, kind: str) -> None:
+    """Blocking Mongo counter writes (mod-actions + reputation event).
+
+    MUST be called as ``await asyncio.to_thread(_record_moderation_action, ...)`` —
+    ``bot.database`` is synchronous and must never run on the event loop.
+    """
+    from bot.database import db as _pdb
+    _pdb.bump_mod_actions(chat_id, 1)
+    _pdb.record_reputation_event(user_id, kind, 1)
+
+
+def _record_reputation(user_id: int, kind: str, amount: int) -> None:
+    """Blocking Mongo reputation write — MUST run inside ``asyncio.to_thread``."""
+    from bot.database import db as _pdb
+    _pdb.record_reputation_event(user_id, kind, amount)
+
+
 async def execute_action(
     message: Message,
     bot: Bot,
@@ -487,10 +505,10 @@ async def mute_command(message: Message, bot: Bot, args: list):
     )
     if ok:
         try:
-            from bot.database import db as _pdb
             chat_id = message.chat.id
-            _pdb.bump_mod_actions(chat_id, 1)
-            _pdb.record_reputation_event(target_user.id, "restriction", 1)
+            await asyncio.to_thread(
+                _record_moderation_action, chat_id, target_user.id, "restriction"
+            )
         except Exception:
             pass
     card_text = moderation_card(
@@ -803,10 +821,10 @@ async def ban_command(message: Message, bot: Bot, args: list):
     )
     if ok:
         try:
-            from bot.database import db as _pdb
             chat_id = message.chat.id
-            _pdb.bump_mod_actions(chat_id, 1)
-            _pdb.record_reputation_event(target_user.id, "restriction", 1)
+            await asyncio.to_thread(
+                _record_moderation_action, chat_id, target_user.id, "restriction"
+            )
         except Exception:
             pass
     card_text = moderation_card(
@@ -1101,10 +1119,10 @@ async def kick_command(message: Message, bot: Bot, args: list):
     )
     if ok:
         try:
-            from bot.database import db as _pdb
             chat_id = message.chat.id
-            _pdb.bump_mod_actions(chat_id, 1)
-            _pdb.record_reputation_event(target_user.id, "restriction", 1)
+            await asyncio.to_thread(
+                _record_moderation_action, chat_id, target_user.id, "restriction"
+            )
         except Exception:
             pass
     card_text = moderation_card(
@@ -1256,9 +1274,9 @@ async def warn_command(message: Message, bot: Bot, args: list):
 
     warning_count = await add_warning(chat_id, target_user.id, reason)
     try:
-        from bot.database import db as _pdb
-        _pdb.bump_mod_actions(chat_id, 1)
-        _pdb.record_reputation_event(target_user.id, "warning", 1)
+        await asyncio.to_thread(
+            _record_moderation_action, chat_id, target_user.id, "warning"
+        )
     except Exception:
         pass
 
@@ -1341,9 +1359,9 @@ async def dwarn_command(message: Message, bot: Bot, args: list):
 
     warning_count = await add_warning(chat_id, target_user.id, reason)
     try:
-        from bot.database import db as _pdb
-        _pdb.bump_mod_actions(chat_id, 1)
-        _pdb.record_reputation_event(target_user.id, "warning", 1)
+        await asyncio.to_thread(
+            _record_moderation_action, chat_id, target_user.id, "warning"
+        )
     except Exception:
         pass
 
@@ -1409,9 +1427,9 @@ async def swarn_command(message: Message, bot: Bot, args: list):
 
     warning_count = await add_warning(chat_id, target_user.id, reason)
     try:
-        from bot.database import db as _pdb
-        _pdb.bump_mod_actions(chat_id, 1)
-        _pdb.record_reputation_event(target_user.id, "warning", 1)
+        await asyncio.to_thread(
+            _record_moderation_action, chat_id, target_user.id, "warning"
+        )
     except Exception:
         pass
 
@@ -1505,8 +1523,7 @@ async def rmwarn_command(message: Message, bot: Bot, args: list):
     if success:
         warnings = await get_warnings(chat_id, target_user.id)
         try:
-            from bot.database import db as _pdb
-            _pdb.record_reputation_event(target_user.id, "positive", 1)
+            await asyncio.to_thread(_record_reputation, target_user.id, "positive", 1)
         except Exception:
             pass
         card_text = action_card(
@@ -1558,8 +1575,7 @@ async def resetwarn_command(message: Message, bot: Bot, args: list):
 
     if count > 0:
         try:
-            from bot.database import db as _pdb
-            _pdb.record_reputation_event(target_user.id, "positive", count)
+            await asyncio.to_thread(_record_reputation, target_user.id, "positive", count)
         except Exception:
             pass
         card_text = action_card(
