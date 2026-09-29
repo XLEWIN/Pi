@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from bot.async_bridge import bind_loop, box, make_facade, run_sync
 from bot.mongo_async import AsyncCursor, open_backend
+from pymongo import ReturnDocument
 
 import atexit
 import asyncio
@@ -59,8 +60,12 @@ try:
 except OSError:
     DB_DIR = _LEGACY_DIR
 
-# Single-process id generator lock (the bot is one process; tests too).
-_SEQ_LOCK = threading.Lock()
+# NOTE: there is deliberately NO threading.Lock around id generation.
+# Holding a plain Lock across an ``await`` deadlocks the event loop:
+# coroutine A acquires it, yields at the I/O await, coroutine B runs on
+# the SAME thread and blocks forever in Lock.acquire() (plain Lock is
+# not reentrant) — the loop freezes and the whole bot goes unresponsive.
+# ``_next_id`` now relies on an atomic server-side $inc instead.
 
 # ── Perf layer (Database: read cache / write-behind buffers) ─────────
 # Read-cache entries live at most _CACHE_TTL seconds; writes invalidate
@@ -428,13 +433,25 @@ class Database:
         return self._clean(await self._mongo[name].find_one(flt or {}, **kwargs))
 
     async def _next_id(self, coll_name: str) -> int:
-        """AUTOINCREMENT replacement — monotonic per collection, in-process."""
-        with _SEQ_LOCK:
-            await self._mongo["counters"].update_one(
-                {"_id": coll_name}, {"$inc": {"seq": 1}}, upsert=True
-            )
-            doc = await self._mongo["counters"].find_one({"_id": coll_name})
-            return int(doc["seq"]) if doc else 1
+        """AUTOINCREMENT replacement — monotonic per collection, in-process.
+
+        One atomic server-side ``$inc`` returning the inserted value.
+        This must NEVER hold a threading.Lock across an ``await``: a
+        second coroutine entering the plain, non-reentrant Lock while
+        the first is mid-I/O blocks the very thread the event loop runs
+        on — a same-thread self-deadlock that freezes the whole bot and
+        makes every queued ``run_sync`` call die 60s later with an empty
+        TimeoutError (``… failed: `` with nothing after the colon).
+        Server-side atomicity makes the lock unnecessary: each ``$inc``
+        yields its own distinct sequence value.
+        """
+        doc = await self._mongo["counters"].find_one_and_update(
+            {"_id": coll_name},
+            {"$inc": {"seq": 1}},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        return int(doc["seq"]) if doc else 1
 
     @staticmethod
     def _now() -> str:
