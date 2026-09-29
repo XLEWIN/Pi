@@ -13,6 +13,7 @@ from datetime import datetime
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramRetryAfter
 
 from bot import pipeline
 from bot.config import settings
@@ -66,6 +67,37 @@ async def _flush() -> None:
         await asyncio.to_thread(activity_tracker.flush_now)
     except Exception as e:
         logger.warning(f"final activity flush failed: {e}")
+
+
+async def _drop_update_backlog(bot: Bot) -> int:
+    """Fetch-and-confirm every update Telegram queued while the bot was off.
+
+    Telegram holds undelivered updates for up to 24 hours — every command
+    sent during an outage sits in that queue — and only *confirms* an
+    update once getUpdates is called with an offset above its update_id.
+    Booting into the backlog answers a pile of old /commands in one burst
+    and trips Telegram's flood limits.
+
+    Walks the queue in batches of 100 with ``timeout=0`` (short poll —
+    the real long-poll starts with ``start_polling`` right after) and
+    stops on the empty fetch that confirms the lot.  Returns how many
+    stale updates were dropped.
+    """
+    dropped = 0
+    offset = None
+    while True:
+        try:
+            batch = await bot.get_updates(offset=offset, limit=100, timeout=0)
+        except TelegramRetryAfter as e:
+            # Telegram caps how often getUpdates may be called; draining a
+            # huge backlog can hit that.  Wait out the penalty and retry
+            # the same offset — nothing is confirmed until it succeeds.
+            await asyncio.sleep(e.retry_after + 0.5)
+            continue
+        if not batch:
+            return dropped
+        dropped += len(batch)
+        offset = batch[-1].update_id + 1
 
 
 def _install_signal_handlers(loop, task, on_stop=None) -> None:  # noqa: ANN001
@@ -212,6 +244,24 @@ def main() -> None:
             # bind there for the life of the process.
             await db.startup()
 
+            # Everything Telegram queued while the bot was offline (it
+            # keeps undelivered updates for up to 24h) is dropped BEFORE
+            # polling: booting into that backlog replies to a pile of old
+            # /commands at once and trips Telegram's flood limits.  The
+            # documented deleteWebhook(drop_pending_updates=True) alone
+            # has not reliably cleared a polling backlog, so also
+            # fetch-and-confirm whatever is left — see _drop_update_backlog.
+            try:
+                await bot.delete_webhook(drop_pending_updates=True)
+                dropped = await _drop_update_backlog(bot)
+                if dropped:
+                    logger.info(
+                        f"Dropped {dropped} update(s) queued while the "
+                        "bot was offline"
+                    )
+            except Exception as e:
+                logger.warning(f"offline update backlog drop failed: {e}")
+
             me = await bot.get_me()
             pipeline.BOT_DATA["username"] = me.username
             pipeline.BOT_DATA["name"] = me.full_name
@@ -229,10 +279,6 @@ def main() -> None:
 
             # Fire-and-forget: start listening for updates immediately.
             asyncio.create_task(_startup_log(bot, me, privacy_on))
-
-            # PTB run_polling(drop_pending_updates=True) parity: clear the
-            # backlog and detach any webhook before long-polling.
-            await bot.delete_webhook(drop_pending_updates=True)
 
             # Subscribe only to update types that actually have handlers.
             # `UpdateType` has 27 members; 22 of them (message_reaction,
