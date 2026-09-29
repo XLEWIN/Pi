@@ -138,10 +138,13 @@ def select_format(
         if video_only and audio_only:
             video_only.sort(key=_prog_score, reverse=True)
             audio_only.sort(key=_audio_score, reverse=True)
-            v, a = video_only[0], audio_only[0]
-            est = estimate_bytes(v, duration) + estimate_bytes(a, duration)
-            if not max_bytes or not est or est <= max_bytes:
-                return FormatChoice(kind="merge", video=v, audio=a, est_bytes=est)
+            best_a = audio_only[0]
+            # Walk DOWN (4K → 1440 → 1080 → …) until the pair fits the
+            # cap — trying only the tallest pair gave up too early.
+            for v in video_only:
+                est = estimate_bytes(v, duration) + estimate_bytes(best_a, duration)
+                if not max_bytes or not est or est <= max_bytes:
+                    return FormatChoice(kind="merge", video=v, audio=best_a, est_bytes=est)
 
     # 3) Any progressive under the cap (size-guarded, smallest pass first).
     if progressive:
@@ -156,12 +159,25 @@ def select_format(
             kind="progressive", video=small, est_bytes=estimate_bytes(small, duration)
         )
 
-    # 4) Whatever the site gave us (downloader enforces the hard cap).
-    for f in sorted(usable, key=_prog_score, reverse=True):
-        if _has_video(f):
-            return FormatChoice(
-                kind="progressive", video=f, est_bytes=estimate_bytes(f, duration)
-            )
+    # 4) Whatever the site gave us. Honour the quality cap and size budget
+    #    first — never hand a 4K/225 MB stream to a 50 MB Telegram cap.
+    video_cands = [f for f in usable if _has_video(f)]
+    if video_cands:
+        def _fits(f: Dict[str, Any]) -> bool:
+            est = estimate_bytes(f, duration)
+            return not max_bytes or not est or est <= max_bytes
+
+        under_cap = [f for f in video_cands if int(f.get("height") or 0) <= cap]
+        pool = (
+            [f for f in under_cap if _fits(f)]      # cap + size OK
+            or [f for f in video_cands if _fits(f)]  # size OK (any height)
+            or under_cap                             # cap OK (unknown size)
+            or video_cands                           # last resort (old behaviour)
+        )
+        pool.sort(key=_prog_score, reverse=True)
+        return FormatChoice(
+            kind="progressive", video=pool[0], est_bytes=estimate_bytes(pool[0], duration)
+        )
     if usable:
         return FormatChoice(
             kind="progressive", video=usable[0], est_bytes=estimate_bytes(usable[0], duration)

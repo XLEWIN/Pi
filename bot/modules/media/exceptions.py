@@ -63,11 +63,13 @@ class IGRateLimited(IGError):
 
 class IGTooLarge(IGError):
     def __init__(self, size: int | None = None) -> None:
-        detail = f" ({size} bytes)" if size else ""
+        detail = f" ({size / (1024 * 1024):.0f} MB)" if size else ""
         super().__init__(
-            f"File is too large for Telegram{detail}.",
+            f"File is too large for Telegram{detail} — pick a smaller "
+            "quality in /mediasettings.",
             code="too_large",
         )
+        self.size = size
 
 
 class IGBusy(IGError):

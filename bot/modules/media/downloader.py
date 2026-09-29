@@ -149,6 +149,7 @@ def _get_http_client():
                 ig_config.read_timeout, connect=ig_config.connect_timeout
             ),
             limits=httpx.Limits(max_connections=10, max_keepalive_connections=10),
+            proxy=ig_config.proxy_url or None,
             headers={
                 "User-Agent": _UA,
                 "Accept": "*/*",
@@ -214,7 +215,9 @@ async def _http_download(
                 part = dest / f"media.{ext}.part"
                 total = 0
                 with part.open("wb") as fh:
-                    async for chunk in resp.aiter_bytes(64 * 1024):
+                    # 256 KiB chunks — fewer syscall round-trips than 64 KiB,
+                    # measurably faster on long CDN streams.
+                    async for chunk in resp.aiter_bytes(256 * 1024):
                         total += len(chunk)
                         if total > max_b:
                             fh.close()
@@ -249,7 +252,7 @@ async def _http_download(
 
 
 def _ydl_download_opts(dest: Path) -> dict:
-    return {
+    opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
@@ -267,6 +270,9 @@ def _ydl_download_opts(dest: Path) -> dict:
         "noprogress": True,
         "ignoreerrors": False,
     }
+    if ig_config.proxy_url:
+        opts["proxy"] = ig_config.proxy_url
+    return opts
 
 
 def _sanitize_filename(name: str) -> str:
@@ -354,8 +360,8 @@ async def _fetch_one(
     cap = max_bytes or ig_config.max_file_bytes
     size = asset.filesize
     if size and size > cap:
-        ig_log(f"skip oversized asset[{idx}] size={size}")
-        return []
+        ig_log(f"oversized asset[{idx}] size={size} > cap={cap}")
+        raise IGTooLarge(size)
 
     sub = dest / f"item_{idx}"
     sub.mkdir(parents=True, exist_ok=True)
@@ -366,7 +372,7 @@ async def _fetch_one(
             asset.url, sub, asset, platform=post.platform, max_bytes=cap
         )
     except IGTooLarge:
-        return []
+        raise
     except IGDownloadFailed:
         paths = None  # fall through to yt-dlp
 
@@ -374,7 +380,7 @@ async def _fetch_one(
         try:
             paths = await asyncio.to_thread(_download_sync, asset.url, sub)
         except IGTooLarge:
-            return []
+            raise
         except IGDownloadFailed:
             return []
 
@@ -435,10 +441,15 @@ async def download_post(
 
     results: List[DownloadedFile] = []
     errors = 0
+    too_large = 0
+    biggest = 0
     for batch in batches:
         if isinstance(batch, BaseException):
             ig_log(f"asset fetch error: {batch}")
             errors += 1
+            if isinstance(batch, IGTooLarge):
+                too_large += 1
+                biggest = max(biggest, getattr(batch, "size", 0) or 0)
             continue
         if not batch:
             errors += 1
@@ -446,6 +457,16 @@ async def download_post(
         results.extend(batch)
 
     if not results:
+        # Every asset blew the cap → say so precisely, not generically.
+        if too_large:
+            raise IGTooLarge(biggest or None)
+        raise IGDownloadFailed()
+
+    # A half-finished merge pair would upload a lone audio track — fail
+    # with the real reason instead of sending something nonsensical.
+    if post.needs_merge and len(post.assets) == 2 and len(results) < 2:
+        if too_large:
+            raise IGTooLarge(biggest or None)
         raise IGDownloadFailed()
 
     # Merge pass for split streams (video part + audio part → one MP4).

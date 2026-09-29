@@ -34,7 +34,7 @@ from .url_utils import (
 
 def base_ydl_opts() -> Dict[str, Any]:
     """Shared yt-dlp options for a single-entry, no-download extraction."""
-    return {
+    opts: Dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
@@ -46,6 +46,12 @@ def base_ydl_opts() -> Dict[str, Any]:
         "ignoreerrors": False,
         "nocheckcertificate": False,
     }
+    # Optional egress proxy — TikTok blocks many datacenter IPs outright.
+    from .config import ig_config as _cfg
+
+    if _cfg.proxy_url:
+        opts["proxy"] = _cfg.proxy_url
+    return opts
 
 
 def classify_ytdlp_error(e: Exception) -> IGError:
@@ -53,9 +59,17 @@ def classify_ytdlp_error(e: Exception) -> IGError:
     if isinstance(e, IGError):
         return e
     msg = str(e).lower()
-    if "age" in msg or "confirm your age" in msg or "sign in to confirm" in msg:
+    # Precise phrases only — a bare "age" also matches "p-a-g-e".
+    if (
+        "sign in to confirm" in msg
+        or "confirm your age" in msg
+        or "age-restricted" in msg
+        or "age restricted" in msg
+        or "age verification" in msg
+    ):
         return IGResolveFailed(
-            "This video needs sign-in — set YOUTUBE_COOKIES_FILE to download it."
+            "This media demands sign in (bot check) — cookies required "
+            "to bypass it."
         )
     if "private" in msg or "login" in msg or "signin" in msg:
         return IGPrivateMedia()

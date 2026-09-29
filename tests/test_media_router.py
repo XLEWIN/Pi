@@ -37,7 +37,11 @@ os.environ["LOCALAPPDATA"] = _TEST_DIR
 atexit.register(shutil.rmtree, _TEST_DIR, ignore_errors=True)
 
 # ── Imports (after env) ───────────────────────────────────────────
+from types import SimpleNamespace  # noqa: E402
+
+from aiofakes import FakeBot, call, make_callback  # noqa: E402
 from bot.modules.media.exceptions import IGInvalidUrl, IGPlaylist, IGResolveFailed  # noqa: E402
+from bot.modules.media.exceptions import IGPrivateMedia, IGTooLarge  # noqa: E402
 from bot.modules.media.formats import (  # noqa: E402
     estimate_bytes,
     quality_cap,
@@ -46,8 +50,12 @@ from bot.modules.media.formats import (  # noqa: E402
 from bot.modules.media.handlers import (  # noqa: E402
     _build_caption,
     _gate_allows,
+    _media_settings,
     _settings_card,
+    ig_callback,
 )
+from bot.modules.media.downloader import download_post  # noqa: E402
+from bot.modules.media.resolver import classify_ytdlp_error  # noqa: E402
 from bot.modules.media.keyboards import settings_keyboard  # noqa: E402
 from bot.modules.media.merge import merge_command  # noqa: E402
 from bot.modules.media.models import MediaAsset, MediaKind, PostType, ResolvedPost  # noqa: E402
@@ -765,6 +773,316 @@ class TestExhaustedError(unittest.TestCase):
         self.assertIs(yt_mod._exhausted_error(False, last), last)
         generic = yt_mod._exhausted_error(False, None)
         self.assertEqual(generic.code, "resolve")
+
+
+# ═════════════════════════════════════════════════════════════════
+# Regressions: oversize selection / chat_id crash / classify / proxy
+# ═════════════════════════════════════════════════════════════════
+
+_MB = 1024 * 1024
+
+
+class TestOversizeSelection(unittest.TestCase):
+    """The 225 MB/4K bug — every selection step must honour max_bytes."""
+
+    def test_merge_walks_down_when_tallest_pair_too_big(self):
+        fmts = [
+            {"format_id": "v4k", "url": "https://cdn/4k",
+             "vcodec": "av01", "acodec": "none", "height": 2160,
+             "width": 3840, "ext": "mp4", "protocol": "https",
+             "filesize": 600_000_000},
+            {"format_id": "v1080", "url": "https://cdn/1080",
+             "vcodec": "vp09", "acodec": "none", "height": 1080,
+             "width": 1920, "ext": "mp4", "protocol": "https",
+             "filesize": 40_000_000},
+            {"format_id": "a", "url": "https://cdn/a",
+             "vcodec": "none", "acodec": "mp4a", "ext": "m4a",
+             "protocol": "https", "filesize": 5_000_000},
+        ]
+        choice = select_format(
+            fmts, quality="best", max_bytes=50 * _MB, duration=600
+        )
+        self.assertEqual(choice.kind, "merge")
+        self.assertEqual(choice.video["height"], 1080)  # walked down from 4K
+        self.assertLessEqual(choice.est_bytes, 50 * _MB)
+
+    def test_step4_prefers_fitting_stream(self):
+        # DASH-only list, no audio stream → step 4 used to hand back the
+        # 4K/225 MB file no matter the cap.
+        fmts = [
+            {"format_id": "4k", "url": "https://cdn/4k",
+             "vcodec": "avc1", "acodec": "none", "height": 2160,
+             "width": 3840, "ext": "mp4", "protocol": "https",
+             "filesize": 225_000_000},
+            {"format_id": "1080", "url": "https://cdn/1080",
+             "vcodec": "avc1", "acodec": "none", "height": 1080,
+             "width": 1920, "ext": "mp4", "protocol": "https",
+             "filesize": 20_000_000},
+        ]
+        choice = select_format(
+            fmts, quality="auto", max_bytes=50 * _MB
+        )
+        self.assertEqual(choice.kind, "progressive")
+        self.assertEqual(choice.video["height"], 1080)
+
+    def test_step4_last_resort_when_nothing_fits(self):
+        # Unchanged old behaviour as a final fallback — the downloader's
+        # hard cap still rejects it with a clear IGTooLarge message.
+        fmts = [
+            {"format_id": "4k", "url": "https://cdn/4k",
+             "vcodec": "avc1", "acodec": "none", "height": 2160,
+             "width": 3840, "ext": "mp4", "protocol": "https",
+             "filesize": 600_000_000},
+        ]
+        choice = select_format(
+            fmts, quality="auto", max_bytes=50 * _MB
+        )
+        self.assertEqual(choice.video["height"], 2160)
+
+
+class TestClassifyErrors(unittest.TestCase):
+    def test_webpage_error_is_not_a_signin_error(self):
+        # Regression: "age" matched inside "p-age" → bogus cookies advice.
+        e = Exception(
+            "ERROR: [TikTok] 6718: Unexpected response from webpage "
+            "request; please report this issue on GitHub"
+        )
+        err = classify_ytdlp_error(e)
+        self.assertEqual(err.code, "resolve")
+        self.assertNotIn("sign in", err.user.lower())
+
+    def test_signin_detected_with_neutral_message(self):
+        e = Exception("ERROR: Sign in to confirm your age with this video")
+        err = classify_ytdlp_error(e)
+        self.assertIn("sign in", err.user.lower())
+        self.assertNotIn("YOUTUBE_COOKIES_FILE", err.user)
+
+    def test_age_restricted_detected(self):
+        e = Exception("ERROR: [youtube] x: age-restricted — confirmation required")
+        err = classify_ytdlp_error(e)
+        self.assertIn("sign in", err.user.lower())
+
+
+class TestTooLargeMessage(unittest.TestCase):
+    def test_stores_size_and_shows_mb(self):
+        e = IGTooLarge(225_562_129)
+        self.assertEqual(e.size, 225_562_129)
+        self.assertEqual(e.code, "too_large")
+        self.assertIn("215 MB", e.user)  # 225562129 B ≈ 215.1 MiB
+
+    def test_unknown_size_still_constructs(self):
+        e = IGTooLarge()
+        self.assertIsNone(e.size)
+        self.assertIn("too large", e.user.lower())
+
+
+class TestDownloadOversize(unittest.IsolatedAsyncioTestCase):
+    async def test_download_post_raises_too_large(self):
+        post = ResolvedPost(
+            canonical_url="https://youtu.be/oversize",
+            post_type=PostType.POST,
+            media_id="yt:oversize_regression",
+            platform="youtube",
+            assets=[
+                MediaAsset(
+                    url="https://rr1---sn-x.googlevideo.com/videoplayback?id=1",
+                    kind=MediaKind.VIDEO,
+                    height=2160,
+                    filesize=225_000_000,
+                )
+            ],
+        )
+        with self.assertRaises(IGTooLarge) as ctx:
+            await download_post(post, max_bytes=50 * _MB)
+        self.assertEqual(ctx.exception.size, 225_000_000)
+        # …and the card message names the size in MB, not raw bytes.
+        self.assertIn("215 MB", str(ctx.exception))
+
+
+class TestSettingsCallback(unittest.IsolatedAsyncioTestCase):
+    async def test_toggle_uses_chat_dot_id_not_chat_id(self):
+        # Regression: `query.message.chat_id` → AttributeError crash on
+        # every mediasettings button press.
+        bot = FakeBot()
+        bot.chat_members[(-100777001, 42)] = SimpleNamespace(
+            user=SimpleNamespace(id=42, is_bot=False, first_name="T"),
+            status="administrator",
+        )
+        cb = make_callback("ig:set:yt", chat_id=-100777001, user_id=42)
+        before = _media_settings(-100777001).get("yt_enabled")
+        await call(ig_callback, cb, bot=bot)
+        after = _media_settings(-100777001).get("yt_enabled")
+        self.assertNotEqual(before, after, "yt_enabled did not toggle")
+        # The settings card was re-rendered on the same message.
+        self.assertTrue(
+            any(c[0] == "edit_text" for c in cb.message.calls),
+            "settings card not edited after toggle",
+        )
+
+    async def test_inaccessible_message_returns_quietly(self):
+        # InaccessibleMessage has no .chat — must not raise.
+        cb = make_callback(
+            "ig:set:yt", message=SimpleNamespace(data="ig:set:yt")
+        )
+        await call(ig_callback, cb, bot=FakeBot())
+        # Only the initial bare ack — no "Admins only" alert, no toggle.
+        self.assertEqual(len(cb.answers), 1)
+        self.assertIsNone(cb.answers[0]["text"])
+
+
+class TestProxyWiring(unittest.TestCase):
+    def test_config_exposes_proxy_url(self):
+        from bot.modules.media.config import ig_config
+        self.assertTrue(hasattr(ig_config, "proxy_url"))
+        self.assertIsInstance(ig_config.proxy_url, str)
+
+    def test_resolver_opts_pick_up_proxy(self):
+        from bot.modules.media import config as cfg_mod
+        from bot.modules.media import resolver as res_mod
+        original = cfg_mod.ig_config
+        try:
+            cfg_mod.ig_config = dataclasses.replace(
+                original, proxy_url="http://127.0.0.1:9999"
+            )
+            self.assertEqual(
+                res_mod.base_ydl_opts().get("proxy"), "http://127.0.0.1:9999"
+            )
+            cfg_mod.ig_config = dataclasses.replace(original, proxy_url="")
+            self.assertNotIn("proxy", res_mod.base_ydl_opts())
+        finally:
+            cfg_mod.ig_config = original
+
+
+# ═════════════════════════════════════════════════════════════════
+# TikTok: yt-dlp → tikwm mirror fallback
+# ═════════════════════════════════════════════════════════════════
+
+_TIKWM_DATA = {
+    "id": "7312345678901234567",
+    "title": "Scramble up ur name",
+    "cover": "https://p16-tiktokcdn.com/cover.jpg",
+    "duration": 10,
+    "play": "https://v16m.tiktokcdn-us.com/abc/video.mp4",
+    "hdplay": None,
+    "size": 2953029,
+    "hd_size": None,
+    "author": {"unique_id": "scout2015"},
+}
+
+_TIKWM_URL = "https://www.tiktok.com/@scout2015/video/6718335390845095173"
+
+
+class TestTikwmBuilder(unittest.TestCase):
+    def test_video_post_plan(self):
+        from bot.modules.media.tiktok import _post_from_tikwm
+        post = _post_from_tikwm(dict(_TIKWM_DATA), _TIKWM_URL, "tiktok:x", 12)
+        self.assertEqual(post.platform, "tiktok")
+        self.assertEqual(post.resolver, "tikwm")
+        self.assertFalse(post.needs_merge)
+        self.assertEqual(post.uploader, "scout2015")
+        self.assertEqual(len(post.assets), 1)
+        a = post.assets[0]
+        self.assertEqual(a.kind, MediaKind.VIDEO)
+        self.assertEqual(a.filesize, 2953029)
+        self.assertTrue(host_allowed(a.url))  # tiktokcdn-us is allowlisted
+
+    def test_relative_play_url_prefixed(self):
+        from bot.modules.media.tiktok import _post_from_tikwm
+        data = dict(_TIKWM_DATA, play="/3797/vid.mp4", hdplay=None)
+        post = _post_from_tikwm(data, _TIKWM_URL, "tiktok:x", 5)
+        self.assertTrue(post.assets[0].url.startswith("https://www.tikwm.com/"))
+        self.assertTrue(host_allowed(post.assets[0].url))  # .tikwm.com suffix
+
+    def test_photo_carousel(self):
+        from bot.modules.media.tiktok import _post_from_tikwm
+        data = dict(_TIKWM_DATA, images=[
+            "https://p16-tiktokcdn.com/1.jpg",
+            "https://p16-tiktokcdn.com/2.jpg",
+            "https://p16-tiktokcdn.com/3.jpg",
+        ])
+        post = _post_from_tikwm(data, _TIKWM_URL, "tiktok:x", 5)
+        self.assertEqual(len(post.assets), 3)
+        self.assertTrue(all(a.kind == MediaKind.PHOTO for a in post.assets))
+
+    def test_blocked_host_rejected(self):
+        from bot.modules.media.tiktok import _post_from_tikwm
+        data = dict(_TIKWM_DATA, play="https://evil.example.com/x.mp4")
+        with self.assertRaises(IGResolveFailed):
+            _post_from_tikwm(data, _TIKWM_URL, "tiktok:x", 5)
+
+
+class TestTikTokFallback(unittest.IsolatedAsyncioTestCase):
+    async def test_mirror_rescues_blocked_ytdlp(self):
+        from bot.modules.media import tiktok as tk
+        from bot.modules.media.exceptions import IGResolveFailed as RF
+
+        orig_entry, orig_api = tk.extract_entry, tk._tikwm_api
+        tk.extract_entry = lambda *a, **k: (_ for _ in ()).throw(
+            RF("webpage request blocked")
+        )
+        tk._tikwm_api = lambda url: dict(_TIKWM_DATA)
+        try:
+            post = await tk.TikTokResolver().resolve(_TIKWM_URL)
+            self.assertEqual(post.resolver, "tikwm")
+            self.assertEqual(post.assets[0].kind, MediaKind.VIDEO)
+        finally:
+            tk.extract_entry, tk._tikwm_api = orig_entry, orig_api
+
+    async def test_original_error_when_both_fail(self):
+        from bot.modules.media import tiktok as tk
+        from bot.modules.media.exceptions import IGResolveFailed as RF
+
+        orig_entry, orig_api = tk.extract_entry, tk._tikwm_api
+        tk.extract_entry = lambda *a, **k: (_ for _ in ()).throw(
+            RF("yt boom")
+        )
+        tk._tikwm_api = lambda url: (_ for _ in ()).throw(
+            RuntimeError("api down")
+        )
+        try:
+            with self.assertRaises(RF) as ctx:
+                await tk.TikTokResolver().resolve(_TIKWM_URL)
+            self.assertIn("yt boom", str(ctx.exception))
+        finally:
+            tk.extract_entry, tk._tikwm_api = orig_entry, orig_api
+
+    async def test_private_media_not_sent_to_mirror(self):
+        from bot.modules.media import tiktok as tk
+
+        calls = []
+        orig_entry, orig_api = tk.extract_entry, tk._tikwm_api
+        tk.extract_entry = lambda *a, **k: (_ for _ in ()).throw(
+            IGPrivateMedia()
+        )
+        tk._tikwm_api = lambda url: calls.append(url)
+        try:
+            with self.assertRaises(IGPrivateMedia):
+                await tk.TikTokResolver().resolve(_TIKWM_URL)
+            self.assertEqual(calls, [], "mirror must not be called for private")
+        finally:
+            tk.extract_entry, tk._tikwm_api = orig_entry, orig_api
+
+    async def test_mirror_payload_used_end_to_end(self):
+        # Full happy path with only the network call stubbed.
+        from bot.modules.media import tiktok as tk
+
+        orig_entry, orig_api = tk.extract_entry, tk._tikwm_api
+
+        def _blocked(*a, **k):
+            raise IGResolveFailed("bot check")
+
+        tk.extract_entry = _blocked
+        tk._tikwm_api = lambda url: dict(
+            _TIKWM_DATA,
+            images=["https://p16-tiktokcdn.com/1.jpg",
+                    "https://p16-tiktokcdn.com/2.jpg"],
+        )
+        try:
+            post = await tk.TikTokResolver().resolve(_TIKWM_URL)
+            self.assertEqual(len(post.assets), 2)
+            self.assertEqual(post.media_id, "7312345678901234567")
+        finally:
+            tk.extract_entry, tk._tikwm_api = orig_entry, orig_api
 
 
 if __name__ == "__main__":

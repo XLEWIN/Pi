@@ -390,6 +390,8 @@ async def _run_job(
         try:
             try:
                 files = await download_post(post, job_dir, max_bytes=max_bytes)
+            except IGTooLarge:
+                raise  # size won't shrink on a re-resolve — skip the retry
             except Exception:
                 # CDN URLs may have expired (resolve cache) — refresh once.
                 invalidate_resolved(key)
@@ -822,7 +824,12 @@ async def ig_callback(callback_query: CallbackQuery, bot: Bot) -> None:
 
     if not query.message or not query.from_user:
         return
-    chat_id = query.message.chat_id
+    # aiogram: Message has no .chat_id (it's .chat.id); an
+    # InaccessibleMessage has no .chat at all — bail out instead of crash.
+    chat = getattr(query.message, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    if chat_id is None:
+        return
     if not await _member_is_admin(bot, chat_id, query.from_user.id):
         await query.answer("Admins only.", show_alert=True)
         return
@@ -855,6 +862,13 @@ async def ig_callback(callback_query: CallbackQuery, bot: Bot) -> None:
 
 async def _toggle_setting(chat_id: int, field: str) -> None:
     """Flip/cycle one /mediasettings field and persist it."""
+    # Callbacks use short names — map them to the row columns, otherwise
+    # the YouTube / TikTok / Delete buttons silently do nothing.
+    field = {
+        "yt": "yt_enabled",
+        "tt": "tt_enabled",
+        "delete": "delete_source",
+    }.get(field, field)
     st = await asyncio.to_thread(_media_settings, chat_id)
     flip = {"yt_enabled", "tt_enabled", "videos", "shorts", "delete_source", "progress"}
     if field in flip:

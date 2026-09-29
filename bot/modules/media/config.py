@@ -92,6 +92,7 @@ ALLOWED_MEDIA_HOST_SUFFIXES = (
     ".tiktokcdn.com",
     ".tiktokv.com",
     ".tiktokcdn-us.com",
+    ".tikwm.com",
     ".byteoversea.com",
     ".ibytedtos.com",
     ".googlevideo.com",
@@ -200,6 +201,9 @@ class IGConfig:
     max_active_uploads: int = max(1, _int("MEDIA_MAX_ACTIVE_UPLOADS", 4))
 
     # ── Network timeouts / retries ─────────────────────────────
+    # Optional egress proxy (e.g. "http://user:pass@host:port").
+    # TikTok rejects many datacenter IPs — route through this if so.
+    proxy_url: str = _str("MEDIA_PROXY_URL")
     connect_timeout: float = max(1.0, float(os.getenv("MEDIA_CONNECT_TIMEOUT", "10") or 10))
     read_timeout: float = max(1.0, float(os.getenv("MEDIA_READ_TIMEOUT", "30") or 30))
     download_timeout: float = max(10.0, float(os.getenv("MEDIA_DOWNLOAD_TIMEOUT", "300") or 300))

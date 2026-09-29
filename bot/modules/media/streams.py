@@ -257,6 +257,7 @@ def fetch_stream(video_id: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any], s
             client = httpx.Client(
                 timeout=per_request,
                 follow_redirects=True,
+                proxy=ig_config.proxy_url or None,
                 headers={"User-Agent": _UA, "Accept": "application/json"},
             )
         except Exception as e:  # pragma: no cover — client construction

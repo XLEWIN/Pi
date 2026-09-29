@@ -91,6 +91,12 @@ def normalize_url(raw: str) -> str:
     return urlunsplit(("https", canon_host, path, query, ""))
 
 
+# TikTok CDN hosts come in two shapes: subdomains (p16-sign.tiktokcdn.com)
+# and dashed apex-style (p16-tiktokcdn.com). Only p<number>- prefixed hosts
+# match, so faketiktokcdn.com never passes.
+_TT_CDN_RE = re.compile(r"^p\d+[-.].*tiktokcdn\.com$", re.I)
+
+
 def host_allowed(url: str) -> bool:
     """True if *url*'s host is on the allowlist (for any outbound fetch)."""
     try:
@@ -108,7 +114,9 @@ def host_allowed(url: str) -> bool:
         return True
     if any(host.endswith("." + dom) for dom in STREAM_MEDIA_DOMAINS):
         return True
-    return any(host.endswith(suf) for suf in ALLOWED_MEDIA_HOST_SUFFIXES)
+    if any(host.endswith(suf) for suf in ALLOWED_MEDIA_HOST_SUFFIXES):
+        return True
+    return bool(_TT_CDN_RE.match(host))
 
 
 def assert_media_host(url: str) -> None:
