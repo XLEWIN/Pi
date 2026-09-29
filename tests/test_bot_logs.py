@@ -225,5 +225,42 @@ class TestHandleBotMembership(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured, [])
 
 
+class TestNoUserJoinChannelLog(unittest.IsolatedAsyncioTestCase):
+    """register_user must NOT post joins to the log channel (owner request).
+
+    #BOT_ADDED / #BOT_REMOVED (own membership) and #Newuser (first
+    message) stay — only the per-member join log was removed.
+    """
+
+    async def test_register_user_sends_no_channel_log(self):
+        captured = []
+
+        async def fake_send_log(bot, message):
+            captured.append(message)
+
+        user = SimpleNamespace(
+            id=99, first_name="Joiner", last_name=None, full_name="Joiner",
+            username="joiner", is_bot=False,
+        )
+        # Patch the Database behind the _Facade (the facade has
+        # __slots__, so mock.patch can't delattr it) — register_user
+        # calls these positionally, so accept *args.
+        db_target = object.__getattribute__(um.db, "_target")
+        noop = lambda *a, **k: None  # noqa: E731 — DB work is not under test
+        with mock.patch.object(um, "send_log", fake_send_log), \
+                mock.patch.object(db_target, "add_user", noop), \
+                mock.patch.object(db_target, "add_group", noop), \
+                mock.patch.object(db_target, "add_group_member", noop), \
+                mock.patch.object(db_target, "update_user_activity", noop):
+            await um.register_user(
+                user, object(),
+                chat_id=-1001, chat_title="Test Group",
+                action="joined Test Group",
+            )
+            # let any (wrongly) created send_log task run
+            await asyncio.sleep(0.05)
+        self.assertEqual(captured, [])
+
+
 if __name__ == "__main__":
     unittest.main()

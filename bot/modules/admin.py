@@ -48,6 +48,21 @@ async def _is_owner(message: Message, bot: Bot) -> bool:
         return False
 
 
+async def _can_promote(message: Message, bot: Bot) -> bool:
+    """Creator always; administrators only with the add-admins right."""
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+    except Exception:
+        return False
+    if member.status == "creator":
+        return True
+    if member.status == "administrator":
+        return bool(getattr(member, "can_promote_members", False))
+    return False
+
+
 async def _is_bot_admin(message: Message, bot: Bot) -> bool:
     try:
         member = await bot.get_chat_member(message.chat.id, bot.id)
@@ -78,8 +93,8 @@ async def promote_command(message: Message, bot: Bot, args: list):
             parse_mode=ParseMode.HTML)
         return
 
-    if not await _is_owner(message, bot):
-        await reply_text(message, f"{E.ERROR} Only the group creator can promote admins.",
+    if not await _can_promote(message, bot):
+        await reply_text(message, f"{E.ERROR} Only admins with add admins permission can promote admins.",
             parse_mode=ParseMode.HTML)
         return
 

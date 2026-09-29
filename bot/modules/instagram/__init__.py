@@ -30,6 +30,24 @@ from .handlers import (
     igsettings_command,
     igstats_command,
 )
+from .url_utils import find_instagram_urls
+
+
+def _auto_detect(message) -> bool:
+    """True when non-command text/caption carries an Instagram URL.
+
+    Uses the SAME extractor the handler runs (find_instagram_urls) —
+    the old magic-filter regexp defaulted to match-at-start mode, so it
+    never fired on ``https://…`` / ``www.…`` links and auto-download was
+    dead unless the message literally began with ``instagram.com/``.
+    """
+    if message is None:
+        return False
+    return bool(find_instagram_urls(message.text or message.caption or ""))
+
+
+#: Module-level so tests can import the exact production filter.
+ig_filter = and_f(~COMMAND, F.func(_auto_detect))
 
 
 def setup() -> list[str]:
@@ -56,12 +74,8 @@ def setup() -> list[str]:
 
     # Auto-detect — dedicated high group so we never steal updates from
     # filters(1)/blocklist(2)/watchwords(3)/bind(4)/leveling(5)/…/analytics(13).
-    # Narrow filter: only non-command text that contains an Instagram host.
-    ig_filter = and_f(
-        F.text,
-        ~COMMAND,
-        F.text.regexp(re.compile(r"(?i)(instagram\.com|instagr\.am)/")),
-    )
+    # Narrow filter: only non-command text (or caption) containing an
+    # Instagram host with a path.
     on("message", auto_download_handler, group=HANDLER_GROUP, flt=ig_filter)
 
     logger.info(f"[IG] registered (auto group={HANDLER_GROUP})")

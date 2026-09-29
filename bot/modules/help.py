@@ -66,6 +66,14 @@ _CAPTION_SLACK = 16
 PAGE_SIZE = 9
 COLS = 3
 
+#: Grid layout (owner's table screenshot): every command line renders as
+#: ``<code>command padded</code>Description`` so descriptions start at one
+#: x position. Padding uses non-breaking spaces inside the code cell.
+_NBSP = "\u00A0"
+#: Command column cap — commands longer than this keep a single gap
+#: instead of being padded (they'd blow the row past the screen edge).
+GRID_COL_CAP = 30
+
 #: Callback data prefix (Forge uses ``_CB = "d"``).
 _CB = "help"
 
@@ -112,6 +120,47 @@ def _module(key: str) -> dict | None:
     return None
 
 
+# ── Grid rows (command | description columns) ────────────────────
+
+def _split_row(line: str) -> tuple[str, str]:
+    """``/cmd args — Description`` → ``("/cmd args", "Description")``."""
+    left, sep, right = line.partition(" — ")
+    if not sep:
+        return line, ""
+    return left, right
+
+
+def _cell(text: str, width: int) -> str:
+    """Pad *text* with NBSPs so every cell ends at *width* + 1.
+
+    The extra column is the gap between the code cell and the
+    description — without it, exact-width commands would run into their
+    descriptions while shorter ones keep a gap (one-column skew).
+    """
+    return text + _NBSP * max(width - _visible_len(text) + 1, 1)
+
+
+def _grid_row(left: str, right: str, width: int) -> str:
+    """One table row: padded command cell + description."""
+    row = f"<code>{_cell(left, width)}</code>"
+    return row + right if right else row
+
+
+def _module_width(mod: dict) -> int:
+    """Column width for a module — widest command cell, capped."""
+    lefts = [
+        _split_row(line)[0]
+        for _, cmds in mod["sections"]
+        for line in cmds
+    ]
+    return min(max((_visible_len(left) for left in lefts), default=0), GRID_COL_CAP)
+
+
+def _col_header(width: int) -> str:
+    """Bold column header row — the table's "Metric | Value" line."""
+    return f"<code>{_cell('Command', width)}</code><b>Description</b>"
+
+
 def _bot_username(bot: Bot, bot_data: dict) -> str:
     name = None
     try:
@@ -156,10 +205,15 @@ def _module_header(mod: dict, sub: int, total: int) -> list[str]:
 def _module_chunks(mod: dict) -> list[list[tuple[str | None, list[str]]]]:
     """Greedily pack sections (+ notes) so each page fits one caption.
 
-    Budget uses the widest possible header (worst-case page indicator),
-    so no rendered page can exceed CAPTION_LIMIT visible characters.
+    Budget uses the widest possible header (worst-case page indicator +
+    the grid column-header row), and command bodies are measured in
+    their RENDERED grid form, so no rendered page can exceed
+    CAPTION_LIMIT visible characters.
     """
+    width = _module_width(mod)
     worst_header = "\n".join(_module_header(mod, 99, 99))
+    if any(cmds for _, cmds in mod["sections"]):
+        worst_header += "\n" + _col_header(width)
     budget = CAPTION_LIMIT - _visible_len(worst_header) - _CAPTION_SLACK
 
     pages: list[list[tuple[str | None, list[str]]]] = [[]]
@@ -175,7 +229,8 @@ def _module_chunks(mod: dict) -> list[list[tuple[str | None, list[str]]]]:
         used += size
 
     for header, cmds in mod["sections"]:
-        push(header, list(cmds))
+        # Render now so budget == rendered size (NBSP padding counts).
+        push(header, [_grid_row(*_split_row(line), width) for line in cmds])
     if mod["notes"]:
         push(None, list(mod["notes"]))
     return pages
@@ -186,15 +241,20 @@ def _module_page_count(mod: dict) -> int:
 
 
 def _build_module_message(mod: dict, sub: int) -> str:
-    """Module page caption — one content sub-page at a time."""
+    """Module page caption — grid rows, one content sub-page at a time."""
     pages = _module_chunks(mod)
     total = len(pages)
     sub = max(0, min(sub, total - 1))
+    width = _module_width(mod)
     lines = _module_header(mod, sub + 1, total)
+    wrote_col_header = False
     for header, body in pages[sub]:
         lines.append("")
         if header:
             lines.append(f"<b>{escape(header)}</b>")
+        if body and body[0].startswith("<code>") and not wrote_col_header:
+            lines.append(_col_header(width))
+            wrote_col_header = True
         lines.extend(body)
     return "\n".join(lines)
 
@@ -212,10 +272,11 @@ def _build_start_message(username: str) -> str:
 # ── Keyboards (colored, Bot API 9.4+ styling) ────────────────────
 
 def main_menu_keyboard(page: int, *, icons: bool = True):
-    """Module grid (3 per row) + nav row + CLOSE/BACK rows.
+    """Module grid (3 per row) + nav row + CLOSE row.
 
     Labels are plain titles — the custom emoji icon already shows, a
-    literal emoji in the text would duplicate it.
+    literal emoji in the text would duplicate it.  No BACK row: the
+    owner asked for it to be removed (CLOSE dismisses the menu).
     """
     page = _clamp_page(page)
     chunk = HELP_MENU[page * PAGE_SIZE : (page + 1) * PAGE_SIZE]
@@ -248,7 +309,6 @@ def main_menu_keyboard(page: int, *, icons: bool = True):
             )
         ]
     )
-    rows.append([btn_primary("BACK", f"{_CB}:start")])
     return build_keyboard(rows)
 
 
@@ -280,13 +340,13 @@ def module_keyboard(key: str, menu_page: int, sub: int, *, icons: bool = True):
 
 
 def _dm_keyboard(username: str, *, icons: bool = True):
-    """Single deep-link row for the group redirect."""
+    """Single deep-link row for the group redirect — opens /help in the DM."""
     return build_keyboard(
         [
             [
                 btn_url(
                     "Open in DM",
-                    f"https://t.me/{username}",
+                    f"https://t.me/{username}?start=help",
                     icon_emoji_id=EID.USER if icons else None,
                 )
             ]

@@ -24,7 +24,9 @@ passes only the deps each real signature declares.
 from __future__ import annotations
 
 import atexit
+import asyncio
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -321,6 +323,51 @@ class TestModulePagination(unittest.TestCase):
 
 
 # ═════════════════════════════════════════════════════════════════
+# Grid layout — command | description columns (owner's table screenshot)
+# ═════════════════════════════════════════════════════════════════
+
+class TestGridLayout(unittest.TestCase):
+    def _text(self, key: str = "general") -> str:
+        return help_mod._build_module_message(help_mod._module(key), 0)
+
+    def test_rows_are_code_cells(self):
+        text = self._text()
+        self.assertIn("<code>/start", text)
+        self.assertIn("<code>/help", text)
+        self.assertIn("\u00a0", text)  # NBSP padding in the command column
+        self.assertIn("<b>Description</b>", text)  # table header row
+
+    def test_split_row_on_em_dash(self):
+        left, right = help_mod._split_row("/ping — API latency + uptime")
+        self.assertEqual(left, "/ping")
+        self.assertEqual(right, "API latency + uptime")
+
+    def test_cells_share_one_width(self):
+        text = self._text()
+        # Every cell ends at module width + 1 (the +1 is the gap column).
+        expect = help_mod._module_width(help_mod._module("general")) + 1
+        cells = re.findall(r"<code>(.*?)</code>", text)
+        self.assertTrue(cells)
+        for cell in cells:
+            self.assertEqual(help_mod._visible_len(cell), expect, cell)
+
+    def test_description_follows_the_cell(self):
+        text = self._text()
+        self.assertIn("</code>Open the main menu", text)
+
+    def test_every_page_still_fits_the_limit(self):
+        for mod in HELP_MENU:
+            for sub in range(help_mod._module_page_count(mod)):
+                with self.subTest(key=mod["key"], sub=sub):
+                    self.assertLessEqual(
+                        help_mod._visible_len(
+                            help_mod._build_module_message(mod, sub)
+                        ),
+                        help_mod.CAPTION_LIMIT,
+                    )
+
+
+# ═════════════════════════════════════════════════════════════════
 # /help in groups → DM redirect (still one message, no media)
 # ═════════════════════════════════════════════════════════════════
 
@@ -335,7 +382,7 @@ class TestGroupRedirect(unittest.IsolatedAsyncioTestCase):
         self.assertIn("DM", reply["text"])
         buttons = _flat(reply["markup"])
         self.assertEqual(len(buttons), 1)
-        self.assertEqual(buttons[0].url, f"https://t.me/{BOT_USERNAME}")
+        self.assertEqual(buttons[0].url, f"https://t.me/{BOT_USERNAME}?start=help")
 
     async def test_brand_emoji_failure_falls_back_to_plain(self):
         msg = _cmd_msg("supergroup", message=_BrandFailsMessage())
@@ -343,7 +390,7 @@ class TestGroupRedirect(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(msg.replies), 1)  # exactly one message sent
         self.assertNotIn("<tg-emoji", msg.last["text"])
         buttons = _flat(msg.last["markup"])
-        self.assertEqual(buttons[0].url, f"https://t.me/{BOT_USERNAME}")
+        self.assertEqual(buttons[0].url, f"https://t.me/{BOT_USERNAME}?start=help")
 
     async def test_private_menu_has_no_dm_button(self):
         msg = _cmd_msg("private")
@@ -409,15 +456,18 @@ class TestPrivateMenu(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(nav[0].text, ">")
         self.assertEqual(nav[0].callback_data, "help:main:1")
 
-    def test_close_and_back_rows(self):
+    def test_close_row_and_no_back(self):
+        # Owner removed the BACK row — CLOSE is the last row.
         rows = self.msg["markup"].inline_keyboard
-        close_btn, back_btn = rows[4][0], rows[5][0]
+        self.assertEqual(len(rows), 5)  # 3 grid + nav + close
+        close_btn = rows[4][0]
         self.assertEqual(close_btn.text, "CLOSE")
         self.assertEqual(close_btn.callback_data, "help:close")
         self.assertEqual(_style(close_btn), "danger")
-        self.assertEqual(back_btn.text, "BACK")
-        self.assertEqual(back_btn.callback_data, "help:start")
-        self.assertEqual(_style(back_btn), "primary")
+        self.assertFalse(
+            any(getattr(b, "callback_data", None) == "help:start"
+                for b in _flat(self.msg["markup"]))
+        )
 
     def test_module_icons_present(self):
         first = self.msg["markup"].inline_keyboard[0][0]
@@ -616,6 +666,34 @@ class TestStartHelpLoop(unittest.IsolatedAsyncioTestCase):
         await _run(start_mod.start_callback, cb.callback_query)
         self.assertEqual(cb.callback_query.edits, [])
         self.assertEqual(cb.callback_query.answers[0]["text"], "Coming soon!")
+
+    async def test_start_help_arg_opens_menu(self):
+        # ?start=help deep link (group /help button) → menu, not start screen.
+        msg = _cmd_msg("private")
+        await call(
+            start_mod.start_command, msg,
+            bot=_FakeBot(),
+            bot_data={"username": BOT_USERNAME},
+            args=["help"],
+        )
+        self.assertEqual(len(msg.replies), 1)
+        self.assertIn("Help Menu", msg.last["text"])
+        self.assertIsNotNone(
+            _by_data(msg.last["markup"], f"help:open:{HELP_MENU[0]['key']}:0:0")
+        )
+        await asyncio.sleep(0.01)  # command message delete is spawned
+        self.assertTrue(msg.deleted)
+
+    async def test_start_without_help_arg_keeps_start_screen(self):
+        msg = _cmd_msg("private")
+        await call(
+            start_mod.start_command, msg,
+            bot=_FakeBot(),
+            bot_data={"username": BOT_USERNAME},
+            args=[],
+        )
+        self.assertEqual(len(msg.replies), 1)
+        self.assertIn(BOT_DESCRIPTION, msg.last["text"])
 
 
 if __name__ == "__main__":

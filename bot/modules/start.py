@@ -219,10 +219,21 @@ async def _finish_start(bot: Bot, user, chat) -> None:
         await send_log(bot, format_user_log(user, "started the bot (DM)"))
 
 
-async def start_command(message: Message, bot: Bot, bot_data: dict) -> None:
-    """Handle /start — one reply first; DB + log only after that."""
+async def start_command(message: Message, bot: Bot, bot_data: dict, args: list) -> None:
+    """Handle /start — one reply first; DB + log only after that.
+
+    ``/start help`` (the group menu's ``?start=help`` deep link) opens the
+    interactive help menu instead of the start screen.
+    """
     user = message.from_user
     chat = message.chat
+
+    if args and str(args[0]).lower() == "help":
+        from bot.modules.help import help_command
+
+        await help_command(message, bot, bot_data)
+        _spawn(_safe_delete(message))
+        return
 
     username = bot_data.get("username", "Phi π")
     text = START_TEXT.format(

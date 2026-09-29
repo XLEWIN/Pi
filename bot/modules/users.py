@@ -17,7 +17,7 @@ from aiogram.types import CallbackQuery, ChatMemberUpdated, Message, User
 
 from bot.command_handler import COMMAND
 from bot.database import db
-from bot.modules.start import send_log, format_user_log
+from bot.modules.start import send_log
 from bot.emojis import E, EID, custom_emoji
 from bot.keyboards.colored import btn_danger, btn_primary, build_keyboard
 from bot.pipeline import on, cmd
@@ -38,11 +38,13 @@ def get_user_display(user: User) -> str:
 async def register_user(user: User, bot: Bot,
                         chat_id: int = None, chat_title: str = None,
                         action: str = "joined"):
-    """Register a user and log the activity (never blocks the caller for long)."""
+    """Register a user (never blocks the caller for long).
+
+    No log-channel post here — join/leave activity stays in the DB
+    only (the owner asked for the channel logs to stop).
+    """
     if user.is_bot:
         return
-
-    log_message = format_user_log(user, action, chat_title)
 
     def _db_work() -> None:
         try:
@@ -67,8 +69,6 @@ async def register_user(user: User, bot: Bot,
 
     # Off the event loop so join events cannot stall command replies.
     asyncio.get_running_loop().run_in_executor(None, _db_work)
-    # Soft log — timeout + HTML-safe payload already inside send_log/format_user_log.
-    asyncio.create_task(send_log(bot, log_message))
     logger.info(f"User {user.id} ({get_user_display(user)}) {action}")
 
 
