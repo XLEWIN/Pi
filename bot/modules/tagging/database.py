@@ -14,6 +14,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from bot.async_bridge import run_sync
 from bot.database import db as _db
 from bot.logger import logger
 
@@ -25,17 +26,31 @@ def now() -> float:
 # ── Schema ────────────────────────────────────────────────
 
 def ensure_tables() -> None:
-    """Create tagging indexes if missing. Safe to call once at setup()."""
+    """Queue tagging index creation for ``db.startup()`` (the bot loop).
+
+    ``setup()`` runs at import time, before any event loop exists —
+    calling ``create_index`` there produced un-awaited coroutines (the
+    indexes were never actually built).  See ``Database.defer``.
+    """
+    _db.defer(_ensure_tables)
+
+
+async def _ensure_tables() -> None:
+    """Create tagging indexes if missing (runs during ``db.startup()``)."""
     try:
-        _db.collection("tag_settings").create_index("chat_id", unique=True)
-        _db.collection("tag_members").create_index(
+        await _db.collection("tag_settings").create_index("chat_id", unique=True)
+        await _db.collection("tag_members").create_index(
             [("chat_id", 1), ("user_id", 1)], unique=True
         )
-        _db.collection("tag_members").create_index([("chat_id", 1), ("left_at", 1)])
-        _db.collection("tag_activity").create_index(
+        await _db.collection("tag_members").create_index(
+            [("chat_id", 1), ("left_at", 1)]
+        )
+        await _db.collection("tag_activity").create_index(
             [("chat_id", 1), ("user_id", 1)], unique=True
         )
-        _db.collection("tag_sessions").create_index([("chat_id", 1), ("started_at", -1)])
+        await _db.collection("tag_sessions").create_index(
+            [("chat_id", 1), ("started_at", -1)]
+        )
         logger.info("Tagging indexes created/verified")
     except Exception as e:
         logger.error(f"Tagging index creation failed: {e}")
@@ -47,7 +62,22 @@ def mark_interrupted() -> int:
     Never auto-resumes: a restart must not surprise the chat with a
     resumed mass tag.
     """
-    res = _db.collection("tag_sessions").update_many(
+    return run_sync(_mark_interrupted())
+
+
+def defer_interrupted() -> None:
+    """Queue :func:`mark_interrupted` for ``db.startup()`` (the bot loop).
+
+    ``setup()`` runs at import time: performing the write there binds
+    the async client to a throw-away inline loop, and startup()'s ping
+    on the bot loop then dies with ``Cannot use AsyncMongoClient in
+    different event loop``.
+    """
+    _db.defer(_mark_interrupted)
+
+
+async def _mark_interrupted() -> int:
+    res = await _db.collection("tag_sessions").update_many(
         {"status": "running"},
         {"$set": {"status": "interrupted", "finished_at": now()}},
     )

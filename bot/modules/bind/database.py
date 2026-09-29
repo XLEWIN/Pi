@@ -44,18 +44,30 @@ _INT_COLS = (
 
 
 def ensure_tables() -> None:
-    """Create bind indexes if missing. Safe to call once at setup()."""
+    """Queue bind index creation for ``db.startup()`` (the bot loop).
+
+    ``setup()`` runs at import time, before any event loop exists —
+    calling ``create_index`` there produced un-awaited coroutines (the
+    indexes were never actually built) and risked binding the async
+    client to a throw-away loop.  ``Database.defer`` runs it on the bot
+    loop instead.
+    """
+    _db.defer(_ensure_tables)
+
+
+async def _ensure_tables() -> None:
+    """Create bind indexes if missing (runs during ``db.startup()``)."""
     try:
-        _db.collection("bind_settings").create_index("chat_id", unique=True)
+        await _db.collection("bind_settings").create_index("chat_id", unique=True)
         # One channel ↔ one group (sparse: rows without a channel skip it).
-        _db.collection("bind_settings").create_index(
+        await _db.collection("bind_settings").create_index(
             "channel_id", unique=True, sparse=True
         )
-        _db.collection("bind_user_joins").create_index(
+        await _db.collection("bind_user_joins").create_index(
             [("chat_id", 1), ("user_id", 1)], unique=True
         )
-        _db.collection("bind_warnings").create_index("message_id")
-        _db.collection("bind_warnings").create_index("chat_id")
+        await _db.collection("bind_warnings").create_index("message_id")
+        await _db.collection("bind_warnings").create_index("chat_id")
         logger.info("Bind indexes created/verified")
     except Exception as e:
         logger.error(f"Bind index creation failed: {e}")

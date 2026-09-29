@@ -264,6 +264,14 @@ def main() -> None:
             logger.info("SIGTERM received — flushing before exit")
         finally:
             await _flush()
+            # Close the async client while its loop is still alive: the
+            # client's background tasks (server monitor, RTT sampler)
+            # would otherwise outlive asyncio.run and spam
+            # "Task was destroyed but it is pending!" on every deploy.
+            try:
+                await db.shutdown()
+            except Exception:
+                pass
             try:
                 await bot.session.close()
             except Exception:

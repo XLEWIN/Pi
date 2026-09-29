@@ -276,6 +276,13 @@ class Database:
         self._real_mongo = self._mongo
         self._mongo = _MongoProxy(self, self._mongo)
         atexit.register(self._atexit_flush)
+        # Boot work queued by module setup() hooks (index creation,
+        # crash recovery).  They run at import time — before any event
+        # loop exists — and touching the async client there binds it to
+        # a throw-away inline loop, so startup()'s ping on the bot loop
+        # would die with "Cannot use AsyncMongoClient in different event
+        # loop".  Drained by _drain_deferred() inside startup().
+        self._deferred: List[Any] = []
 
         if self._is_test:
             # mongomock is in-memory and loop-agnostic, so the test
@@ -298,8 +305,59 @@ class Database:
             # Fail fast on a bad URI / unreachable cluster.
             await self._client.admin.command("ping")
         await self._ensure_indexes()
+        await self._drain_deferred()
         await self._log_snapshot()
         logger.info(f"Connected to database: {self.backend}")
+
+    def defer(self, fn) -> None:
+        """Queue a zero-arg boot callable (usually ``async def``).
+
+        Module ``setup()`` hooks call this instead of doing database
+        work directly: they run at import time, before any event loop
+        exists, and touching the async client there binds it to a
+        throw-away inline loop — startup()'s ping on the bot loop would
+        then fail with ``Cannot use AsyncMongoClient in different event
+        loop``.  Drained by :meth:`_drain_deferred` during startup().
+        """
+        self._deferred.append(fn)
+
+    async def _drain_deferred(self) -> None:
+        """Run every ``defer()`` queued so far — on the bot loop."""
+        pending, self._deferred = self._deferred, []
+        for fn in pending:
+            try:
+                res = fn()
+                if inspect.isawaitable(res):
+                    await res
+            except Exception as e:  # noqa: BLE001 — one bad hook must not block boot
+                logger.warning(
+                    f"deferred startup {getattr(fn, '__name__', fn)!r} failed: {e}"
+                )
+
+    async def shutdown(self) -> None:
+        """Flush buffers and close the async client cleanly.
+
+        Without the close the client's background tasks (server monitor,
+        RTT sampler) outlive ``asyncio.run`` and every deploy logs
+        ``Task was destroyed but it is pending!`` spam.  Called from
+        ``main.py``'s shutdown path while the bot loop is still alive.
+        """
+        try:
+            await self.flush_buffers()
+        except Exception:  # noqa: BLE001 — closing must not fail on flush
+            pass
+        self._flusher_stop.set()
+        closer = getattr(self._client, "aclose", None) or getattr(
+            self._client, "close", None
+        )
+        if closer is None:
+            return
+        try:
+            res = closer()
+            if inspect.isawaitable(res):
+                await res
+        except Exception as e:  # noqa: BLE001 — best-effort close
+            logger.warning(f"database close failed: {e}")
 
     # ── internals ────────────────────────────────────────
 

@@ -47,7 +47,7 @@ def setup() -> list[str]:
     """Register tagging commands, callbacks and activity observers."""
     try:
         tdb.ensure_tables()
-        tdb.mark_interrupted()  # crash recovery: never auto-resume
+        tdb.defer_interrupted()  # crash recovery: never auto-resume
     except Exception as e:
         logger.warning(f"Tagging table init failed: {e}")
 
