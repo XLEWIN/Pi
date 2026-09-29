@@ -25,6 +25,7 @@ class IGMetrics:
     direct_ok: int = 0
     direct_fallback: int = 0
     merges: int = 0
+    stream_hits: int = 0
     youtube_n: int = 0
     tiktok_n: int = 0
     instagram_n: int = 0
@@ -77,6 +78,7 @@ class IGMetrics:
                 "direct_ok": self.direct_ok,
                 "direct_fallback": self.direct_fallback,
                 "merges": self.merges,
+                "stream_hits": self.stream_hits,
                 "youtube_n": self.youtube_n,
                 "tiktok_n": self.tiktok_n,
                 "instagram_n": self.instagram_n,

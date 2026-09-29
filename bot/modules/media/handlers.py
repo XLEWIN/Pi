@@ -699,6 +699,7 @@ async def mediastats_command(message: Message, bot: Bot) -> None:
             (E.GLOBE, "Uploads", f"{snap['uploads']} ok / {snap['upload_fail']} fail"),
             (E.ARROW, "Direct URL", f"{snap['direct_ok']} ok / {snap['direct_fallback']} fallback"),
             (E.CIRCLE, "Merges", str(snap["merges"])),
+            (E.STAR, "Stream mirrors", str(snap["stream_hits"])),
             (E.NUMBER_1, "Auto triggers", str(snap["auto_triggers"])),
             (E.TIME, "Avg resolve", f"{snap['avg_resolve_ms']} ms"),
             (E.WARN, "Rate/busy rejects", f"{snap['rate_rejects']} / {snap['busy_rejects']}"),

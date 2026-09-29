@@ -6,7 +6,12 @@ import re
 from typing import Iterable, List, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from .config import ALLOWED_HOSTS, ALLOWED_MEDIA_HOST_SUFFIXES
+from .config import (
+    ALLOWED_HOSTS,
+    ALLOWED_MEDIA_HOST_SUFFIXES,
+    STREAM_MEDIA_DOMAINS,
+    STREAM_MEDIA_HOSTS,
+)
 from .exceptions import IGInvalidUrl
 from .models import PostType
 
@@ -95,6 +100,13 @@ def host_allowed(url: str) -> bool:
     if not host:
         return False
     if host in ALLOWED_HOSTS:
+        return True
+    # Stream-mirror instances (Piped/Invidious) and the media they
+    # proxy — proxied URLs often live on a sibling subdomain such as
+    # pipedproxy.<mirror-domain>.
+    if host in STREAM_MEDIA_HOSTS:
+        return True
+    if any(host.endswith("." + dom) for dom in STREAM_MEDIA_DOMAINS):
         return True
     return any(host.endswith(suf) for suf in ALLOWED_MEDIA_HOST_SUFFIXES)
 

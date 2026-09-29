@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Tuple
 
 
 def _int(key: str, default: int) -> int:
@@ -99,6 +100,45 @@ ALLOWED_MEDIA_HOST_SUFFIXES = (
     ".youtube.com",
 )
 
+# ── Direct stream mirrors (Piped / Invidious) ──────────────────────
+# Public mirrors that hand back the same googlevideo CDN stream URLs —
+# used when YouTube's player API demands a sign-in (bot check).  No API
+# key, cookies or PO token required: pure HTTPS GETs against hosts we
+# configure ourselves (SSRF-safe — only this list is ever contacted).
+# Override with MEDIA_STREAM_INSTANCES (comma-separated hosts);
+# MEDIA_STREAM_FALLBACK=0 disables the whole path.
+_STREAM_DEFAULT = (
+    "pipedapi.adminforge.de",
+    "pipedapi.ducks.party",
+    "api.piped.private.coffee",
+    "inv.nadeko.net",
+    "yewtu.be",
+    "invidious.nerdvpn.de",
+)
+
+
+def _stream_instances() -> Tuple[str, ...]:
+    raw = _str("MEDIA_STREAM_INSTANCES")
+    if not raw:
+        return _STREAM_DEFAULT
+    out = []
+    for h in raw.split(","):
+        h = h.strip().lower()
+        h = h.removeprefix("https://").removeprefix("http://")
+        h = h.split("/")[0].strip(".")
+        if h and "." in h and " " not in h:
+            out.append(h)
+    return tuple(out) or _STREAM_DEFAULT
+
+
+STREAM_INSTANCES = _stream_instances()
+# Exact hosts + registrable domains (last two labels): proxied media
+# often lives on a sibling subdomain such as pipedproxy.<domain>.
+STREAM_MEDIA_HOSTS = frozenset(STREAM_INSTANCES)
+STREAM_MEDIA_DOMAINS = frozenset(
+    ".".join(h.split(".")[-2:]) for h in STREAM_INSTANCES if h.count(".") >= 1
+)
+
 
 @dataclass(frozen=True)
 class IGConfig:
@@ -135,6 +175,14 @@ class IGConfig:
     # ── YouTube strategy knobs (optional — no defaults are secrets) ──
     youtube_po_token: str = _str("YOUTUBE_PO_TOKEN")
     youtube_cookies_file: str = _str("YOUTUBE_COOKIES_FILE")
+
+    # ── Direct stream mirrors (bypass YouTube's player API) ──────
+    # Tried after the sign-in-free player clients and before the
+    # operator's PO token / cookies opt-ins.
+    stream_fallback: bool = _bool("MEDIA_STREAM_FALLBACK", True)
+    stream_instances: Tuple[str, ...] = STREAM_INSTANCES
+    # Per-request timeout; the whole mirror phase is capped at 2× this.
+    stream_timeout: float = max(1.0, float(os.getenv("MEDIA_STREAM_TIMEOUT", "5") or 5))
 
     # ── Delivery ───────────────────────────────────────────────
     # Try Telegram-side HTTP fetch (sendVideo with URL) before downloading.

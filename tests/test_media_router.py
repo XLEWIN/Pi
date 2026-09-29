@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import dataclasses
 import os
 import shutil
 import sys
@@ -36,7 +37,7 @@ os.environ["LOCALAPPDATA"] = _TEST_DIR
 atexit.register(shutil.rmtree, _TEST_DIR, ignore_errors=True)
 
 # ── Imports (after env) ───────────────────────────────────────────
-from bot.modules.media.exceptions import IGInvalidUrl, IGPlaylist  # noqa: E402
+from bot.modules.media.exceptions import IGInvalidUrl, IGPlaylist, IGResolveFailed  # noqa: E402
 from bot.modules.media.formats import (  # noqa: E402
     estimate_bytes,
     quality_cap,
@@ -62,6 +63,9 @@ from bot.modules.media.platforms import (  # noqa: E402
 from bot.modules.media.ratelimit import RateLimiter  # noqa: E402
 from bot.modules.media.singleflight import run_exclusive  # noqa: E402
 from bot.modules.media.exceptions import IGBusy  # noqa: E402
+from bot.modules.media import streams as streams_mod  # noqa: E402
+from bot.modules.media import youtube as yt_mod  # noqa: E402
+from bot.modules.media.url_utils import host_allowed  # noqa: E402
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -551,6 +555,216 @@ class TestPlaylistReject(unittest.IsolatedAsyncioTestCase):
         err = IGPlaylist()
         self.assertIn("direct video link", err.user)
         self.assertEqual(err.code, "playlist")
+
+
+# ═════════════════════════════════════════════════════════════════
+# Direct stream-URL fallback (YouTube sign-in bypass)
+# ═════════════════════════════════════════════════════════════════
+
+class TestResolveSteps(unittest.TestCase):
+    def test_default_order(self):
+        steps = yt_mod.resolve_steps()
+        self.assertEqual(
+            steps[:4],
+            [
+                ("yt", "default"),
+                ("yt", "android_vr"),
+                ("yt", "tv"),
+                ("yt", "alt_clients"),
+            ],
+        )
+        self.assertIn(("stream", "stream_fallback"), steps)
+
+    def test_stream_before_env_optins(self):
+        orig = yt_mod.ig_config
+        yt_mod.ig_config = dataclasses.replace(
+            orig, youtube_po_token="tok", youtube_cookies_file="ck.txt"
+        )
+        try:
+            names = [n for _, n in yt_mod.resolve_steps()]
+            self.assertLess(names.index("stream_fallback"), names.index("po_token"))
+            self.assertLess(names.index("po_token"), names.index("cookies"))
+        finally:
+            yt_mod.ig_config = orig
+
+    def test_stream_fallback_can_disable(self):
+        orig = yt_mod.ig_config
+        yt_mod.ig_config = dataclasses.replace(orig, stream_fallback=False)
+        try:
+            names = [n for _, n in yt_mod.resolve_steps()]
+            self.assertNotIn("stream_fallback", names)
+        finally:
+            yt_mod.ig_config = orig
+
+    def test_strategy_opts_clients(self):
+        self.assertEqual(
+            yt_mod._strategy_opts("android_vr")["extractor_args"],
+            {"youtube": {"player_client": ["android_vr"]}},
+        )
+        self.assertEqual(
+            yt_mod._strategy_opts("tv")["extractor_args"],
+            {"youtube": {"player_client": ["tv"]}},
+        )
+
+
+class TestStreamNormalize(unittest.TestCase):
+    def _piped(self):
+        return {
+            "title": "Demo",
+            "uploader": "Chan",
+            "duration": 60,
+            "thumbnail": "https://i.ytimg.com/x.jpg",
+            "videoStreams": [
+                {
+                    "url": "https://rr1---sn-x.googlevideo.com/videoplayback?p=720",
+                    "format": "mp4",
+                    "quality": "720p",
+                    "height": 720,
+                    "width": 1280,
+                    "videoOnly": False,
+                    "bitrate": 1_200_000,
+                    "contentLength": "8000000",
+                    "itag": "18",
+                    "codec": "avc1",
+                },
+                {
+                    "url": "https://rr1---sn-x.googlevideo.com/videoplayback?v=1080",
+                    "format": "mp4",
+                    "quality": "1080p",
+                    "height": 1080,
+                    "width": 1920,
+                    "videoOnly": True,
+                    "bitrate": 4_500_000,
+                    "contentLength": "30000000",
+                    "itag": "137",
+                    "codec": "avc1",
+                },
+            ],
+            "audioStreams": [
+                {
+                    "url": "https://rr1---sn-x.googlevideo.com/videoplayback?a=1",
+                    "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
+                    "codec": "mp4a.40.2",
+                    "bitrate": 128_000,
+                    "contentLength": "1000000",
+                    "itag": "140",
+                },
+            ],
+        }
+
+    def test_piped_shapes(self):
+        fmts = streams_mod.piped_formats(self._piped())
+        self.assertEqual(len(fmts), 3)
+        by_id = {f["format_id"]: f for f in fmts}
+        # Progressive carries audio; video-only does not; audio-only is audio.
+        self.assertEqual(by_id["18"]["acodec"], "aac")
+        self.assertIsNone(by_id["137"]["acodec"])
+        self.assertEqual(by_id["140"]["vcodec"], "none")
+        # bit/s normalized to kbit/s for select_format's tbr.
+        self.assertAlmostEqual(by_id["18"]["tbr"], 1200.0)
+
+    def test_piped_progressive_wins(self):
+        fmts = streams_mod.piped_formats(self._piped())
+        choice = select_format(
+            fmts, quality="auto", max_bytes=50 * 1024 * 1024, duration=60
+        )
+        self.assertEqual(choice.kind, "progressive")
+        self.assertEqual(choice.video["height"], 720)
+
+    def test_piped_merge_when_no_progressive(self):
+        payload = self._piped()
+        payload["videoStreams"] = [payload["videoStreams"][1]]  # drop 720p muxed
+        fmts = streams_mod.piped_formats(payload)
+        choice = select_format(
+            fmts, quality="auto", max_bytes=50 * 1024 * 1024, duration=60
+        )
+        self.assertEqual(choice.kind, "merge")
+        self.assertEqual(choice.video["height"], 1080)
+        self.assertEqual(choice.audio["ext"], "m4a")
+
+    def test_invidious_adaptive_split(self):
+        payload = {
+            "title": "T",
+            "author": "A",
+            "lengthSeconds": 30,
+            "videoThumbnails": [
+                {"url": "https://i.example/lo.jpg", "quality": "low"},
+                {"url": "https://i.example/max.jpg", "quality": "maxres"},
+            ],
+            "formatStreams": [
+                {
+                    "url": "https://rr1---sn-x.googlevideo.com/videoplayback?f=360",
+                    "itag": "18",
+                    "container": "mp4",
+                    "bitrate": 500000,
+                    "width": 640,
+                    "height": 360,
+                    "qualityLabel": "360p",
+                    "contentLength": "4000000",
+                },
+            ],
+            "adaptiveFormats": [
+                {
+                    "url": "https://rr1---sn-x.googlevideo.com/videoplayback?v=1080",
+                    "itag": "137",
+                    "type": "video/mp4; codecs=\"avc1.640028\"",
+                    "bitrate": 4_000_000,
+                    "clen": "25000000",
+                    "width": 1920,
+                    "height": 1080,
+                    "qualityLabel": "1080p",
+                    "container": "mp4",
+                },
+                {
+                    "url": "https://rr1---sn-x.googlevideo.com/videoplayback?a=140",
+                    "itag": "140",
+                    "type": "audio/mp4; codecs=\"mp4a.40.2\"",
+                    "bitrate": 128000,
+                    "clen": "900000",
+                    "container": "mp4",
+                },
+            ],
+        }
+        fmts = streams_mod.invidious_formats(payload)
+        self.assertEqual(len(fmts), 3)
+        by = {f["format_id"]: f for f in fmts}
+        self.assertEqual(by["137"]["acodec"], "none")  # video-only
+        self.assertEqual(by["140"]["vcodec"], "none")  # audio-only
+        self.assertEqual(by["18"]["acodec"], "aac")    # muxed progressive
+
+        fmts2, meta = streams_mod.parse_payload("invidious", payload)
+        self.assertEqual(meta["uploader"], "A")
+        self.assertEqual(meta["thumbnail"], "https://i.example/max.jpg")
+        choice = select_format(
+            fmts2, quality="auto", max_bytes=50 * 1024 * 1024, duration=30
+        )
+        self.assertEqual(choice.kind, "merge")
+
+    def test_stream_hosts_allowed(self):
+        # Direct CDN stream URLs.
+        self.assertTrue(
+            host_allowed("https://rr1---sn-x.googlevideo.com/videoplayback?id=1")
+        )
+        # Mirror host itself + proxied sibling subdomain.
+        self.assertTrue(host_allowed("https://inv.nadeko.net/api/v1/videos/x"))
+        self.assertTrue(host_allowed("https://pipedproxy.adminforge.de/watch/x"))
+        # Everything else stays blocked (SSRF).
+        self.assertFalse(host_allowed("https://evil.example.com/x"))
+        self.assertFalse(host_allowed("https://googlevideo.com.evil.com/x"))
+
+
+class TestExhaustedError(unittest.TestCase):
+    def test_signin_message_mentions_mirrors_and_levers(self):
+        err = yt_mod._exhausted_error(True, None)
+        self.assertIn("sign-in", err.user)
+        self.assertIn("stream mirrors", err.user.lower())
+        self.assertIn("YOUTUBE_COOKIES_FILE", err.user)
+
+    def test_generic_falls_back_to_last_error(self):
+        last = IGResolveFailed("plain failure")
+        self.assertIs(yt_mod._exhausted_error(False, last), last)
+        generic = yt_mod._exhausted_error(False, None)
+        self.assertEqual(generic.code, "resolve")
 
 
 if __name__ == "__main__":
