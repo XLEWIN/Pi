@@ -145,24 +145,35 @@ async def stats_command(message: Message, bot: Bot, args: list):
         period = args[0].lower()
     days = _PERIOD_DAYS.get(period, 1)
 
-    stats = await adb(db.get_daily_stats(chat_id, days=days))
     # Prefer daily_messages for message volume (leveling already tracks it).
     from datetime import date, timedelta as td
     start = (date.today() - td(days=days - 1)).isoformat()
-    try:
-        msg_sum = await adb(db.sum_daily_messages(chat_id, start))
-    except Exception:
+    prev_start = (date.today() - td(days=days * 2 - 1)).isoformat()
+
+    # Four independent reads — one gather = one round-trip deep instead
+    # of four serial ones.  return_exceptions keeps the old fallbacks:
+    # a failed volume/trend read degrades to its default, while a failed
+    # primary read (stats/active) still raises like before.
+    stats, msg_sum, active, prev = await asyncio.gather(
+        adb(db.get_daily_stats(chat_id, days=days)),
+        adb(db.sum_daily_messages(chat_id, start)),
+        adb(db.get_active_member_count(chat_id, days=days)),
+        adb(db.sum_daily_messages(chat_id, prev_start, start)),
+        return_exceptions=True,
+    )
+    if isinstance(stats, Exception):
+        raise stats
+    if isinstance(active, Exception):
+        raise active
+    if isinstance(msg_sum, Exception):
         msg_sum = stats.get("messages", 0)
 
-    active = await adb(db.get_active_member_count(chat_id, days=days))
     label = period.capitalize()
 
     # Trend: compare to previous equal window when we have history.
     trend = "—"
-    if days >= 1:
-        prev_start = (date.today() - td(days=days * 2 - 1)).isoformat()
+    if days >= 1 and not isinstance(prev, Exception):
         try:
-            prev = await adb(db.sum_daily_messages(chat_id, prev_start, start))
             if prev > 0:
                 delta = msg_sum - prev
                 pct = int(abs(delta) / prev * 100)

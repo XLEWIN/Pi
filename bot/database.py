@@ -70,8 +70,12 @@ except OSError:
 # ── Perf layer (Database: read cache / write-behind buffers) ─────────
 # Read-cache entries live at most _CACHE_TTL seconds; writes invalidate
 # them exactly via the collection proxy, the TTL is only a safety net.
-_CACHE_TTL = 60.0
-_MEMO_TTL = 60.0            # aggregate memo safety net (day totals, …)
+# Tuned 60→300s: invalidation is exact (collection proxy + generation
+# counter in _cached_read), so a longer window only reduces re-reads
+# after idle expiry — a stale entry past a *missed* write would be the
+# failure mode, and no write path bypasses the proxy.
+_CACHE_TTL = 300.0
+_MEMO_TTL = 300.0            # aggregate memo safety net (day totals, …)
 _FLUSH_INTERVAL = 5.0       # background counter flush cadence (seconds)
 _SKIP_TTL = 60.0            # identity/activity fast-skip window (seconds)
 _BUFFERED = frozenset({     # collections with write-behind counters
@@ -2641,33 +2645,60 @@ class Database:
             # to be _totals_by_user() twice per card + two O(users) walks
             # in _position_in, i.e. a full-collection aggregation per
             # /rank, /info, /profile, /nextlevel.)
-            mine = await self._sum_msgs({"user_id": user_id})
-            info["global_messages"] = mine
-            info["global_members"] = await self._distinct_users({})
-            if mine > 0:
-                info["global_rank"] = await self.global_rank_for(mine)
-                info["global_position"] = await self._rank_position(
-                    {}, user_id, mine
-                )
+            #
+            # The three blocks below — global scope, chat scope,
+            # presentation row — feed no data into each other, so they
+            # run CONCURRENTLY.  Each block keeps its original internal
+            # order, so sequential-vs-parallel call order per method is
+            # unchanged; only the overlap is new.  Worst-case round-trip
+            # depth drops from ~9 serial reads to ~3 (the two dependent
+            # pairs: sum → rank+position, per scope).  return_exceptions
+            # keeps the old semantics on failure: every block finishes
+            # writing its fields, the first error is logged, and the
+            # partially-filled info dict is still returned.
+            async def _global_scope() -> None:
+                mine = await self._sum_msgs({"user_id": user_id})
+                info["global_messages"] = mine
+                info["global_members"] = await self._distinct_users({})
+                if mine > 0:
+                    g_rank, g_pos = await asyncio.gather(
+                        self.global_rank_for(mine),
+                        self._rank_position({}, user_id, mine),
+                    )
+                    info["global_rank"] = g_rank
+                    info["global_position"] = g_pos
 
-            # Chat scope (groups only — skip for DM callers).
-            if chat_id is not None:
+            async def _chat_scope() -> None:
+                # Chat scope (groups only — skip for DM callers).
+                if chat_id is None:
+                    return
                 match = {"chat_id": chat_id}
                 cmine = await self._sum_msgs({**match, "user_id": user_id})
                 info["chat_messages"] = cmine
                 info["chat_members"] = await self._distinct_users(match)
                 if cmine > 0:
-                    info["chat_rank"] = await self.chat_rank_for(cmine)
-                    info["chat_position"] = await self._rank_position(
-                        match, user_id, cmine
+                    c_rank, c_pos = await asyncio.gather(
+                        self.chat_rank_for(cmine),
+                        self._rank_position(match, user_id, cmine),
                     )
+                    info["chat_rank"] = c_rank
+                    info["chat_position"] = c_pos
 
-            # Presentation extras (template / xp / streaks — no counters).
-            lvl = await self.get_user_level(user_id)
-            info["template"] = int(lvl.get("template") or 1)
-            info["global_xp"] = int(lvl.get("global_xp") or 0)
-            info["streak_current"] = int(lvl.get("streak_current") or 0)
-            info["streak_best"] = int(lvl.get("streak_best") or 0)
+            async def _presentation() -> None:
+                # Presentation extras (template / xp / streaks — no counters).
+                lvl = await self.get_user_level(user_id)
+                info["template"] = int(lvl.get("template") or 1)
+                info["global_xp"] = int(lvl.get("global_xp") or 0)
+                info["streak_current"] = int(lvl.get("streak_current") or 0)
+                info["streak_best"] = int(lvl.get("streak_best") or 0)
+
+            results = await asyncio.gather(
+                _global_scope(), _chat_scope(), _presentation(),
+                return_exceptions=True,
+            )
+            for r in results:
+                if isinstance(r, Exception):
+                    raise r
         except Exception as e:
             logger.error(f"Error building rank info: {e}")
         return info

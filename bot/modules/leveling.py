@@ -192,18 +192,17 @@ async def rank_command(message: Message, bot: Bot, args: list, bot_data: dict):
     user_id = target_user.id
 
     # Unified rank info — daily_messages is the source of truth.
-    info = await adb(db.get_user_rank_info(user_id, chat_id))
+    # Started BEFORE the avatar work: the DB reads and the Telegram
+    # avatar download are independent, so /rank pays whichever is
+    # slower instead of their sum (cold: ~DB reads + 3 Telegram round
+    # trips).  get_user_rank_info never raises (it logs and returns a
+    # default-filled dict), so this task cannot die unobserved.  The
+    # wrapper keeps the fetch under an await (test_no_blocking_db) —
+    # ensure_future itself schedules it on the loop, nothing blocks.
+    async def _fetch_rank_info():
+        return await adb(db.get_user_rank_info(user_id, chat_id))
 
-    name = target_user.first_name or "User"
-    username = target_user.username or ""
-    level = info["chat_rank"]
-    chat_msgs = info["chat_messages"]
-    global_msgs = info["global_messages"]
-    template_id = info["template"]
-    in_rank = chat_msgs % CHAT_RANK_MESSAGES
-    progress_pct = min(int(in_rank * 100 / CHAT_RANK_MESSAGES), 100)
-    position = info["chat_position"]
-    total_members = info["chat_members"]
+    info_fut = asyncio.ensure_future(_fetch_rank_info())
 
     # Avatar — memory-cached for _AVATAR_TTL (a fresh fetch costs 3
     # Telegram round trips: profile_photos + get_file + download).
@@ -230,6 +229,19 @@ async def rank_command(message: Message, bot: Bot, args: list, bot_data: dict):
                 _avatars[user_id] = (now + _AVATAR_TTL, "")
         except Exception as e:
             logger.warning(f"Avatar download failed: {e}")
+
+    info = await info_fut
+
+    name = target_user.first_name or "User"
+    username = target_user.username or ""
+    level = info["chat_rank"]
+    chat_msgs = info["chat_messages"]
+    global_msgs = info["global_messages"]
+    template_id = info["template"]
+    in_rank = chat_msgs % CHAT_RANK_MESSAGES
+    progress_pct = min(int(in_rank * 100 / CHAT_RANK_MESSAGES), 100)
+    position = info["chat_position"]
+    total_members = info["chat_members"]
 
     # Generate rank card using smash-style renderer (PIL — keep it off
     # the event loop so other chats' replies stay instant).

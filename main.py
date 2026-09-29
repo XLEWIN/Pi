@@ -55,6 +55,68 @@ async def _startup_log(bot: Bot, me, privacy_on: bool) -> None:  # noqa: ANN001
         logger.warning(f"Startup log not sent: {e}")
 
 
+async def _warm_read_caches() -> None:
+    """Fill the hot read-through caches before the first update arrives.
+
+    Every group message runs a serial gate chain (bind settings,
+    blocklist, filters, watch words) plus per-join welcome/shield reads;
+    on a cold process each of those was one Mongo round-trip until the
+    first read filled its cache.  This warms them once in the
+    background so the first message after a deploy doesn't pay the
+    whole chain, and /rank-style commands start warm too.
+
+    Purely best-effort: every failure is swallowed with a warning —
+    the normal read-through path just loads the entry later, exactly
+    as it would without this task.  Reads only; nothing is written.
+    """
+    try:
+        from bot.async_bridge import adb
+        from bot.database import db
+
+        warmed = 0
+        try:
+            await adb(db.get_sudo_users())
+            warmed += 1
+        except Exception as e:
+            logger.warning(f"sudo cache warm skipped: {e}")
+        try:
+            chat_ids = await adb(db.get_all_chat_ids())
+        except Exception as e:
+            logger.warning(f"warmup chat list failed: {e}")
+            chat_ids = []
+        for chat_id in chat_ids:
+            loaders = (
+                lambda c=chat_id: db.get_shield_settings(c),
+                lambda c=chat_id: db.get_blocklist(c),
+                lambda c=chat_id: db.get_filters(c),
+                lambda c=chat_id: db.get_welcome_settings(c),
+                lambda c=chat_id: db.get_welcome_message(c),
+                lambda c=chat_id: db.get_all_watch_words(c),
+                # Bind gate — read on EVERY group message by
+                # gate_message_handler.  Warmed through the async
+                # read-through directly: the module's own entry point
+                # (bind.database.get_settings) is a sync facade meant
+                # for executor threads.
+                lambda c=chat_id: db._cached_read(
+                    "get_bind_settings",
+                    (c,),
+                    lambda: db._find_one("bind_settings", {"chat_id": c}),
+                ),
+            )
+            for load in loaders:
+                try:
+                    await adb(load())
+                    warmed += 1
+                except Exception:
+                    pass  # read-through fills it on first use
+        logger.info(
+            f"Warmed {warmed} read-cache entr{'y' if warmed == 1 else 'ies'} "
+            f"for {len(chat_ids)} chat(s)"
+        )
+    except Exception as e:
+        logger.warning(f"cache warmup skipped: {e}")
+
+
 async def _flush() -> None:
     """post_shutdown parity — persist write-behind buffers on exit."""
     try:
@@ -279,6 +341,10 @@ def main() -> None:
 
             # Fire-and-forget: start listening for updates immediately.
             asyncio.create_task(_startup_log(bot, me, privacy_on))
+            # Fill hot read caches in the background so the first group
+            # message after boot doesn't pay the serial cache-miss chain
+            # (bind gate, blocklist, filters, watch words, shield).
+            asyncio.create_task(_warm_read_caches())
 
             # Subscribe only to update types that actually have handlers.
             # `UpdateType` has 27 members; 22 of them (message_reaction,
