@@ -190,6 +190,26 @@ _ICON_BOARD = E.STAR
 _ICON_TOTAL = E.ANNOUNCE
 
 
+def _big(text: str) -> str:
+    """Mathematical bold (𝐀–𝐙 𝐚–𝐳) for board headings.
+
+    Telegram HTML has no font-size tag (verified in the Bot API docs),
+    so Unicode math-bold is the only way to make a heading visibly
+    larger without custom emoji. Letters map to U+1D400/U+1D41A;
+    other characters pass through unchanged.
+    """
+    out = []
+    for ch in text:
+        o = ord(ch)
+        if 65 <= o <= 90:  # A-Z
+            out.append(chr(0x1D400 + o - 65))
+        elif 97 <= o <= 122:  # a-z
+            out.append(chr(0x1D41A + o - 97))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def _scope_markup(kind: str, scope: str, user_id: Optional[int] = None):
     """Active tab solo on row 1 (green + ✅), the rest blue below.
 
@@ -218,7 +238,10 @@ def _rank_board(chat_id: int, scope: str) -> Tuple[str, Optional[object]]:
     rows = db.get_chat_top(chat_id, since=since, limit=_TOP_LIMIT)
     total = db.get_chat_message_total(chat_id, since=since)
 
-    lines = [f"{_ICON_BOARD} <b>Leaderboard</b> · <i>{_SCOPE_LABELS[scope]}</i>"]
+    lines = [
+        f"{_ICON_BOARD} {_big('Leaderboard')}",
+        f"<i>{_SCOPE_LABELS[scope]}</i>",
+    ]
     if rows:
         for i, row in enumerate(rows, start=1):
             lines.append(_rank_line(
@@ -240,9 +263,8 @@ def _mytop_board(user, scope: str) -> Tuple[str, Optional[object]]:
     rows = db.get_user_top_groups(user.id, since=since, limit=_TOP_LIMIT)
 
     lines = [f"{E.USER} {_mention_name(user)}"]
-    lines.append(
-        f"{_ICON_BOARD} <b>Top Groups</b> · <i>{_SCOPE_LABELS[scope]}</i>"
-    )
+    lines.append(f"{_ICON_BOARD} {_big('Top Groups')}")
+    lines.append(f"<i>{_SCOPE_LABELS[scope]}</i>")
     if rows:
         for i, row in enumerate(rows, start=1):
             title = _clip(row.get("chat_title") or f"Chat {row['chat_id']}")

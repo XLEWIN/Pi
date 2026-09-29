@@ -497,7 +497,7 @@ class TestRankings(unittest.IsolatedAsyncioTestCase):
         msg = _msg("/rankings")
         await call(cs.rankings_command, msg)
         text = _sent(msg)
-        self.assertIn("Leaderboard", text)
+        self.assertIn(cs._big("Leaderboard"), text)
         self.assertIn(f'href="tg://user?id={USER_1}"', text)
         self.assertIn("11,797", text)
         self.assertIn("2,019", text)
@@ -594,7 +594,7 @@ class TestMytop(unittest.IsolatedAsyncioTestCase):
         msg = _msg("/mytop")
         await call(cs.mytop_command, msg)
         text = _sent(msg)
-        self.assertIn("Top Groups", text)
+        self.assertIn(cs._big("Top Groups"), text)
         self.assertIn(f'href="tg://user?id={USER_1}"', text)  # profile mention header
         self.assertIn("Smash Your Character", text)
         self.assertIn("7,107", text)
@@ -633,7 +633,7 @@ class TestMytop(unittest.IsolatedAsyncioTestCase):
     async def test_works_in_private(self):
         msg = _msg("/mytop", chat_type="private", chat_id=USER_1)
         await call(cs.mytop_command, msg)
-        self.assertIn("Top Groups", _sent(msg))
+        self.assertIn(cs._big("Top Groups"), _sent(msg))
 
     async def test_title_fallback_when_group_unknown(self):
         _cleanup()
@@ -701,7 +701,7 @@ class TestBoardCallback(unittest.IsolatedAsyncioTestCase):
         )
         await call(cs.board_callback, query)
         self.assertEqual(len(msg.edits), 1)
-        self.assertIn("Top Groups", msg.edits[0]["text"])
+        self.assertIn(cs._big("Top Groups"), msg.edits[0]["text"])
 
     async def test_invalid_data_ignored(self):
         msg = _CBMsg(CHAT_A)

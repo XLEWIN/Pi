@@ -443,7 +443,7 @@ class TestMytopHeader(unittest.IsolatedAsyncioTestCase):
         user = SimpleNamespace(id=U1, username="u1", first_name="U1")
         text, _markup = cs._mytop_board(user, "overall")
 
-        self.assertIn("Top Groups", text)
+        self.assertIn(cs._big("Top Groups"), text)
         # Rank lines were removed from /mytop — ranks live on /rank,
         # /profile and /info.
         self.assertNotIn("Chat: Rank", text)

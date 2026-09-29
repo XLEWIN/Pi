@@ -15,7 +15,7 @@ from aiogram.types import CallbackQuery, Message
 from bot.constants import BOT_DESCRIPTION, LOG_CHANNEL_ID, START_TEXT, URL_ADD_TO_GROUP, URL_OFFICIAL_CHANNEL, URL_NETWORK
 from bot.database import db
 from bot.emojis import E
-from bot.keyboards.colored import btn_primary, btn_success, btn_url, build_keyboard
+from bot.keyboards.colored import btn_primary, btn_url, build_keyboard
 from bot.logger import logger
 from bot.pipeline import cmd, on
 from bot.reply import reply_text
@@ -172,8 +172,8 @@ def build_start_keyboard(icons: bool = True):
                         icon_emoji_id=EID.INFO if icons else None),
         ],
         [
-            btn_success("Dashboard", "start:dashboard",
-                        icon_emoji_id=EID.WEB if icons else None),
+            btn_url("Dashboard", "https://piweb-teal.vercel.app/",
+                    icon_emoji_id=EID.WEB if icons else None),
         ],
         [
             btn_url("Channel", URL_OFFICIAL_CHANNEL,

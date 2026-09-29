@@ -1,8 +1,13 @@
-"""Download resolved assets — HTTP streaming first, yt-dlp only as fallback."""
+"""Download resolved assets — HTTP streaming first, yt-dlp only as fallback.
+
+Also owns the split-stream merge step (YouTube video-only + audio-only
+pairs are merged with ffmpeg stream-copy before upload).
+"""
 
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import shutil
 import time
@@ -27,6 +32,18 @@ _UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/126.0.0.0 Safari/537.36"
 )
+
+# Per-platform Referer/Origin — some CDNs reject requests carrying the
+# wrong site's referrer (Instagram's default would break YouTube CDNs).
+_PLATFORM_HEADERS = {
+    "youtube": {
+        "Referer": "https://www.youtube.com/",
+        "Origin": "https://www.youtube.com",
+    },
+    "tiktok": {"Referer": "https://www.tiktok.com/"},
+    "instagram": {"Referer": "https://www.instagram.com/"},
+}
+
 _CT_EXT = {
     "image/jpeg": "jpg",
     "image/jpg": "jpg",
@@ -128,7 +145,9 @@ def _get_http_client():
 
         _HTTP_CLIENT = httpx.AsyncClient(
             follow_redirects=True,
-            timeout=httpx.Timeout(30.0, connect=8.0),
+            timeout=httpx.Timeout(
+                ig_config.read_timeout, connect=ig_config.connect_timeout
+            ),
             limits=httpx.Limits(max_connections=10, max_keepalive_connections=10),
             headers={
                 "User-Agent": _UA,
@@ -151,38 +170,82 @@ def _ext_from(url: str, content_type: str) -> str:
     return "mp4"
 
 
-async def _http_download(url: str, dest: Path, asset: MediaAsset) -> List[Path]:
-    """Stream a direct CDN URL to disk — no yt-dlp extraction pass."""
+async def _http_download(
+    url: str,
+    dest: Path,
+    asset: MediaAsset,
+    *,
+    platform: str = "instagram",
+    max_bytes: Optional[int] = None,
+) -> List[Path]:
+    """Stream a direct CDN URL to disk — no yt-dlp extraction pass.
+
+    Retries transient failures (connect errors, 5xx, 403/429) with short
+    backoff; writes to a ``.part`` file and renames on success so a crash
+    never leaves a half file that looks complete.
+    """
     if not host_allowed(url):
         raise IGDownloadFailed()
 
     client = _get_http_client()
-    max_b = ig_config.max_file_bytes
+    max_b = max_bytes or ig_config.max_file_bytes
+    hdrs = dict(_PLATFORM_HEADERS.get(platform) or _PLATFORM_HEADERS["instagram"])
+    hdrs.update(asset.headers or {})
 
-    try:
-        async with client.stream("GET", url) as resp:
-            if resp.status_code >= 400:
-                raise IGDownloadFailed()
-            ext = _ext_from(url, resp.headers.get("content-type", ""))
-            path = dest / f"media.{ext}"
-            total = 0
-            with path.open("wb") as fh:
-                async for chunk in resp.aiter_bytes(64 * 1024):
-                    total += len(chunk)
-                    if total > max_b:
-                        fh.close()
-                        path.unlink(missing_ok=True)
-                        raise IGTooLarge(total)
-                    fh.write(chunk)
-            if total == 0:
-                path.unlink(missing_ok=True)
-                raise IGDownloadFailed()
-            return [path]
-    except (IGTooLarge, IGDownloadFailed):
-        raise
-    except Exception as e:
-        ig_log(f"http download fail: {e}")
-        raise IGDownloadFailed() from e
+    attempts = 1 + max(0, ig_config.max_network_retries)
+    last: Exception = IGDownloadFailed()
+    for attempt in range(attempts):
+        if attempt:
+            await asyncio.sleep(min(0.5 * (2 ** (attempt - 1)), 5.0))
+        part: Optional[Path] = None
+        final: Optional[Path] = None
+        try:
+            async with client.stream("GET", url, headers=hdrs) as resp:
+                if resp.status_code in (403, 410):
+                    # Expired CDN signature — caller re-resolves once.
+                    raise IGDownloadFailed()
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    last = IGDownloadFailed()
+                    continue
+                if resp.status_code >= 400:
+                    raise IGDownloadFailed()
+                ext = _ext_from(url, resp.headers.get("content-type", ""))
+                final = dest / f"media.{ext}"
+                part = dest / f"media.{ext}.part"
+                total = 0
+                with part.open("wb") as fh:
+                    async for chunk in resp.aiter_bytes(64 * 1024):
+                        total += len(chunk)
+                        if total > max_b:
+                            fh.close()
+                            part.unlink(missing_ok=True)
+                            raise IGTooLarge(total)
+                        fh.write(chunk)
+                if total == 0:
+                    part.unlink(missing_ok=True)
+                    raise IGDownloadFailed()
+                os.replace(part, final)
+                return [final]
+        except (IGTooLarge,):
+            raise
+        except IGDownloadFailed as e:
+            if part:
+                part.unlink(missing_ok=True)
+            # 403/410/4xx are definitive for this URL — don't retry blindly.
+            last = e
+            if attempt + 1 >= attempts:
+                raise
+            continue
+        except Exception as e:
+            if part:
+                part.unlink(missing_ok=True)
+            last = e
+            ig_log(f"http download fail (attempt {attempt + 1}): {e}")
+            continue
+    ig_log(f"http download exhausted retries: {last}")
+    if isinstance(last, IGDownloadFailed):
+        raise last
+    raise IGDownloadFailed() from last
 
 
 def _ydl_download_opts(dest: Path) -> dict:
@@ -280,10 +343,17 @@ def _kind_from_path(path: Path, fallback: MediaKind) -> MediaKind:
     return fallback
 
 
-async def _fetch_one(dest: Path, idx: int, asset: MediaAsset, post: ResolvedPost) -> List[DownloadedFile]:
+async def _fetch_one(
+    dest: Path,
+    idx: int,
+    asset: MediaAsset,
+    post: ResolvedPost,
+    max_bytes: Optional[int] = None,
+) -> List[DownloadedFile]:
     """Fetch one asset: direct HTTP first, yt-dlp only if that fails."""
+    cap = max_bytes or ig_config.max_file_bytes
     size = asset.filesize
-    if size and size > ig_config.max_file_bytes:
+    if size and size > cap:
         ig_log(f"skip oversized asset[{idx}] size={size}")
         return []
 
@@ -292,7 +362,9 @@ async def _fetch_one(dest: Path, idx: int, asset: MediaAsset, post: ResolvedPost
 
     paths: Optional[List[Path]] = None
     try:
-        paths = await _http_download(asset.url, sub, asset)
+        paths = await _http_download(
+            asset.url, sub, asset, platform=post.platform, max_bytes=cap
+        )
     except IGTooLarge:
         return []
     except IGDownloadFailed:
@@ -312,7 +384,7 @@ async def _fetch_one(dest: Path, idx: int, asset: MediaAsset, post: ResolvedPost
             sz = p.stat().st_size
         except OSError:
             continue
-        if sz > ig_config.max_file_bytes:
+        if sz > cap:
             p.unlink(missing_ok=True)
             continue
         kind = _kind_from_path(p, asset.kind)
@@ -322,7 +394,7 @@ async def _fetch_one(dest: Path, idx: int, asset: MediaAsset, post: ResolvedPost
                 kind=kind,
                 asset=asset,
                 size=sz,
-                cache_key=f"{post.media_id}:{idx}",
+                cache_key=f"{post.platform}:{post.media_id}:{idx}",
             )
         )
         metrics.bump("downloads")
@@ -330,8 +402,18 @@ async def _fetch_one(dest: Path, idx: int, asset: MediaAsset, post: ResolvedPost
     return out
 
 
-async def download_post(post: ResolvedPost, job_dir: Optional[Path] = None) -> List[DownloadedFile]:
-    """Download all assets for *post* in parallel (HTTP-first per asset)."""
+async def download_post(
+    post: ResolvedPost,
+    job_dir: Optional[Path] = None,
+    *,
+    max_bytes: Optional[int] = None,
+) -> List[DownloadedFile]:
+    """Download all assets for *post* in parallel (HTTP-first per asset).
+
+    Split YouTube streams (post.needs_merge) are merged with ffmpeg here;
+    on merge failure both parts are returned so the upload still happens.
+    *max_bytes* overrides the global size cap (per-chat File Size setting).
+    """
     ensure_temp_root()
     dest = job_dir or job_workdir(post.media_id)
     dest.mkdir(parents=True, exist_ok=True)
@@ -343,8 +425,9 @@ async def download_post(post: ResolvedPost, job_dir: Optional[Path] = None) -> L
 
     async def _guarded(idx: int, asset: MediaAsset) -> List[DownloadedFile]:
         async with sem:
-            return await _fetch_one(dest, idx, asset, post)
+            return await _fetch_one(dest, idx, asset, post, max_bytes)
 
+    t0 = time.perf_counter()
     batches = await asyncio.gather(
         *(_guarded(i, a) for i, a in enumerate(post.assets)),
         return_exceptions=True,
@@ -365,8 +448,62 @@ async def download_post(post: ResolvedPost, job_dir: Optional[Path] = None) -> L
     if not results:
         raise IGDownloadFailed()
 
+    # Merge pass for split streams (video part + audio part → one MP4).
+    if post.needs_merge and len(post.assets) == 2 and len(results) >= 2:
+        merged = await _try_merge(post, results, dest, max_bytes)
+        if merged:
+            results = merged
+
+    metrics.bump("dl_ms", dl_ms=int((time.perf_counter() - t0) * 1000))
     ig_log(f"downloaded {len(results)} file(s) for {post.media_id} ({errors} skipped)")
     return results
+
+
+async def _try_merge(
+    post: ResolvedPost,
+    files: List[DownloadedFile],
+    dest: Path,
+    max_bytes: Optional[int] = None,
+) -> Optional[List[DownloadedFile]]:
+    """ffmpeg-merge v/a parts; None → caller keeps the separate parts."""
+    from .merge import merge_streams
+
+    cap = max_bytes or ig_config.max_file_bytes
+    video = next(
+        (f for f in files if f.asset.merge_role == "v"), None
+    )
+    audio = next(
+        (f for f in files if f.asset.merge_role == "a"), None
+    )
+    if not video or not audio:
+        return None
+    out = await merge_streams(video.path, audio.path, dest)
+    if not out:
+        return None
+    try:
+        size = out.stat().st_size
+    except OSError:
+        return None
+    if size > cap:
+        out.unlink(missing_ok=True)
+        return None  # fall back to parts (downloader cap rejects later)
+    # Remove the source parts so only the merged file uploads.
+    for f in (video, audio):
+        try:
+            f.path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    merged_file = DownloadedFile(
+        path=out,
+        kind=MediaKind.VIDEO,
+        asset=video.asset,
+        size=size,
+        cache_key=f"{post.platform}:{post.media_id}:merged",
+    )
+    metrics.bump("downloads")
+    metrics.bump("bytes_sent", n=size)
+    ig_log(f"merged streams → {out.name} ({size} bytes)")
+    return [merged_file]
 
 
 def job_workdir(media_id: str) -> Path:

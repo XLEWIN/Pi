@@ -1,4 +1,9 @@
-"""Instagram module exceptions — user-facing + internal."""
+"""Media module exceptions — user-facing + internal.
+
+Class names keep the ``IG*`` prefix (stable for imports across the
+codebase) but messages are platform-neutral: the module now serves
+YouTube, TikTok and Instagram alike.
+"""
 
 from __future__ import annotations
 
@@ -15,14 +20,22 @@ class IGError(Exception):
 
 class IGDisabled(IGError):
     def __init__(self) -> None:
-        super().__init__("Instagram downloader is disabled.", code="disabled")
+        super().__init__("Media downloader is disabled.", code="disabled")
 
 
 class IGInvalidUrl(IGError):
     def __init__(self) -> None:
         super().__init__(
-            "That does not look like a supported Instagram post/reel link.",
+            "That does not look like a supported media link.",
             code="invalid_url",
+        )
+
+
+class IGPlaylist(IGError):
+    def __init__(self) -> None:
+        super().__init__(
+            "Playlists are not supported — please send a direct video link.",
+            code="playlist",
         )
 
 
@@ -42,7 +55,7 @@ class IGMediaGone(IGError):
 class IGRateLimited(IGError):
     def __init__(self) -> None:
         super().__init__(
-            "Instagram rate-limited us. Try again in a moment.",
+            "The source is rate-limiting us. Try again in a moment.",
             code="rate_limit",
             retryable=True,
         )
@@ -62,6 +75,15 @@ class IGBusy(IGError):
         super().__init__(
             "Already processing this link — one moment…",
             code="busy",
+            retryable=True,
+        )
+
+
+class IGRateRejected(IGError):
+    def __init__(self) -> None:
+        super().__init__(
+            "Too many download requests — wait a moment and try again.",
+            code="rate_rejected",
             retryable=True,
         )
 

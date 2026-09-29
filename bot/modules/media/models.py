@@ -1,4 +1,4 @@
-"""Data models for resolved Instagram media."""
+"""Data models for resolved media (YouTube / TikTok / Instagram)."""
 
 from __future__ import annotations
 
@@ -37,6 +37,10 @@ class MediaAsset:
     ext: str = "mp4"
     codec: Optional[str] = None
     note: str = ""
+    # Merge role for split streams: "v" (video part) / "a" (audio part).
+    merge_role: Optional[str] = None
+    # Optional per-asset HTTP headers (Referer etc. for some CDNs).
+    headers: Optional[dict] = None
 
 
 @dataclass
@@ -55,10 +59,24 @@ class ResolvedPost:
     thumbnail: Optional[str] = None
     resolve_ms: int = 0
     resolver: str = "ytdlp"
+    # Which platform produced this post: youtube | tiktok | instagram.
+    platform: str = "instagram"
+    # True when assets are split streams that need an ffmpeg merge pass.
+    needs_merge: bool = False
 
     @property
     def cache_key(self) -> str:
-        return f"{self.media_id}:{len(self.assets)}"
+        return f"{self.platform}:{self.media_id}:{len(self.assets)}"
+
+    def file_id_keys(self) -> List[str]:
+        """Per-asset Telegram file_id cache keys (platform-scoped).
+
+        Merged posts cache ONE row under ``…:merged`` — the merged file
+        replaces both parts, so a second key would never be filled.
+        """
+        if self.needs_merge:
+            return [f"{self.platform}:{self.media_id}:merged"]
+        return [f"{self.platform}:{self.media_id}:{i}" for i in range(len(self.assets))]
 
 
 @dataclass

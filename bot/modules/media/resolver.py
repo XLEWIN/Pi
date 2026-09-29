@@ -1,4 +1,9 @@
-"""Media resolution — yt-dlp Python API (no subprocess) + optional fallback."""
+"""Media resolution — yt-dlp Python API (no subprocess) + optional fallback.
+
+Shared helpers (``base_ydl_opts`` / ``extract_entry`` /
+``classify_ytdlp_error``) power the platform resolvers in
+``youtube.py`` / ``tiktok.py`` as well as the Instagram chain below.
+"""
 
 from __future__ import annotations
 
@@ -8,8 +13,10 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
 from .exceptions import (
+    IGError,
     IGInvalidUrl,
     IGMediaGone,
+    IGPlaylist,
     IGPrivateMedia,
     IGRateLimited,
     IGResolveFailed,
@@ -23,6 +30,68 @@ from .url_utils import (
     host_allowed,
     normalize_url,
 )
+
+
+def base_ydl_opts() -> Dict[str, Any]:
+    """Shared yt-dlp options for a single-entry, no-download extraction."""
+    return {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "extract_flat": False,
+        "socket_timeout": 12,
+        "retries": 1,
+        "fragment_retries": 1,
+        "skip_download": True,
+        "ignoreerrors": False,
+        "nocheckcertificate": False,
+    }
+
+
+def classify_ytdlp_error(e: Exception) -> IGError:
+    """Map a yt-dlp DownloadError (or IGError passthrough) to a card error."""
+    if isinstance(e, IGError):
+        return e
+    msg = str(e).lower()
+    if "age" in msg or "confirm your age" in msg or "sign in to confirm" in msg:
+        return IGResolveFailed(
+            "This video needs sign-in — set YOUTUBE_COOKIES_FILE to download it."
+        )
+    if "private" in msg or "login" in msg or "signin" in msg:
+        return IGPrivateMedia()
+    if "404" in msg or "not found" in msg or "gone" in msg or "removed" in msg:
+        return IGMediaGone()
+    if "429" in msg or "rate" in msg:
+        return IGRateLimited()
+    if "unsupported url" in msg or "no video" in msg or "not a valid url" in msg:
+        return IGInvalidUrl()
+    if "playlist" in msg:
+        return IGPlaylist()
+    ig_log(f"resolve fail: {e}")
+    return IGResolveFailed()
+
+
+def extract_entry(url: str, opts: Dict[str, Any]) -> Dict[str, Any]:
+    """One yt-dlp extraction pass (sync — call inside asyncio.to_thread).
+
+    Raises a classified IGError on failure; never returns None.
+    """
+    import yt_dlp
+    from yt_dlp.utils import DownloadError
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except DownloadError as e:
+        metrics.bump("resolved_fail", error=str(e)[:200])
+        raise classify_ytdlp_error(e) from e
+    except Exception as e:  # non-DownloadError (import problems etc.)
+        metrics.bump("resolved_fail", error=str(e)[:200])
+        raise classify_ytdlp_error(e) from e
+    if not info:
+        metrics.bump("resolved_fail", error="empty info")
+        raise IGMediaGone()
+    return info
 
 
 def _classify_vcodec(vcodec: str | None, acodec: str | None, ext: str) -> MediaKind:
@@ -190,18 +259,8 @@ class YtDlpResolver(BaseResolver):
             with yt_dlp.YoutubeDL(self._ydl_opts()) as ydl:
                 info = ydl.extract_info(norm, download=False)
         except DownloadError as e:
-            msg = str(e).lower()
             metrics.bump("resolved_fail", error=str(e)[:200])
-            if "private" in msg or "login" in msg or "signin" in msg:
-                raise IGPrivateMedia() from e
-            if "404" in msg or "not found" in msg or "gone" in msg:
-                raise IGMediaGone() from e
-            if "429" in msg or "rate" in msg:
-                raise IGRateLimited() from e
-            if "unsupported url" in msg or "no video" in msg:
-                raise IGInvalidUrl() from e
-            ig_log(f"resolve fail: {e}")
-            raise IGResolveFailed() from e
+            raise classify_ytdlp_error(e) from e
         except Exception as e:
             metrics.bump("resolved_fail", error=str(e)[:200])
             ig_log(f"resolve error: {e}")
@@ -227,6 +286,7 @@ class YtDlpResolver(BaseResolver):
 
         elapsed = int((time.perf_counter() - start) * 1000)
         metrics.bump("resolved_ok", ms=elapsed)
+        metrics.bump_platform("instagram")
         ig_log(f"resolved {media_id} type={post_type.value} assets={len(assets)} in {elapsed}ms")
 
         title = info.get("title") or info.get("description") or ""
@@ -247,6 +307,7 @@ class YtDlpResolver(BaseResolver):
             thumbnail=info.get("thumbnail"),
             resolve_ms=elapsed,
             resolver=self.name,
+            platform="instagram",
         )
 
 
@@ -291,6 +352,7 @@ class FallbackResolver(BaseResolver):
                 raise IGResolveFailed()
             elapsed = int((time.perf_counter() - start) * 1000)
             metrics.bump("resolved_ok", ms=elapsed)
+            metrics.bump_platform("instagram")
             return ResolvedPost(
                 canonical_url=norm,
                 post_type=classify_post_type(norm),
@@ -304,6 +366,7 @@ class FallbackResolver(BaseResolver):
                 thumbnail=info.get("thumbnail"),
                 resolve_ms=elapsed,
                 resolver=self.name,
+                platform="instagram",
             )
 
         return await asyncio.to_thread(_alt)
@@ -319,7 +382,7 @@ class ResolverChain:
         for i, r in enumerate(self.resolvers):
             try:
                 return await r.resolve(url)
-            except (IGPrivateMedia, IGMediaGone, IGInvalidUrl, IGRateLimited):
+            except (IGPrivateMedia, IGMediaGone, IGInvalidUrl, IGRateLimited, IGPlaylist):
                 raise
             except Exception as e:
                 last = e
@@ -335,10 +398,23 @@ class ResolverChain:
 resolver_chain = ResolverChain()
 
 
+async def resolve_media(platform: str, url: str) -> ResolvedPost:
+    """Route *url* to its platform resolver (called after platforms.resolve_target)."""
+    if platform == "youtube":
+        from .youtube import YouTubeResolver
+
+        return await YouTubeResolver().resolve(url)
+    if platform == "tiktok":
+        from .tiktok import TikTokResolver
+
+        return await TikTokResolver().resolve(url)
+    return await resolver_chain.resolve(url)
+
+
 def ensure_yt_dlp() -> None:
     """Raise a clear error if yt-dlp is not installed."""
     try:
-        import yt_dlp  # noqa: F401
+        __import__("yt_dlp")
     except ImportError as e:
         raise IGResolveFailed(
             "yt-dlp is not installed. Run: pip install yt-dlp"

@@ -384,20 +384,21 @@ HELP_MENU: list[dict] = [
         ],
     },
     {
-        "key": "instagram",
+        "key": "media",
         "icon": E.WEB,
-        "title": "Instagram",
+        "title": "Media Download",
         "sections": [
             (None, [
-                "/igdl &lt;url&gt; — Download a post/reel (or reply to a link)",
-                "/igsettings [auto on|off] [max N] — Auto-download settings (admin)",
-                "/igstats — Downloader metrics (admin)",
-                "/igcache [clear] — file_id cache (owner)",
-                "/igbenchmark &lt;url&gt; — Time a resolve (owner)",
+                "/dl &lt;url&gt; — Download YouTube/TikTok/Instagram media (or reply)",
+                "/mediasettings — Download settings board (admin)",
+                "/mediastats — Downloader metrics (admin)",
+                "/mediacache [clear] — file_id cache (owner)",
+                "/mediabench &lt;url&gt; — Time a resolve (owner)",
             ]),
         ],
         "notes": [
-            "Auto: Instagram links in groups/DMs download automatically when enabled."
+            "Auto: media links in groups/DMs download automatically when enabled.",
+            "Aliases: /igdl /igsettings /igstats /igcache /igbenchmark.",
         ],
     },
     {

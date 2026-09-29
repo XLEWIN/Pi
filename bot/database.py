@@ -1012,14 +1012,20 @@ class Database:
             doc.setdefault("auto_download", 1)
             doc.setdefault("max_items", 10)
             doc.setdefault("send_spoiler", 0)
+            # Media downloader fields (yt_enabled/quality/…) are applied by
+            # the module so MEDIA_* env defaults can override per deploy.
             doc.setdefault("updated_at", None)
             return doc
         except Exception as e:
             logger.error(f"ig_get_settings: {e}")
             return None
 
-    async def ig_set_settings(self, chat_id: int, **fields: int) -> None:
-        allowed = {"auto_download", "max_items", "send_spoiler"}
+    async def ig_set_settings(self, chat_id: int, **fields: Any) -> None:
+        allowed = {
+            "auto_download", "max_items", "send_spoiler",
+            "yt_enabled", "tt_enabled", "videos", "shorts",
+            "quality", "captions", "max_mb", "delete_source", "progress",
+        }
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
             return

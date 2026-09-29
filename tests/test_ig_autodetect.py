@@ -1,4 +1,4 @@
-"""Tests for the Instagram auto-detect filter (bot/modules/instagram).
+"""Tests for the Instagram auto-detect filter (bot/modules/media).
 
 Run from the repo root:
 
@@ -41,7 +41,7 @@ os.environ["LOCALAPPDATA"] = _TEST_DIR
 atexit.register(shutil.rmtree, _TEST_DIR, ignore_errors=True)
 
 # ── Imports (after env) ───────────────────────────────────────────
-from bot.modules.instagram import ig_filter  # noqa: E402
+from bot.modules.media import ig_filter  # noqa: E402
 
 
 def _msg(text=None, caption=None) -> SimpleNamespace:
