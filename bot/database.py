@@ -1653,6 +1653,76 @@ class Database:
             logger.error(f"Error getting lock stats: {e}")
             return 0, 0
 
+    # ── Content locks (/lock /unlock /locks) ────────────────────────
+
+    async def set_lock(self, chat_id: int, lock_type: str) -> None:
+        """Enable one content lock for the chat (idempotent upsert)."""
+        try:
+            await self._mongo["locks"].update_one(
+                {"chat_id": chat_id, "lock_type": lock_type},
+                {"$set": {"chat_id": chat_id, "lock_type": lock_type}},
+                upsert=True,
+            )
+        except Exception as e:
+            logger.error(f"Error setting lock {lock_type}: {e}")
+
+    async def unset_lock(self, chat_id: int, lock_type: str) -> None:
+        """Disable locks. ``all`` clears every lock for the chat."""
+        try:
+            flt = {"chat_id": chat_id}
+            if lock_type != "all":
+                flt["lock_type"] = lock_type
+            await self._mongo["locks"].delete_many(flt)
+        except Exception as e:
+            logger.error(f"Error unsetting lock {lock_type}: {e}")
+
+    async def get_locks(self, chat_id: int) -> List[str]:
+        """Active lock types for the chat (sorted, de-duplicated)."""
+        try:
+            rows = await self._find(
+                "locks", {"chat_id": chat_id}, {"lock_type": 1, "_id": 0}
+            )
+            return sorted({str(r.get("lock_type")) for r in rows
+                           if r.get("lock_type")})
+        except Exception as e:
+            logger.error(f"Error getting locks: {e}")
+            return []
+
+    # ── Nightmode (/nightmode) ──────────────────────────────────────
+
+    async def set_nightmode(self, chat_id: int, enabled: bool) -> None:
+        """Persist the per-chat nightmode flag."""
+        try:
+            if enabled:
+                await self._mongo["nightmode"].update_one(
+                    {"chat_id": chat_id},
+                    {"$set": {"chat_id": chat_id}},
+                    upsert=True,
+                )
+            else:
+                await self._mongo["nightmode"].delete_many({"chat_id": chat_id})
+        except Exception as e:
+            logger.error(f"Error setting nightmode: {e}")
+
+    async def is_nightmode(self, chat_id: int) -> bool:
+        """True when nightmode is enabled for the chat."""
+        try:
+            n = await self._mongo["nightmode"].count_documents(
+                {"chat_id": chat_id}
+            )
+            return bool(n)
+        except Exception as e:
+            logger.error(f"Error checking nightmode: {e}")
+            return False
+
+    async def get_nightmode_chats(self) -> List[int]:
+        """Every chat with nightmode enabled."""
+        try:
+            return list(await self._mongo["nightmode"].distinct("chat_id"))
+        except Exception as e:
+            logger.error(f"Error listing nightmode chats: {e}")
+            return []
+
     # ── /broadcast targets ────────────────────────────────────────
 
     async def get_all_chat_ids(self) -> List[int]:

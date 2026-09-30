@@ -21,6 +21,7 @@ from bot.constants import BOT_NAME, LOG_CHANNEL_ID
 from bot.errors import on_error
 from bot.loader import load_modules
 from bot.logger import logger
+from bot.modules import nightmode as nightmode_mod
 
 
 async def _startup_log(bot: Bot, me, privacy_on: bool) -> None:  # noqa: ANN001
@@ -345,6 +346,9 @@ def main() -> None:
             # message after boot doesn't pay the serial cache-miss chain
             # (bind gate, blocklist, filters, watch words, shield).
             asyncio.create_task(_warm_read_caches())
+            # Nightmode: flip group permissions at 23:00/07:00 IST for
+            # every chat that enabled /nightmode (idempotent watcher).
+            nightmode_mod.start(bot)
 
             # Subscribe only to update types that actually have handlers.
             # `UpdateType` has 27 members; 22 of them (message_reaction,
