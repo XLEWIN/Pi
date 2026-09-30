@@ -11,7 +11,8 @@ Environment isolation (BEFORE any bot import):
     * LOCALAPPDATA points at a temp dir so runtime files are isolated.
 
 No network: parsers/rendering are pure; command tests patch
-``profiles._lookup`` / ``profiles._fetch_avatar``.
+``profiles._lookup`` / ``profiles._fetch_avatar``; fetch-chain tests
+drive a stub HTTP client.
 """
 
 from __future__ import annotations
@@ -117,6 +118,54 @@ def _profile(name="TriggeredInsaan", handle="@TriggeredInsaan",
     }
 
 
+_FX = {
+    "code": 200,
+    "user": {
+        "screen_name": "ElonMusk",
+        "name": "Elon Musk",
+        "description": "Mars and more",
+        "avatar_url": "https://pbs.twimg.com/profile_images/1/photo_normal.jpg",
+        "followers": 241727911,
+        "following": 1414,
+        "tweets": 100217,
+        "raw_description": {"text": "https://t.co/x"},
+    },
+}
+
+
+class _Resp:
+    """Fake httpx response for the fetch-chain stubs."""
+
+    def __init__(self, status: int, body: str = "", data=None):
+        self.status_code = status
+        if data is not None and not body:
+            import json as _json
+            body = _json.dumps(data)
+        self.text = body
+        self._data = data
+
+    def json(self):
+        if self._data is not None:
+            return self._data
+        import json as _json
+        return _json.loads(self.text)
+
+
+class _StubClient:
+    """Queue of responses/exceptions; records request URLs in order."""
+
+    def __init__(self, queue):
+        self._q = list(queue)
+        self.calls: list = []
+
+    async def get(self, url, **kw):
+        self.calls.append(url)
+        item = self._q.pop(0) if self._q else RuntimeError("stub queue empty")
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
 # ═════════════════════════════════════════════════════════════════
 # Number formatting
 # ═════════════════════════════════════════════════════════════════
@@ -216,6 +265,140 @@ class TestParsers(unittest.TestCase):
     def test_instagram_missing_user_raises(self):
         with self.assertRaises(pm.ProfileError):
             pm._parse_instagram({"data": {}})
+
+    def test_fxtwitter(self):
+        p = pm._parse_fxtwitter(_FX)
+        self.assertEqual(p["name"], "Elon Musk")
+        self.assertEqual(p["handle"], "@ElonMusk")
+        self.assertEqual(p["bio"], "Mars and more")
+        self.assertEqual(p["stats"],
+                         ("241.7M Followers", "1.4K Following", "100.2K Tweets"))
+        self.assertIn("_400x400.", p["avatar"])
+        self.assertNotIn("_normal.", p["avatar"])
+
+    def test_fxtwitter_missing_user_raises(self):
+        with self.assertRaises(pm.ProfileError):
+            pm._parse_fxtwitter({"code": 404, "message": "User not found"})
+
+
+# ═════════════════════════════════════════════════════════════════
+# Fetch chains (stubbed client — no network)
+# ═════════════════════════════════════════════════════════════════
+
+class TestFetchTikTok(unittest.IsolatedAsyncioTestCase):
+    async def test_rate_limited_then_succeeds(self):
+        busy = _Resp(200, data={"code": 429, "msg": "Too many requests"})
+        ok = _Resp(200, data={
+            "code": 0,
+            "data": {
+                "user": {"uniqueId": "messi", "nickname": "Messi",
+                         "avatarLarger": "https://cdn/x_large.jpg"},
+                "stats": {"followerCount": 10924, "heartCount": 18234,
+                          "videoCount": 0},
+            },
+        })
+        client = _StubClient([busy, ok])
+        with mock.patch.object(pm, "_RETRY_DELAY", 0):
+            prof = await pm._fetch_tiktok(client, "messi")
+        self.assertEqual(prof["handle"], "@messi")
+        self.assertEqual(prof["stats"][0], "10.9K Followers")
+        self.assertIn("large.jpg", prof["avatar"])
+        self.assertEqual(len(client.calls), 2)
+
+    async def test_html_pages_retried_then_busy_error(self):
+        html = _Resp(200, "<html>Just a moment...</html>")
+        client = _StubClient([html, html, html])
+        with mock.patch.object(pm, "_RETRY_DELAY", 0):
+            with self.assertRaises(pm.ProfileError) as ctx:
+                await pm._fetch_tiktok(client, "messi")
+        self.assertIn("not responding", str(ctx.exception))
+        self.assertEqual(len(client.calls), 3)
+
+    async def test_not_found_code_raises_immediately(self):
+        nf = _Resp(200, data={"code": -1, "msg": "user not found"})
+        client = _StubClient([nf])
+        with mock.patch.object(pm, "_RETRY_DELAY", 0):
+            with self.assertRaises(pm.ProfileError) as ctx:
+                await pm._fetch_tiktok(client, "ghost")
+        self.assertEqual(str(ctx.exception), "user not found")
+        self.assertEqual(len(client.calls), 1)
+
+    async def test_network_error_then_success(self):
+        ok = _Resp(200, data={
+            "code": 0,
+            "data": {
+                "user": {"uniqueId": "messi", "nickname": "Messi"},
+                "stats": {"followerCount": 1, "heartCount": 2,
+                          "videoCount": 3},
+            },
+        })
+        client = _StubClient([RuntimeError("boom"), ok])
+        with mock.patch.object(pm, "_RETRY_DELAY", 0):
+            prof = await pm._fetch_tiktok(client, "messi")
+        self.assertEqual(prof["handle"], "@messi")
+
+
+class TestFetchX(unittest.IsolatedAsyncioTestCase):
+    async def test_fxtwitter_wins_and_syndication_skipped(self):
+        client = _StubClient([_Resp(200, data=_FX)])
+        prof = await pm._fetch_x(client, "ElonMusk")
+        self.assertEqual(prof["handle"], "@ElonMusk")
+        self.assertEqual(prof["stats"][0], "241.7M Followers")
+        self.assertEqual(len(client.calls), 1)
+        self.assertIn("api.fxtwitter.com", client.calls[0])
+
+    async def test_fxtwitter_404_falls_back_to_syndication(self):
+        client = _StubClient([
+            _Resp(404, data={"code": 404, "message": "User not found"}),
+            _Resp(200, body=_X_HTML),
+        ])
+        prof = await pm._fetch_x(client, "ElonMusk")
+        self.assertEqual(prof["handle"], "@ElonMusk")
+        self.assertEqual(len(client.calls), 2)
+        self.assertIn("syndication.twitter.com", client.calls[1])
+
+    async def test_syndication_404_is_not_found(self):
+        client = _StubClient([
+            _Resp(404, data={"code": 404, "message": "User not found"}),
+            _Resp(404),
+        ])
+        with self.assertRaises(pm.ProfileError) as ctx:
+            await pm._fetch_x(client, "ghost")
+        self.assertEqual(str(ctx.exception), "user not found")
+
+    async def test_all_sources_down_gives_reachability_error(self):
+        client = _StubClient([
+            RuntimeError("fx down"),
+            RuntimeError("synd down"),
+        ])
+        with self.assertRaises(pm.ProfileError) as ctx:
+            await pm._fetch_x(client, "ElonMusk")
+        self.assertIn("Could not reach X", str(ctx.exception))
+        self.assertNotIn("not found", str(ctx.exception))
+
+
+class TestFetchInstagram(unittest.IsolatedAsyncioTestCase):
+    async def test_success_from_mirror_host(self):
+        ok = _Resp(200, data=_IG_PAYLOAD)
+        client = _StubClient([_Resp(403), ok])
+        prof = await pm._fetch_instagram(client, "choud4ary")
+        self.assertEqual(prof["handle"], "@choud4ary")
+        self.assertEqual(len(client.calls), 2)
+
+    async def test_429_all_hosts_gives_rate_limit_message(self):
+        client = _StubClient([_Resp(429), _Resp(429),
+                              _Resp(429), _Resp(429)])
+        with mock.patch.object(pm, "_IG_DELAY", 0):
+            with self.assertRaises(pm.ProfileError) as ctx:
+                await pm._fetch_instagram(client, "choud4ary")
+        self.assertIn("rate-limiting", str(ctx.exception))
+
+    async def test_404_raises_not_found(self):
+        client = _StubClient([_Resp(404)])
+        with self.assertRaises(pm.ProfileError) as ctx:
+            await pm._fetch_instagram(client, "ghost")
+        self.assertEqual(str(ctx.exception), "user not found")
+        self.assertEqual(len(client.calls), 1)
 
 
 # ═════════════════════════════════════════════════════════════════

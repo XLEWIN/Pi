@@ -7,8 +7,8 @@ blue "View on …" URL button.
 
 Data sources (no API keys):
   TikTok   tikwm user/info (same host the media module already uses)
-           → fallback www.tiktok.com/api/user/detail
-  X        syndication.twitter.com timeline-profile JSON-in-HTML
+            → paced retries for its ~1/s rate limit
+  X        api.fxtwitter.com profile JSON → syndication fallback
   YouTube  channel HTML (ytInitialData) + /about for total views
   Instagram  web_profile_info (x-ig-app-id) → i.instagram.com mirror
 """
@@ -47,6 +47,8 @@ _UA = (
 )
 _TIMEOUT = httpx.Timeout(8.0, connect=6.0)
 _CACHE_TTL = 300.0  # seconds — repeat searches answer instantly
+_RETRY_DELAY = 1.3   # seconds between tikwm attempts (its rate limit is ~1/s)
+_IG_DELAY = 2.0      # seconds between Instagram 429 retries
 
 #: Platform display spec: template file, blue button label, profile URL.
 _PLATFORMS: Dict[str, Dict[str, str]] = {
@@ -200,7 +202,8 @@ def _parse_tikwm(payload: Dict[str, Any]) -> Dict[str, Any]:
         "name": user.get("nickname") or handle,
         "handle": f"@{handle}",
         "bio": (user.get("signature") or "").strip(),
-        "avatar": user.get("avatarThumb") or user.get("avatarMedium") or "",
+        "avatar": (user.get("avatarLarger") or user.get("avatarMedium")
+                   or user.get("avatarThumb") or ""),
         "stats": (
             f"{compact(stats.get('followerCount'))} Followers",
             f"{compact(stats.get('heartCount'))} Likes",
@@ -251,6 +254,32 @@ def _parse_x(html: str) -> Dict[str, Any]:
             f"{compact(int(followers))} Followers",
             f"{compact(int(following))} Following",
             f"{compact(int(tweets))} Tweets",
+        ),
+    }
+
+
+def _parse_fxtwitter(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """api.fxtwitter.com /{screen_name} JSON → profile dict."""
+    user = payload.get("user") or {}
+    handle = user.get("screen_name") or ""
+    if not handle:
+        raise ProfileError("user not found")
+    avatar = user.get("avatar_url") or ""
+    if "_normal." in avatar:
+        avatar = avatar.replace("_normal.", "_400x400.")
+    raw = user.get("raw_description")
+    bio = user.get("description") or (
+        raw.get("text") if isinstance(raw, dict) else ""
+    )
+    return {
+        "name": user.get("name") or handle,
+        "handle": f"@{handle}",
+        "bio": (bio or "").strip(),
+        "avatar": avatar,
+        "stats": (
+            f"{compact(user.get('followers'))} Followers",
+            f"{compact(user.get('following'))} Following",
+            f"{compact(user.get('tweets'))} Tweets",
         ),
     }
 
@@ -337,43 +366,74 @@ async def _json(client: httpx.AsyncClient, url: str, **kwargs: Any) -> Dict[str,
 
 
 async def _fetch_tiktok(client: httpx.AsyncClient, user: str) -> Dict[str, Any]:
-    # 1) tikwm — same host the media module already reaches from Railway.
-    try:
-        j = await _json(
-            client, "https://www.tikwm.com/api/user/info",
-            params={"unique_id": user},
-            headers={"Referer": "https://www.tikwm.com/", "Accept": "application/json"},
-        )
-        if j.get("code") == 0:
-            return _parse_tikwm(j)
-    except ProfileError:
-        pass
-    except Exception:
-        pass
-    # 2) TikTok's own user/detail endpoint.
-    try:
-        j = await _json(
-            client, "https://www.tiktok.com/api/user/detail/",
-            params={"uniqueId": user},
-            headers={"Referer": "https://www.tiktok.com/", "Accept": "application/json"},
-        )
-        return _parse_tiktok_direct(j)
-    except ProfileError:
-        raise
-    except Exception as e:
-        raise ProfileError("could not reach TikTok right now") from e
+    """tikwm user/info with paced retries.
+
+    This is the host the media module already reaches from Railway.
+    www.tiktok.com's own /api/user/detail answers with an HTML app
+    shell (200) unless browser cookies are present, so it is useless
+    as a data source — rate-limit codes and flaky pages are retried
+    instead, then a friendly "busy" error is raised.
+    """
+    url = "https://www.tikwm.com/api/user/info"
+    headers = {"Referer": "https://www.tikwm.com/", "Accept": "application/json"}
+    timeout = httpx.Timeout(5.0, connect=4.0)
+    for attempt in range(3):
+        if attempt:
+            await asyncio.sleep(_RETRY_DELAY)
+        try:
+            r = await client.get(url, params={"unique_id": user},
+                                 headers=headers, timeout=timeout)
+        except Exception:
+            continue
+        if r.status_code == 404:
+            raise ProfileError("user not found")
+        try:
+            data = r.json()
+        except Exception:
+            continue  # challenge page / rate-limit HTML
+        if not isinstance(data, dict):
+            continue
+        if data.get("code") == 0:
+            return _parse_tikwm(data)
+        msg = str(data.get("msg") or "").lower()
+        if "not found" in msg or "exist" in msg:
+            raise ProfileError("user not found")
+        # any other non-zero code = busy / rate limit → pace and retry
+    raise ProfileError("TikTok is not responding right now — try again "
+                       "in a few seconds.")
 
 
 async def _fetch_x(client: httpx.AsyncClient, user: str) -> Dict[str, Any]:
-    r = await client.get(
-        f"https://syndication.twitter.com/srv/timeline-profile/screen-name/{user}",
-        headers={"Referer": "https://twitter.com/", "Accept": "text/html,*/*"},
-    )
-    if r.status_code == 404:
-        raise ProfileError("user not found")
-    if r.status_code != 200 or '"screen_name"' not in r.text:
-        raise ProfileError("could not reach X right now")
-    return _parse_x(r.text)
+    """fxtwitter profile JSON (fast, no auth) → syndication fallback."""
+    # 1) api.fxtwitter.com — small JSON, usually reachable anywhere.
+    try:
+        r = await client.get(
+            f"https://api.fxtwitter.com/{user}",
+            headers={"Accept": "application/json", "Referer": "https://x.com/"},
+            timeout=httpx.Timeout(6.0, connect=4.0),
+        )
+        if r.status_code == 200 and r.text.lstrip().startswith("{"):
+            data = r.json()
+            if data.get("code") == 200 and data.get("user"):
+                return _parse_fxtwitter(data)
+    except Exception:
+        pass
+    # 2) syndication timeline page (works from some IPs, blocks others).
+    try:
+        r = await client.get(
+            f"https://syndication.twitter.com/srv/timeline-profile/"
+            f"screen-name/{user}",
+            headers={"Referer": "https://twitter.com/", "Accept": "text/html,*/*"},
+        )
+        if r.status_code == 404:
+            raise ProfileError("user not found")
+        if r.status_code == 200 and '"screen_name"' in r.text:
+            return _parse_x(r.text)
+    except ProfileError:
+        raise
+    except Exception:
+        pass
+    raise ProfileError("Could not reach X right now — try again in a moment.")
 
 
 async def _fetch_youtube(client: httpx.AsyncClient, user: str) -> Dict[str, Any]:
@@ -400,28 +460,40 @@ async def _fetch_instagram(client: httpx.AsyncClient, user: str) -> Dict[str, An
         "https://i.instagram.com/api/v1/users/web_profile_info/",
     )
     last: Optional[Exception] = None
-    for attempt, base in enumerate(urls):
-        for _try in (0, 1):  # one patient retry on 429
+    for base in urls:
+        for _try in (0, 1):  # one patient retry per host on 429/503
             try:
-                r = await client.get(base, params={"username": user}, headers=headers)
-                if r.status_code == 200 and r.text.strip().startswith("{"):
-                    return _parse_instagram(r.json())
-                last = ProfileError(
-                    "user not found" if r.status_code == 404 else
-                    f"unexpected reply (HTTP {r.status_code})"
-                )
-                if r.status_code not in (429, 503):
-                    break
-            except ProfileError as e:
-                last = e
-                break
+                r = await client.get(base, params={"username": user},
+                                     headers=headers)
             except Exception as e:
                 last = e
                 break
-            await asyncio.sleep(2.0)
+            if r.status_code == 200 and r.text.strip().startswith("{"):
+                try:
+                    return _parse_instagram(r.json())
+                except ProfileError:
+                    raise
+                except Exception as e:
+                    last = e
+                    break
+            if r.status_code == 404:
+                raise ProfileError("user not found")
+            if r.status_code in (429, 503):
+                last = ProfileError(
+                    "Instagram is rate-limiting this server — try again "
+                    "in a few minutes."
+                )
+                await asyncio.sleep(_IG_DELAY)
+                continue
+            last = ProfileError(
+                "Instagram is not responding right now — try again "
+                "in a few minutes."
+            )
+            break  # non-retryable status on this host — try the next one
     if isinstance(last, ProfileError):
         raise last
-    raise ProfileError("could not reach Instagram right now")
+    raise ProfileError("Could not reach Instagram right now — try again "
+                       "in a moment.")
 
 
 async def _fetch_avatar(client: httpx.AsyncClient, url: str) -> Optional[bytes]:
