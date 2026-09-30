@@ -104,17 +104,15 @@ ALLOWED_MEDIA_HOST_SUFFIXES = (
 # ── Direct stream mirrors (Piped / Invidious) ──────────────────────
 # Public mirrors that hand back the same googlevideo CDN stream URLs —
 # used when YouTube's player API demands a sign-in (bot check).  No API
-# key, cookies or PO token required: pure HTTPS GETs against hosts we
-# configure ourselves (SSRF-safe — only this list is ever contacted).
+# key, cookies or PO token required: pure HTTPS GETs.
+# This static list is ONLY the safety net for when the official list
+# fetch fails; the live instances come from api.invidious.io (refreshed
+# every 30 min, see streams.py).  Keep it SHORT — every dead entry here
+# costs a probe on every resolve.
 # Override with MEDIA_STREAM_INSTANCES (comma-separated hosts);
 # MEDIA_STREAM_FALLBACK=0 disables the whole path.
 _STREAM_DEFAULT = (
-    "pipedapi.adminforge.de",
-    "pipedapi.ducks.party",
-    "api.piped.private.coffee",
-    "inv.nadeko.net",
-    "yewtu.be",
-    "invidious.nerdvpn.de",
+    "invidious.f5.si",  # api-enabled instance, verified live 2026-09
 )
 
 

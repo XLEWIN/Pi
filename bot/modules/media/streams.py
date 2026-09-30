@@ -3,8 +3,10 @@
 When YouTube's bot check demands a sign-in, these public mirrors hand
 back the *same* googlevideo CDN stream URLs they extracted server-side:
 no API key, no cookies, no PO token, no player-client tricks — pure
-HTTPS GETs against hosts we configure ourselves (``MEDIA_STREAM_INSTANCES``;
-only that list is ever contacted, so SSRF stays bounded).
+HTTPS GETs. Candidates come from the official Invidious instance list
+(``api.invidious.io``, refreshed every 30 min) plus our own config
+(``MEDIA_STREAM_INSTANCES``); SSRF stays bounded because only those two
+sources are ever contacted.
 
 Payloads are normalized into yt-dlp-style format dicts so the existing
 ``select_format`` strategy (progressive → size-guarded merge pair)
@@ -16,23 +18,33 @@ from __future__ import annotations
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from .config import ig_config
 from .exceptions import IGResolveFailed
 from .metrics import ig_log, metrics
-from .url_utils import host_allowed
+from .url_utils import host_allowed, register_stream_host
 
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-# Probe order per instance — Piped path first, Invidious second.
+# Probe order per instance — Invidious path first (the official list
+# only publishes Invidious instances), Piped second for static hosts.
 _ENDPOINTS = (
-    ("piped", "/streams/{vid}"),
     ("invidious", "/api/v1/videos/{vid}"),
+    ("piped", "/streams/{vid}"),
 )
+
+# Official Invidious instance list — the ONLY discovery source (SSRF:
+# hosts are contacted only when published there or configured below).
+# Static config alone rots: mirrors die and are replaced by new ones
+# without a redeploy, so the list is refreshed every _DYN_TTL seconds.
+_DISCOVERY_URL = "https://api.invidious.io/instances.json?sort_by=health"
+_DYN_TTL = 1800.0
+_dyn_hosts: Tuple[str, ...] = ()
+_dyn_ts = 0.0
 
 _AUDIO_CODECS = ("mp4a", "aac", "opus", "vorbis", "ac-3", "ec-3", "flac")
 _VIDEO_CODECS = ("avc", "av01", "vp0", "vp9", "hvc", "hev", "theora")
@@ -63,6 +75,11 @@ def _size(raw: Any) -> Optional[int]:
         return None
 
 
+def _media_url(raw: Any) -> str:
+    """Mirror payloads sometimes HTML-escape query separators (&amp;)."""
+    return str(raw or "").replace("&amp;", "&")
+
+
 def _codec_split(typ: str) -> Tuple[List[str], List[str]]:
     """'video/mp4; codecs="avc1..., mp4a..."' → ([video tokens], [audio tokens])."""
     m = re.search(r'codecs="?([^"]+)"?', typ or "")
@@ -77,7 +94,7 @@ def piped_formats(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     dur = data.get("duration")
     out: List[Dict[str, Any]] = []
     for i, s in enumerate(data.get("videoStreams") or []):
-        url = s.get("url")
+        url = _media_url(s.get("url"))
         if not url:
             continue
         h = s.get("height") or _height(s.get("quality"))
@@ -101,7 +118,7 @@ def piped_formats(data: Dict[str, Any]) -> List[Dict[str, Any]]:
             }
         )
     for i, s in enumerate(data.get("audioStreams") or []):
-        url = s.get("url")
+        url = _media_url(s.get("url"))
         if not url:
             continue
         mime = str(s.get("mimeType") or "")
@@ -129,7 +146,7 @@ def invidious_formats(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     # formatStreams: muxed progressive (low quality, video+audio).
     for i, s in enumerate(data.get("formatStreams") or []):
-        url = s.get("url")
+        url = _media_url(s.get("url"))
         if not url:
             continue
         out.append(
@@ -149,7 +166,7 @@ def invidious_formats(data: Dict[str, Any]) -> List[Dict[str, Any]]:
         )
     # adaptiveFormats: single-track — video-only or audio-only (or muxed).
     for i, s in enumerate(data.get("adaptiveFormats") or []):
-        url = s.get("url")
+        url = _media_url(s.get("url"))
         if not url:
             continue
         typ = str(s.get("type") or "")
@@ -228,16 +245,118 @@ def parse_payload(
     return fmts, {k: v for k, v in meta.items() if v}
 
 
+def parse_instance_list(payload: Any) -> Tuple[str, ...]:
+    """Official ``instances.json`` → https hosts whose JSON API is enabled.
+
+    Handles the documented ``[[name, meta], ...]`` shape, a plain
+    ``{name: meta}`` map, and a ``{"instances": [...]}`` wrapper.
+    Anything unexpected yields an empty tuple — static config remains
+    the safety net.
+    """
+    pairs: List[Tuple[str, Dict[str, Any]]] = []
+    if isinstance(payload, list):
+        for item in payload:
+            if (
+                isinstance(item, (list, tuple))
+                and len(item) == 2
+                and isinstance(item[1], dict)
+            ):
+                pairs.append((str(item[0]), item[1]))
+            elif isinstance(item, dict):
+                pairs.append((str(item.get("name") or ""), item))
+    elif isinstance(payload, dict):
+        inner = payload.get("instances")
+        if isinstance(inner, list):
+            return parse_instance_list(inner)
+        for name, meta in payload.items():
+            if isinstance(meta, dict):
+                pairs.append((str(name), meta))
+    out: List[str] = []
+    for name, meta in pairs:
+        if not meta.get("api"):
+            continue
+        uri = str(meta.get("uri") or f"https://{name}")
+        if not uri.lower().startswith("https://"):
+            continue
+        try:
+            host = (urlsplit(uri).hostname or "").lower()
+        except ValueError:
+            continue
+        if host and "." in host and host not in out:
+            out.append(host)
+    return tuple(out)
+
+
+def _dynamic_instances(timeout: float) -> Tuple[str, ...]:
+    """Freshly health-sorted official-list instances (cached 30 min).
+
+    Failures return the last known set (possibly empty) — the static
+    config list still gets its turn either way.
+    """
+    global _dyn_hosts, _dyn_ts
+    now = time.monotonic()
+    if now - _dyn_ts < _DYN_TTL:
+        return _dyn_hosts
+    import httpx
+
+    try:
+        resp = httpx.get(
+            _DISCOVERY_URL,
+            timeout=timeout,
+            follow_redirects=True,
+            headers={"User-Agent": _UA, "Accept": "application/json"},
+        )
+        if resp.status_code != 200:
+            raise ValueError(f"HTTP {resp.status_code}")
+        hosts = parse_instance_list(resp.json())
+    except Exception as e:
+        ig_log(f"stream instance list unavailable: {type(e).__name__}")
+        _dyn_ts = now  # don't hammer the list endpoint on outage
+        return _dyn_hosts
+    if hosts:
+        _dyn_hosts, _dyn_ts = hosts, now
+    else:
+        # Empty answer is suspicious (list format drift) — keep the
+        # previous working set and retry after the TTL.
+        _dyn_ts = now
+    return _dyn_hosts
+
+
+def _candidate_hosts(timeout: float) -> Tuple[str, ...]:
+    """Discovered instances first (fresh health data), then static config."""
+    out: List[str] = []
+    for h in (*_dynamic_instances(timeout), *ig_config.stream_instances):
+        h = str(h).lower().strip().strip(".")
+        if h and "." in h and " " not in h and h not in out:
+            out.append(h)
+    return tuple(out)
+
+
+def _same_host(url: str, host: str) -> bool:
+    try:
+        h = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return h == host
+
+
 def fetch_stream(video_id: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any], str]:
-    """First configured mirror that yields usable direct stream URLs.
+    """First mirror (discovered or configured) with usable stream URLs.
 
     Returns ``(formats, meta, mirror_host)``.  Raises ``IGResolveFailed``
     when every mirror fails — a *non-fatal* outcome so the caller can
     continue with remaining yt-dlp strategies (PO token / cookies).
 
-    Timeouts are hard-bounded: one deadline for the whole phase (2× the
-    per-request timeout) so a wall of dead mirrors can never eat the
-    job's time budget.
+    Candidates come from the official Invidious instance list (refreshed
+    every 30 min) plus the configured ``MEDIA_STREAM_INSTANCES`` list, so
+    dead static entries cost at most one quick probe and replacement
+    mirrors appear without a redeploy.
+
+    Timeouts are hard-bounded: 2× the per-request timeout for up to two
+    candidates, growing with the list but never past 20 s — a wall of
+    dead mirrors can't eat the job's time budget.  A pass that ends on
+    transient signals (5xx / 429 / transport errors) gets ONE retry pass
+    inside the same deadline; definitive 404/403 answers don't retry.
     """
     import httpx
 
@@ -246,59 +365,83 @@ def fetch_stream(video_id: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any], s
         raise IGResolveFailed("Stream mirrors: missing video id.")
 
     per_request = ig_config.stream_timeout
-    deadline = time.monotonic() + per_request * 2
+    candidates = _candidate_hosts(per_request)
+    deadline = time.monotonic() + min(20.0, per_request * max(2, len(candidates)))
     last = "no mirror reachable"
+    transient = False
 
-    for host in ig_config.stream_instances:
-        if time.monotonic() > deadline:
-            break
-        base = f"https://{host}"
-        try:
-            client = httpx.Client(
-                timeout=per_request,
-                follow_redirects=True,
-                proxy=ig_config.proxy_url or None,
-                headers={"User-Agent": _UA, "Accept": "application/json"},
-            )
-        except Exception as e:  # pragma: no cover — client construction
-            last = f"{host}: {type(e).__name__}"
-            continue
-        with client:
-            for kind, tpl in _ENDPOINTS:
-                if time.monotonic() > deadline:
-                    break
-                url = base + tpl.format(vid=vid)
-                try:
-                    resp = client.get(url)
-                except Exception as e:
-                    # Dead host — don't wait again on it, move to next.
-                    last = f"{host}: {type(e).__name__}"
-                    break
-                if resp.status_code != 200:
-                    last = f"{host}: HTTP {resp.status_code}"
-                    continue
-                try:
-                    data = resp.json()
-                except ValueError:
-                    last = f"{host}: bad json"
-                    continue
-                if not isinstance(data, dict):
-                    continue
-                if kind == "piped" and not (
-                    data.get("videoStreams") or data.get("audioStreams")
-                ):
-                    continue
-                if kind == "invidious" and not (
-                    data.get("adaptiveFormats") or data.get("formatStreams")
-                ):
-                    continue
-                fmts, meta = parse_payload(kind, data)
-                usable = [f for f in fmts if f.get("url") and host_allowed(f["url"])]
-                if not usable:
-                    last = f"{host}: no usable streams"
-                    continue
-                metrics.bump("stream_hits")
-                ig_log(f"stream mirror {host} ({kind}) → {len(usable)} direct URL(s)")
-                return usable, meta, host
+    def _pass() -> Optional[Tuple[List[Dict[str, Any]], Dict[str, Any], str]]:
+        nonlocal last, transient
+        for host in candidates:
+            if time.monotonic() > deadline:
+                break
+            base = f"https://{host}"
+            try:
+                client = httpx.Client(
+                    timeout=per_request,
+                    follow_redirects=True,
+                    proxy=ig_config.proxy_url or None,
+                    headers={"User-Agent": _UA, "Accept": "application/json"},
+                )
+            except Exception as e:  # pragma: no cover — client construction
+                last = f"{host}: {type(e).__name__}"
+                continue
+            with client:
+                for kind, tpl in _ENDPOINTS:
+                    if time.monotonic() > deadline:
+                        break
+                    url = base + tpl.format(vid=vid)
+                    try:
+                        resp = client.get(url)
+                    except Exception as e:
+                        # Dead host — don't wait again on it, move to next.
+                        last = f"{host}: {type(e).__name__}"
+                        transient = True
+                        break
+                    if resp.status_code != 200:
+                        last = f"{host}: HTTP {resp.status_code}"
+                        if resp.status_code == 429 or resp.status_code >= 500:
+                            transient = True
+                        continue
+                    try:
+                        data = resp.json()
+                    except ValueError:
+                        last = f"{host}: bad json"
+                        continue
+                    if not isinstance(data, dict):
+                        continue
+                    if kind == "invidious" and not (
+                        data.get("adaptiveFormats") or data.get("formatStreams")
+                    ):
+                        continue
+                    if kind == "piped" and not (
+                        data.get("videoStreams") or data.get("audioStreams")
+                    ):
+                        continue
+                    fmts, meta = parse_payload(kind, data)
+                    usable = [
+                        f
+                        for f in fmts
+                        if f.get("url")
+                        and (host_allowed(f["url"]) or _same_host(f["url"], host))
+                    ]
+                    if not usable:
+                        last = f"{host}: no usable streams"
+                        continue
+                    # Media may be served by the mirror itself — let the
+                    # resolver/downloader allowlist checks pass for it.
+                    register_stream_host(host)
+                    metrics.bump("stream_hits")
+                    ig_log(
+                        f"stream mirror {host} ({kind}) → {len(usable)} direct URL(s)"
+                    )
+                    return usable, meta, host
+        return None
 
-    raise IGResolveFailed(f"Stream mirrors unreachable ({last}).")
+    result = _pass()
+    if result is None and transient and time.monotonic() < deadline:
+        ig_log("stream mirrors: transient failure — one retry pass")
+        result = _pass()
+    if result is None:
+        raise IGResolveFailed(f"Stream mirrors unreachable ({last}).")
+    return result

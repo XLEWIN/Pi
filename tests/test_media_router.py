@@ -25,6 +25,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 # ── Environment isolation — must precede bot imports ──────────────
 ROOT = Path(__file__).resolve().parents[1]
@@ -753,12 +754,213 @@ class TestStreamNormalize(unittest.TestCase):
         self.assertTrue(
             host_allowed("https://rr1---sn-x.googlevideo.com/videoplayback?id=1")
         )
-        # Mirror host itself + proxied sibling subdomain.
-        self.assertTrue(host_allowed("https://inv.nadeko.net/api/v1/videos/x"))
-        self.assertTrue(host_allowed("https://pipedproxy.adminforge.de/watch/x"))
+        # Configured mirror host itself + proxied sibling subdomain.
+        self.assertTrue(host_allowed("https://invidious.f5.si/api/v1/videos/x"))
+        self.assertTrue(host_allowed("https://proxy.f5.si/watch/x"))
         # Everything else stays blocked (SSRF).
         self.assertFalse(host_allowed("https://evil.example.com/x"))
         self.assertFalse(host_allowed("https://googlevideo.com.evil.com/x"))
+
+    def test_register_stream_host_allows_mirror_media(self):
+        # A mirror discovered at runtime may proxy media itself; fetching
+        # registers it, and only then does its media pass the allowlist.
+        self.assertFalse(host_allowed("https://mirror.newly-found.example/v.mp4"))
+        self.assertFalse(host_allowed("https://cdn.mirror.newly-found.example/v.mp4"))
+        streams_mod.register_stream_host("mirror.newly-found.example")
+        self.assertTrue(host_allowed("https://mirror.newly-found.example/v.mp4"))
+        self.assertTrue(host_allowed("https://cdn.mirror.newly-found.example/v.mp4"))
+        # Unrelated hosts stay blocked (SSRF).
+        self.assertFalse(host_allowed("https://other.evil.example/x"))
+
+    def test_parse_instance_list_api_flag_and_https(self):
+        payload = [
+            ["good.example", {"api": True, "uri": "https://good.example"}],
+            ["noapi.example", {"api": False, "uri": "https://noapi.example"}],
+            ["insecure.example", {"api": True, "uri": "http://insecure.example"}],
+            ["nouri.example", {"api": True}],  # falls back to https://name
+            "garbage-entry",
+        ]
+        self.assertEqual(
+            streams_mod.parse_instance_list(payload),
+            ("good.example", "nouri.example"),
+        )
+
+    def test_parse_instance_list_shapes(self):
+        wrapped = {
+            "instances": [["a.example", {"api": True, "uri": "https://a.example"}]]
+        }
+        self.assertEqual(streams_mod.parse_instance_list(wrapped), ("a.example",))
+        mapped = {"b.example": {"api": True, "uri": "https://b.example"}}
+        self.assertEqual(streams_mod.parse_instance_list(mapped), ("b.example",))
+        self.assertEqual(streams_mod.parse_instance_list(None), ())
+        self.assertEqual(streams_mod.parse_instance_list([["broken"]]), ())
+        self.assertEqual(
+            streams_mod.parse_instance_list({"c.example": {"api": False}}), ()
+        )
+
+    def test_candidate_hosts_dynamic_first_then_static(self):
+        orig_dyn = (streams_mod._dyn_hosts, streams_mod._dyn_ts)
+        orig_cfg = streams_mod.ig_config
+        try:
+            streams_mod._dyn_hosts = ("fresh.example", "invidious.f5.si")
+            streams_mod._dyn_ts = streams_mod.time.monotonic()
+            streams_mod.ig_config = dataclasses.replace(
+                orig_cfg, stream_instances=("invidious.f5.si", "static.example.com")
+            )
+            cands = streams_mod._candidate_hosts(5.0)
+            self.assertEqual(
+                cands, ("fresh.example", "invidious.f5.si", "static.example.com")
+            )
+        finally:
+            streams_mod._dyn_hosts, streams_mod._dyn_ts = orig_dyn
+            streams_mod.ig_config = orig_cfg
+
+    def test_invidious_amp_unescape(self):
+        payload = {
+            "title": "T",
+            "author": "A",
+            "lengthSeconds": 5,
+            "formatStreams": [
+                {
+                    "url": "https://rr1---sn-x.googlevideo.com/videoplayback"
+                    "?a=1&amp;b=2",
+                    "itag": "18",
+                    "container": "mp4",
+                    "height": 360,
+                    "qualityLabel": "360p",
+                    "contentLength": "1000",
+                },
+            ],
+        }
+        fmts = streams_mod.invidious_formats(payload)
+        self.assertIn("b=2", fmts[0]["url"])
+        self.assertNotIn("&amp;", fmts[0]["url"])
+
+    @staticmethod
+    def _fake_httpx():
+        """(Response class, hits dict, Client class) for fetch_stream tests."""
+        hits = {"invidious": 0, "piped": 0, "other": 0}
+
+        class _Resp:
+            def __init__(self, status=200, data=None):
+                self.status_code = status
+                self._data = data
+
+            def json(self):
+                if self._data is None:
+                    raise ValueError("not json")
+                return self._data
+
+        return _Resp, hits
+
+    def test_fetch_stream_transient_retry_and_registration(self):
+        _Resp, hits = self._fake_httpx()
+        payload = {
+            "title": "Demo",
+            "author": "Chan",
+            "lengthSeconds": 42,
+            "videoThumbnails": [],
+            "formatStreams": [],
+            "adaptiveFormats": [
+                {
+                    "url": "https://host-a.example/videoplayback?v=1",
+                    "itag": "137",
+                    "type": "video/mp4; codecs=\"avc1.640028\"",
+                    "bitrate": 4_000_000,
+                    "clen": "25000000",
+                    "height": 1080,
+                    "qualityLabel": "1080p",
+                    "container": "mp4",
+                },
+                {
+                    "url": "https://host-a.example/videoplayback?a=1",
+                    "itag": "140",
+                    "type": "audio/mp4; codecs=\"mp4a.40.2\"",
+                    "bitrate": 128000,
+                    "clen": "900000",
+                    "container": "mp4",
+                },
+            ],
+        }
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def get(self, url):
+                if "host-a.example" in url:
+                    if "/api/v1/videos/" in url:
+                        hits["invidious"] += 1
+                        if hits["invidious"] == 1:
+                            return _Resp(500)  # transient → retry pass
+                        return _Resp(200, payload)
+                    hits["piped"] += 1
+                    return _Resp(404)
+                hits["other"] += 1
+                return _Resp(404)
+
+        cfg = dataclasses.replace(
+            streams_mod.ig_config,
+            stream_instances=("host-a.example", "host-b.example"),
+        )
+        with mock.patch.object(streams_mod, "ig_config", cfg), \
+                mock.patch.object(
+                    streams_mod, "_dynamic_instances", return_value=()
+                ), \
+                mock.patch("httpx.Client", _Client):
+            fmts, meta, host = streams_mod.fetch_stream("abc123")
+
+        self.assertEqual(host, "host-a.example")
+        self.assertEqual(len(fmts), 2)
+        self.assertEqual(meta.get("duration"), 42)
+        # Pass 1: 500 + piped 404 + host-b misses; retry: healthy 200.
+        self.assertEqual(hits["invidious"], 2)
+        self.assertEqual(hits["other"], 2)  # host-b probed in both passes
+        # Mirror's own host now passes every downstream allowlist check.
+        self.assertTrue(host_allowed("https://host-a.example/v.mp4"))
+        self.assertTrue(host_allowed("https://cdn.host-a.example/v.mp4"))
+
+    def test_fetch_stream_no_retry_on_definitive_404(self):
+        _Resp, hits = self._fake_httpx()
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def get(self, url):
+                if "/api/v1/videos/" in url:
+                    hits["invidious"] += 1
+                else:
+                    hits["piped"] += 1
+                return _Resp(404)
+
+        cfg = dataclasses.replace(
+            streams_mod.ig_config,
+            stream_instances=("only.example",),
+        )
+        with mock.patch.object(streams_mod, "ig_config", cfg), \
+                mock.patch.object(
+                    streams_mod, "_dynamic_instances", return_value=()
+                ), \
+                mock.patch("httpx.Client", _Client):
+            with self.assertRaises(IGResolveFailed):
+                streams_mod.fetch_stream("zz")
+
+        # Definitive misses don't retry: exactly one pass over the list.
+        self.assertEqual(hits["invidious"], 1)
+        self.assertEqual(hits["piped"], 1)
 
 
 class TestExhaustedError(unittest.TestCase):

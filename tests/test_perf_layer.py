@@ -342,6 +342,64 @@ class TestIdentityFastSkip(_PerfBase):
             db.collection("users").count_documents({"user_id": USER}), 1
         )
 
+    def test_upsert_creation_fields_and_single_row(self):
+        self.assertTrue(db.register_user(USER, "u9", "U9", None))
+        row = db.collection("users").find_one({"user_id": USER})
+        self.assertEqual(row.get("username"), "u9")
+        self.assertEqual(row.get("is_bot"), 0)
+        self.assertEqual(row.get("total_messages"), 0)
+        self.assertEqual(row.get("warnings"), 0)
+        self.assertEqual(row.get("is_banned"), 0)
+        self.assertEqual(row.get("is_muted"), 0)
+        self.assertIn("first_seen", row)
+        self.assertIn("last_seen", row)
+        # Update path refreshes profile fields but never resets
+        # creation-only counters/flags.
+        self.assertTrue(db.add_user(USER, "u9b", None, None))
+        row = db.collection("users").find_one({"user_id": USER})
+        self.assertEqual(row.get("username"), "u9b")
+        self.assertEqual(row.get("total_messages"), 0)
+        self.assertEqual(row.get("is_bot"), 0)
+        self.assertEqual(
+            db.collection("users").count_documents({"user_id": USER}), 1
+        )
+
+    def test_upsert_race_falls_back_to_plain_update(self):
+        """E11000 from a lost insert race → refresh row, report not-created.
+
+        The old update-then-insert pair raised E11000 whenever two writers
+        saw matched_count=0 for the same new user; the atomic upsert plus
+        this fallback keeps the second writer alive and single-rowed.
+        """
+        self.assertTrue(db.register_user(USER, "u1", "U", None))
+        # _AsyncColl has __slots__ — the mongomock collection underneath
+        # is the patchable object (and is shared across __getitem__).
+        raw = db._mongo._real["users"]._inner
+        real_update = raw.update_one
+        calls = {"n": 0}
+
+        def flaky(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise Exception(
+                    "E11000 duplicate key error collection: pi_bot.users "
+                    "index: user_id_1 dup key: { user_id: 710001 }"
+                )
+            return real_update(*args, **kwargs)
+
+        raw.update_one = flaky
+        try:
+            created = db.register_user(USER, "u1x", None, None)
+        finally:
+            del raw.update_one
+        self.assertFalse(created)
+        self.assertGreaterEqual(calls["n"], 2)
+        row = db.collection("users").find_one({"user_id": USER})
+        self.assertEqual(row.get("username"), "u1x")
+        self.assertEqual(
+            db.collection("users").count_documents({"user_id": USER}), 1
+        )
+
     def test_activity_dedupe_inserts_once(self):
         db.update_user_activity(USER, "sent message", CHAT, "T", dedupe=True)
         db.update_user_activity(USER, "sent message", CHAT, "T", dedupe=True)

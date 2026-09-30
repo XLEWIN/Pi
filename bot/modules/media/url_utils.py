@@ -96,6 +96,23 @@ def normalize_url(raw: str) -> str:
 # match, so faketiktokcdn.com never passes.
 _TT_CDN_RE = re.compile(r"^p\d+[-.].*tiktokcdn\.com$", re.I)
 
+# Mirrors discovered at runtime (official Invidious instance list) may
+# proxy media through their own host — host_allowed can't know them at
+# import time. fetch_stream registers the mirror it actually used, so
+# only hosts we already talked to (and whose JSON carried real formats)
+# ever join this set.
+_RUNTIME_STREAM_HOSTS: set = set()
+_RUNTIME_STREAM_DOMAINS: set = set()
+
+
+def register_stream_host(host: str) -> None:
+    """Allow media fetches from a stream mirror we just used successfully."""
+    host = (host or "").strip().lower()
+    if "." not in host or " " in host:
+        return
+    _RUNTIME_STREAM_HOSTS.add(host)
+    _RUNTIME_STREAM_DOMAINS.add(".".join(host.split(".")[-2:]))
+
 
 def host_allowed(url: str) -> bool:
     """True if *url*'s host is on the allowlist (for any outbound fetch)."""
@@ -113,6 +130,10 @@ def host_allowed(url: str) -> bool:
     if host in STREAM_MEDIA_HOSTS:
         return True
     if any(host.endswith("." + dom) for dom in STREAM_MEDIA_DOMAINS):
+        return True
+    if host in _RUNTIME_STREAM_HOSTS:
+        return True
+    if any(host.endswith("." + dom) for dom in _RUNTIME_STREAM_DOMAINS):
         return True
     if any(host.endswith(suf) for suf in ALLOWED_MEDIA_HOST_SUFFIXES):
         return True

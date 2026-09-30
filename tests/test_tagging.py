@@ -778,6 +778,68 @@ class TestPresence(unittest.IsolatedAsyncioTestCase):
                 {"chat_id": CHAT, "user_id": 424242}
             )
 
+    async def test_refresh_once_skips_unresolvable_chats(self):
+        """A chat the session can never resolve is not re-synced every tick."""
+        from bot.modules.tagging.presence.mtproto import MtprotoPresence
+
+        tdb.upsert_member(CHAT, 515151, display_name="Ref")
+        try:
+            prov = MtprotoPresence()
+            synced = []
+
+            async def _fake_sync(chat_id):
+                synced.append(chat_id)
+                return 0
+
+            prov.sync_chat = _fake_sync
+            prov._unresolved.add(CHAT)
+            await prov._refresh_once()
+            self.assertNotIn(CHAT, synced)
+        finally:
+            tdb._db.collection("tag_members").delete_one(
+                {"chat_id": CHAT, "user_id": 515151}
+            )
+
+    async def test_sync_chat_unresolvable_marked_for_skip(self):
+        """'Could not find the input entity' → remember, don't warn."""
+        from bot.modules.tagging.presence.mtproto import MtprotoPresence
+
+        prov = MtprotoPresence()
+        prov.available = True
+
+        class _NoEntityClient:
+            def iter_participants(self, chat_id):
+                async def _gen():
+                    raise ValueError(
+                        "Could not find the input entity for PeerChannel(id=-100123)"
+                    )
+                    yield  # pragma: no cover — keeps _gen a generator
+
+                return _gen()
+
+        prov._client = _NoEntityClient()
+        self.assertEqual(await prov.sync_chat(-100123), 0)
+        self.assertIn(-100123, prov._unresolved)
+
+    async def test_sync_chat_other_errors_stay_out_of_skip_set(self):
+        """Transient/other failures keep warning every cycle (old behavior)."""
+        from bot.modules.tagging.presence.mtproto import MtprotoPresence
+
+        prov = MtprotoPresence()
+        prov.available = True
+
+        class _BoomClient:
+            def iter_participants(self, chat_id):
+                async def _gen():
+                    raise RuntimeError("FLOOD_WAIT_42")
+                    yield  # pragma: no cover — keeps _gen a generator
+
+                return _gen()
+
+        prov._client = _BoomClient()
+        self.assertEqual(await prov.sync_chat(-100124), 0)
+        self.assertNotIn(-100124, prov._unresolved)
+
 
 class _StubPresence:
     """No-op presence: leaves ranks at defaults, records calls."""

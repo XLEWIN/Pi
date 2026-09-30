@@ -75,6 +75,9 @@ class MtprotoPresence(PresenceProvider):
         self._task: Optional[asyncio.Task] = None
         # (chat_id, user_id) → last online timestamp from MTProto.
         self._online: Dict[Tuple[int, int], float] = {}
+        # Chats the session can never resolve (not a member, no access
+        # hash) — retried forever they'd warn every tick for nothing.
+        self._unresolved: set = set()
 
     # ── lifecycle ─────────────────────────────────────────────────
 
@@ -174,6 +177,8 @@ class MtprotoPresence(PresenceProvider):
         # sync db helper (one hop per interval — this is a background
         # loop, not the message path).
         for chat_id in await asyncio.to_thread(known_chat_ids):
+            if chat_id in self._unresolved:
+                continue  # never resolvable by this session — skip quietly
             await self.sync_chat(chat_id)
 
     async def _refresh_loop(self) -> None:
@@ -235,7 +240,19 @@ class MtprotoPresence(PresenceProvider):
                     await asyncio.to_thread(_write_members, chat_id, pending)
                     pending.clear()
         except Exception as e:
-            logger.warning(f"Tagging MTProto sync chat {chat_id} failed: {e}")
+            if "could not find the input entity" in str(e).lower():
+                # The session isn't (and may never become) a member of
+                # this chat: retrying every cycle only spams the log.
+                # Remember it so the periodic refresh skips it; a manual
+                # sync still retries (a later join fixes the access hash).
+                self._unresolved.add(chat_id)
+                logger.debug(
+                    "Tagging MTProto: chat %s not resolvable by session "
+                    "— skipped until re-join",
+                    chat_id,
+                )
+            else:
+                logger.warning(f"Tagging MTProto sync chat {chat_id} failed: {e}")
             if pending:
                 try:
                     await asyncio.to_thread(_write_members, chat_id, pending)

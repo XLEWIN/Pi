@@ -1369,7 +1369,12 @@ class Database:
     async def _upsert_user_row(self, user_id: int, username: Optional[str],
                          first_name: Optional[str], last_name: Optional[str],
                          is_bot: bool, now: str) -> bool:
-        """One update+maybe-insert pass. Returns True when a row was created."""
+        """One atomic upsert. Returns True when a row was created.
+
+        update+insert (two round trips) raced concurrent writers: both saw
+        matched_count=0 and the second insert died with E11000. A single
+        upsert keyed on the unique user_id index closes that window.
+        """
         sets: Dict[str, Any] = {"last_seen": now}
         if username is not None:
             sets["username"] = username
@@ -1377,27 +1382,36 @@ class Database:
             sets["first_name"] = first_name
         if last_name is not None:
             sets["last_name"] = last_name
-        res = await self._mongo["users"].update_one(
-            {"user_id": user_id}, {"$set": sets}
-        )
-        if res.matched_count == 0:
-            await self._mongo["users"].insert_one(
-                {
-                    "user_id": user_id,
-                    "username": username,
-                    "first_name": first_name,
-                    "last_name": last_name,
-                    "is_bot": 1 if is_bot else 0,
-                    "first_seen": now,
-                    "last_seen": now,
-                    "total_messages": 0,
-                    "warnings": 0,
-                    "is_banned": 0,
-                    "is_muted": 0,
-                }
+        # Creation-only defaults; $setOnInsert cannot share keys with $set.
+        on_insert: Dict[str, Any] = {
+            "username": None,
+            "first_name": None,
+            "last_name": None,
+            "is_bot": 1 if is_bot else 0,
+            "first_seen": now,
+            "total_messages": 0,
+            "warnings": 0,
+            "is_banned": 0,
+            "is_muted": 0,
+        }
+        for k in ("username", "first_name", "last_name"):
+            if k in sets:
+                on_insert.pop(k, None)
+        try:
+            res = await self._mongo["users"].update_one(
+                {"user_id": user_id},
+                {"$set": sets, "$setOnInsert": on_insert},
+                upsert=True,
             )
-            return True
-        return False
+        except Exception as e:
+            if "E11000" not in str(e) and "duplicate" not in str(e).lower():
+                raise
+            # Another writer won the insert race — refresh the existing row.
+            await self._mongo["users"].update_one(
+                {"user_id": user_id}, {"$set": sets}
+            )
+            return False
+        return res.upserted_id is not None
 
     async def add_user(self, user_id: int, username: str = None, first_name: str = None,
                  last_name: str = None, is_bot: bool = False) -> bool:
