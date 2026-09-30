@@ -92,19 +92,28 @@ _YT_MAIN = (
 )
 _YT_ABOUT = "<div>5,334,053,111 views</div>"
 
-_IG_PAYLOAD = {
-    "data": {
-        "user": {
-            "username": "choud4ary",
-            "full_name": "Choud4ary",
-            "biography": "jb Tk account na ude chalate rho",
-            "profile_pic_url_hd": "https://scontent.cdninstagram.com/hd.jpg",
-            "edge_followed_by": {"count": 22},
-            "edge_follow": {"count": 24},
-            "edge_owner_to_timeline_media": {"count": 0},
-        }
-    },
-}
+_IG_HTML = (
+    # Instagram entity-encodes the @ in its meta tags (&#064;) — fixtures
+    # mirror the shipped markup exactly.
+    '<meta property="og:title" content="Choud4ary (&#064;choud4ary) \u2022 '
+    'Instagram photos and videos">'
+    '<meta property="og:description" content="22 Followers, 24 Following, '
+    '0 Posts - See Instagram photos and videos from Choud4ary '
+    '(&#064;choud4ary)">'
+    '<meta property="og:image" content="https://scontent.cdninstagram.com/a.jpg">'
+    '"biography":"jb Tk account na ude chalate rho"'
+    '"full_name":"Choud4ary"'
+    '"is_verified":false'
+)
+
+_IG_HTML_BIG = (
+    '<meta property="og:title" content="Cristiano Ronaldo (&#064;cristiano) '
+    '\u2022 Instagram photos and videos">'
+    '<meta property="og:description" content="679M Followers, 649 Following, '
+    '4,137 Posts - See Instagram photos and videos from Cristiano Ronaldo '
+    '(&#064;cristiano)">'
+    '"biography":""'
+)
 
 
 def _profile(name="TriggeredInsaan", handle="@TriggeredInsaan",
@@ -157,9 +166,11 @@ class _StubClient:
     def __init__(self, queue):
         self._q = list(queue)
         self.calls: list = []
+        self.headers: list = []
 
     async def get(self, url, **kw):
         self.calls.append(url)
+        self.headers.append(kw.get("headers") or {})
         item = self._q.pop(0) if self._q else RuntimeError("stub queue empty")
         if isinstance(item, Exception):
             raise item
@@ -256,15 +267,22 @@ class TestParsers(unittest.TestCase):
             pm._parse_youtube("<html>gone</html>", "")
 
     def test_instagram(self):
-        p = pm._parse_instagram(_IG_PAYLOAD)
+        p = pm._parse_instagram_html(_IG_HTML)
         self.assertEqual(p["name"], "Choud4ary")
         self.assertEqual(p["handle"], "@choud4ary")
         self.assertEqual(p["bio"], "jb Tk account na ude chalate rho")
         self.assertEqual(p["stats"], ("22 Followers", "24 Following", "0 Posts"))
+        self.assertEqual(p["avatar"], "")
+
+    def test_instagram_big_counts_compact(self):
+        p = pm._parse_instagram_html(_IG_HTML_BIG)
+        self.assertEqual(p["handle"], "@cristiano")
+        self.assertEqual(p["stats"],
+                         ("679M Followers", "649 Following", "4.1K Posts"))
 
     def test_instagram_missing_user_raises(self):
         with self.assertRaises(pm.ProfileError):
-            pm._parse_instagram({"data": {}})
+            pm._parse_instagram_html("<html><body>soft 404</body></html>")
 
     def test_fxtwitter(self):
         p = pm._parse_fxtwitter(_FX)
@@ -378,20 +396,21 @@ class TestFetchX(unittest.IsolatedAsyncioTestCase):
 
 
 class TestFetchInstagram(unittest.IsolatedAsyncioTestCase):
-    async def test_success_from_mirror_host(self):
-        ok = _Resp(200, data=_IG_PAYLOAD)
-        client = _StubClient([_Resp(403), ok])
+    async def test_success_with_crawler_ua(self):
+        client = _StubClient([_Resp(200, body=_IG_HTML)])
         prof = await pm._fetch_instagram(client, "choud4ary")
         self.assertEqual(prof["handle"], "@choud4ary")
-        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(prof["stats"], ("22 Followers", "24 Following",
+                                         "0 Posts"))
+        self.assertEqual(len(client.calls), 1)
+        self.assertIn("Googlebot", (client.headers[0] or {}).get("User-Agent", ""))
 
-    async def test_429_all_hosts_gives_rate_limit_message(self):
-        client = _StubClient([_Resp(429), _Resp(429),
-                              _Resp(429), _Resp(429)])
-        with mock.patch.object(pm, "_IG_DELAY", 0):
-            with self.assertRaises(pm.ProfileError) as ctx:
-                await pm._fetch_instagram(client, "choud4ary")
+    async def test_429_reports_rate_limit(self):
+        client = _StubClient([_Resp(429)])
+        with self.assertRaises(pm.ProfileError) as ctx:
+            await pm._fetch_instagram(client, "choud4ary")
         self.assertIn("rate-limiting", str(ctx.exception))
+        self.assertEqual(len(client.calls), 1)
 
     async def test_404_raises_not_found(self):
         client = _StubClient([_Resp(404)])
@@ -399,6 +418,41 @@ class TestFetchInstagram(unittest.IsolatedAsyncioTestCase):
             await pm._fetch_instagram(client, "ghost")
         self.assertEqual(str(ctx.exception), "user not found")
         self.assertEqual(len(client.calls), 1)
+
+    async def test_full_page_without_og_is_missing_user(self):
+        big = _Resp(200, body="<html>" + "x" * 400_000)
+        client = _StubClient([big, big])
+        with mock.patch.object(pm, "_IG_RETRY", 0):
+            with self.assertRaises(pm.ProfileError) as ctx:
+                await pm._fetch_instagram(client, "ghost")
+        self.assertEqual(str(ctx.exception), "user not found")
+        self.assertEqual(len(client.calls), 2)  # one patient retry
+
+    async def test_ogless_variant_recovers_via_json_fallback(self):
+        json_variant = _Resp(200, body=(
+            '<script>{"username":"cristiano","full_name":"Cristiano Ronaldo",'
+            '"biography":"","follower_count":679255076,"following_count":636'
+            '}</script>' + "x" * 400_000
+        ))
+        client = _StubClient([json_variant])
+        prof = await pm._fetch_instagram(client, "cristiano")
+        self.assertEqual(prof["handle"], "@cristiano")
+        self.assertEqual(prof["stats"][0], "679.3M Followers")
+
+    async def test_small_block_page_reports_rate_limit(self):
+        small = _Resp(200, body="<html>challenge</html>")
+        client = _StubClient([small, small])
+        with mock.patch.object(pm, "_IG_RETRY", 0):
+            with self.assertRaises(pm.ProfileError) as ctx:
+                await pm._fetch_instagram(client, "choud4ary")
+        self.assertIn("rate-limiting", str(ctx.exception))
+
+    async def test_network_error_reports_reachability(self):
+        client = _StubClient([RuntimeError("boom"), RuntimeError("boom2")])
+        with mock.patch.object(pm, "_IG_RETRY", 0):
+            with self.assertRaises(pm.ProfileError) as ctx:
+                await pm._fetch_instagram(client, "choud4ary")
+        self.assertIn("Could not reach Instagram", str(ctx.exception))
 
 
 # ═════════════════════════════════════════════════════════════════

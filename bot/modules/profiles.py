@@ -10,7 +10,9 @@ Data sources (no API keys):
             → paced retries for its ~1/s rate limit
   X        api.fxtwitter.com profile JSON → syndication fallback
   YouTube  channel HTML (ytInitialData) + /about for total views
-  Instagram  web_profile_info (x-ig-app-id) → i.instagram.com mirror
+  Instagram  public profile HTML fetched as a crawler — the og:
+            meta tags carry counts/name/handle (the official JSON
+            route answers 401 require_login to nearly every IP)
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ import io
 import json
 import re
 import time
-from html import escape
+from html import escape, unescape
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -48,7 +50,11 @@ _UA = (
 _TIMEOUT = httpx.Timeout(8.0, connect=6.0)
 _CACHE_TTL = 300.0  # seconds — repeat searches answer instantly
 _RETRY_DELAY = 1.3   # seconds between tikwm attempts (its rate limit is ~1/s)
-_IG_DELAY = 2.0      # seconds between Instagram 429 retries
+# Instagram serves fully rendered profile pages to search crawlers and
+# blocks ordinary browsers/APIs; this UA gets the SSR page everywhere.
+_IG_UA = ("Mozilla/5.0 (compatible; Googlebot/2.1; "
+          "+http://www.google.com/bot.html)")
+_IG_RETRY = 1.0  # seconds before the single patient Instagram retry
 
 #: Platform display spec: template file, blue button label, profile URL.
 _PLATFORMS: Dict[str, Dict[str, str]] = {
@@ -323,21 +329,81 @@ def _parse_youtube(main_html: str, about_html: str) -> Dict[str, Any]:
     }
 
 
-def _parse_instagram(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """web_profile_info response → profile dict."""
-    user = (payload.get("data") or {}).get("user") or payload.get("user") or {}
-    handle = user.get("username") or ""
+# og:description layout: "679M Followers, 649 Following, 4,137 Posts - See
+# Instagram photos and videos from Cristiano Ronaldo (@cristiano)".
+# Private accounts omit the Posts clause.
+_IG_COUNTS = re.compile(
+    r"([\d.,]+\s*[KMB]?)\s+Followers,\s*([\d.,]+\s*[KMB]?)\s+Following"
+    r"(?:,\s*([\d.,]+\s*[KMB]?)\s+Posts)?",
+    re.I,
+)
+
+
+def _parse_instagram_html(page: str) -> Dict[str, Any]:
+    """Public profile page → profile dict.
+
+    Primary: Instagram fully renders profile pages for crawler
+    user-agents; og:description carries follower/following/post counts
+    and og:title carries display name + handle.
+    Fallback: transient variants drop the og: tags but keep the
+    embedded account JSON (follower_count etc.).
+    Neither on a full-size page means the account is gone. The
+    scontent avatar URLs are signed for logged-in sessions only, so
+    the card keeps the template's own avatar art.
+    """
+    desc_raw = _re1(r'<meta property="og:description" content="([^"]*)"',
+                    page or "")
+    if not desc_raw:
+        # Embedded-JSON path (og-less A/B variant of the same page).
+        pos = (page or "").find('"follower_count"')
+        if pos >= 0:
+            seg = page[max(0, pos - 500):pos + 500]
+            handle = _re1(r'"username":\s*"([A-Za-z0-9._]{1,40})"', seg) or ""
+            if handle:
+                name = _re1(r'"full_name":\s*"((?:[^"\\]|\\.)*)"', seg) or handle
+                bio = _re1(r'"biography":\s*"((?:[^"\\]|\\.)*)"', seg) or ""
+                fcount = _re1(r'"follower_count":\s*(\d+)', seg)
+                fwing = _re1(r'"following_count":\s*(\d+)', seg)
+                return {
+                    "name": _jstr(name),
+                    "handle": f"@{handle}",
+                    "bio": _jstr(bio).strip(),
+                    "avatar": "",
+                    "stats": (
+                        f"{compact(int(fcount))} Followers",
+                        f"{compact(int(fwing)) if fwing else '—'} Following",
+                        "— Posts",
+                    ),
+                }
+        raise ProfileError("user not found")
+    # The @ in the shipped meta tags is an HTML entity (&#064;) — unescape
+    # BEFORE hunting for the (@handle) form.
+    desc = unescape(desc_raw)
+    title = unescape(
+        _re1(r'<meta property="og:title" content="([^"]*)"', page) or ""
+    )
+    handle = (
+        _re1(r"\(@([A-Za-z0-9._]{1,40})\)", desc)
+        or _re1(r"\(@([A-Za-z0-9._]{1,40})\)", title)
+        or ""
+    )
     if not handle:
         raise ProfileError("user not found")
+    m = _IG_COUNTS.search(desc)
+    followers = following = posts = ""
+    if m:
+        followers, following, posts = m.group(1), m.group(2), (m.group(3) or "")
+    name = title.split("(@")[0].strip() or handle
+    bio = _re1(r'"biography":\s*"((?:[^"\\]|\\.)*)"', page) or ""
     return {
-        "name": user.get("full_name") or handle,
+        "name": name,
         "handle": f"@{handle}",
-        "bio": (user.get("biography") or "").strip(),
-        "avatar": user.get("profile_pic_url_hd") or user.get("profile_pic_url") or "",
+        "bio": _jstr(bio).strip() if bio else "",
+        "avatar": "",
         "stats": (
-            f"{compact((user.get('edge_followed_by') or {}).get('count'))} Followers",
-            f"{compact((user.get('edge_follow') or {}).get('count'))} Following",
-            f"{compact((user.get('edge_owner_to_timeline_media') or {}).get('count'))} Posts",
+            f"{compact(_num(followers)) if followers else '—'} Followers",
+            f"{compact(_num(following)) if following else '—'} Following",
+            f"{compact(_num(posts)) if posts else '—'} Posts",
         ),
     }
 
@@ -449,49 +515,49 @@ async def _fetch_youtube(client: httpx.AsyncClient, user: str) -> Dict[str, Any]
 
 
 async def _fetch_instagram(client: httpx.AsyncClient, user: str) -> Dict[str, Any]:
-    headers = {
-        "X-IG-App-ID": "936619743392459",
-        "X-ASBD-ID": "129477",
-        "Accept": "*/*",
-        "Referer": f"https://www.instagram.com/{user}/",
-    }
-    urls = (
-        "https://www.instagram.com/api/v1/users/web_profile_info/",
-        "https://i.instagram.com/api/v1/users/web_profile_info/",
-    )
-    last: Optional[Exception] = None
-    for base in urls:
-        for _try in (0, 1):  # one patient retry per host on 429/503
-            try:
-                r = await client.get(base, params={"username": user},
-                                     headers=headers)
-            except Exception as e:
-                last = e
-                break
-            if r.status_code == 200 and r.text.strip().startswith("{"):
-                try:
-                    return _parse_instagram(r.json())
-                except ProfileError:
-                    raise
-                except Exception as e:
-                    last = e
-                    break
-            if r.status_code == 404:
-                raise ProfileError("user not found")
-            if r.status_code in (429, 503):
-                last = ProfileError(
-                    "Instagram is rate-limiting this server — try again "
-                    "in a few minutes."
-                )
-                await asyncio.sleep(_IG_DELAY)
-                continue
-            last = ProfileError(
-                "Instagram is not responding right now — try again "
-                "in a few minutes."
+    """Fetch the public profile page as a search-engine crawler.
+
+    The official JSON route (web_profile_info) answers 401
+    "require_login" / 429 spam for nearly every unauthenticated IP —
+    verified across hosts, cookies and TLS impersonation. Instagram
+    still fully SSRs profile pages for crawler user-agents, and the
+    og: meta tags carry the same stats (verified live from a
+    previously-blocked IP). One patient retry covers transient
+    og-less response variants.
+    """
+    url = f"https://www.instagram.com/{user}/"
+    page = ""
+    for attempt in range(2):
+        if attempt:
+            await asyncio.sleep(_IG_RETRY)
+        try:
+            r = await client.get(
+                url,
+                headers={"User-Agent": _IG_UA, "Accept": "text/html,*/*"},
+                timeout=httpx.Timeout(10.0, connect=5.0),
             )
-            break  # non-retryable status on this host — try the next one
-    if isinstance(last, ProfileError):
-        raise last
+        except Exception:
+            continue
+        if r.status_code == 404:
+            raise ProfileError("user not found")
+        if r.status_code in (401, 403, 429, 503):
+            raise ProfileError("Instagram is rate-limiting this server — try again "
+                               "in a few minutes.")
+        if r.status_code != 200:
+            raise ProfileError("Instagram is not responding right now — try again "
+                               "in a few minutes.")
+        page = r.text
+        try:
+            return _parse_instagram_html(page)
+        except ProfileError:
+            continue  # transient og-less variant — retry once
+    if page and len(page) > 300_000:
+        # Full profile pages are ~1MB; challenge/consent pages are small.
+        # An account-less full-size page is Instagram's soft-404.
+        raise ProfileError("user not found")
+    if page:
+        raise ProfileError("Instagram is rate-limiting this server — try again "
+                           "in a few minutes.")
     raise ProfileError("Could not reach Instagram right now — try again "
                        "in a moment.")
 
