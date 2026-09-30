@@ -377,12 +377,20 @@ class TestWiring(unittest.TestCase):
         self.assertTrue(any(line.startswith("/bstats") for line in lines))
         self.assertTrue(any(line.startswith("/ping") for line in lines))
 
-    def test_help_documents_broadcast_in_gban_section(self):
-        gban = next(m for m in HELP_MENU if m["key"] == "gban")
-        lines = [line for _, cmds in gban["sections"] for line in cmds]
+    def test_gban_sudo_card_removed_from_help(self):
+        keys = [m["key"] for m in HELP_MENU]
+        self.assertNotIn("gban", keys, "Gban & Sudo section must stay removed")
+
+    def test_broadcast_and_massban_documented_in_general(self):
+        general = next(m for m in HELP_MENU if m["key"] == "general")
+        lines = [line for _, cmds in general["sections"] for line in cmds]
         self.assertTrue(
             any(line.startswith("/broadcast") for line in lines),
-            "Gban & Sudo help is missing the /broadcast entry",
+            "General help is missing the /broadcast entry",
+        )
+        self.assertTrue(
+            any(line.startswith("/massban") for line in lines),
+            "General help is missing the /massban entry",
         )
 
 
