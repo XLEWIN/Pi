@@ -51,6 +51,12 @@ def base_ydl_opts() -> Dict[str, Any]:
 
     if _cfg.proxy_url:
         opts["proxy"] = _cfg.proxy_url
+    # Cookies ride every strategy: a signed-in session passes YouTube's
+    # bot check on the first attempt instead of the last-resort step.
+    # yt-dlp only sends cookies matching each request's domain, so this
+    # is inert for TikTok/Instagram calls.
+    if _cfg.youtube_cookies_file:
+        opts["cookiefile"] = _cfg.youtube_cookies_file
     return opts
 
 

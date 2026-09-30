@@ -101,8 +101,8 @@ def _exhausted_error(sign_in_seen: bool, last_err: Optional[IGError]) -> IGError
         return IGResolveFailed(
             "YouTube is demanding a sign-in from this server (bot check). "
             "Alternate players and public stream mirrors were tried as well. "
-            "Set YOUTUBE_COOKIES_FILE (exported browser cookies) or "
-            "YOUTUBE_PO_TOKEN to bypass it."
+            "Set YOUTUBE_COOKIES_B64 (base64 of an exported browser cookie "
+            "file) or YOUTUBE_PO_TOKEN to bypass it."
         )
     return last_err or IGResolveFailed()
 

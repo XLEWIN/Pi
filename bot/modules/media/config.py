@@ -32,6 +32,42 @@ def _str(key: str, default: str = "") -> str:
     return (os.getenv(key) or "").strip() or default
 
 
+def _youtube_cookies_file() -> str:
+    """Resolve the YouTube cookies path.
+
+    Priority: explicit ``YOUTUBE_COOKIES_FILE`` path →
+    ``YOUTUBE_COOKIES_B64`` (base64 of a Netscape cookie file) →
+    ``YOUTUBE_COOKIES_TEXT`` (raw cookie-file contents).
+
+    The env variants are decoded once at startup into a runtime file
+    under the local temp root — credentials never live in the repo.
+    Returns "" when nothing usable is configured.
+    """
+    p = _str("YOUTUBE_COOKIES_FILE")
+    if p:
+        return p
+    if _str("YOUTUBE_COOKIES_B64"):
+        import base64
+
+        raw = "".join(_str("YOUTUBE_COOKIES_B64").split())
+        try:
+            data = base64.b64decode(raw, validate=False).decode("utf-8", "replace")
+        except Exception:
+            return ""
+    else:
+        data = _str("YOUTUBE_COOKIES_TEXT")
+    if not data or ".youtube.com" not in data:
+        # Refuse junk — a garbage cookiefile would break every yt-dlp call.
+        return ""
+    dest = TEMP_DIR.parent / "yt_cookies.txt"
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(data, encoding="utf-8")
+    except OSError:
+        return ""
+    return str(dest)
+
+
 # Handler groups — leave 0–13 free for existing modules; media auto-detect uses 14.
 HANDLER_GROUP = 14
 COMMAND_GROUP = 0
@@ -173,7 +209,8 @@ class IGConfig:
 
     # ── YouTube strategy knobs (optional — no defaults are secrets) ──
     youtube_po_token: str = _str("YOUTUBE_PO_TOKEN")
-    youtube_cookies_file: str = _str("YOUTUBE_COOKIES_FILE")
+    # Path > base64 env > raw-text env (decoded to a runtime file at load).
+    youtube_cookies_file: str = _youtube_cookies_file()
 
     # ── Direct stream mirrors (bypass YouTube's player API) ──────
     # Tried after the sign-in-free player clients and before the
@@ -190,6 +227,12 @@ class IGConfig:
     status_delay: float = max(0.0, float(os.getenv("MEDIA_STATUS_DELAY", "1.8") or 1.8))
     # Captions default: off / short / full.
     captions: str = _str("MEDIA_CAPTIONS", "short").lower()
+
+    # ── Download speed ────────────────────────────────────────────
+    # Parallel ranged connections for large files with a known size
+    # (falls back to a single stream when the server ignores Range).
+    parallel_download: bool = _bool("MEDIA_PARALLEL_DOWNLOAD", True)
+    parallel_connections: int = max(2, min(_int("MEDIA_PARALLEL_CONNECTIONS", 4), 8))
 
     # ── Rate limits / concurrency (per spec) ───────────────────
     max_requests_per_minute: int = max(1, _int("MEDIA_REQUESTS_PER_MINUTE", 10))

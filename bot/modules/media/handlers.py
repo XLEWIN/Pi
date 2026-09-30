@@ -59,6 +59,7 @@ from .platforms import (
     pick_media_url,
     resolve_target,
 )
+from .progress import JobProgress
 from .ratelimit import limiter
 from .resolver import ensure_yt_dlp, resolve_media
 from .singleflight import GlobalSemaphore, run_exclusive
@@ -258,6 +259,7 @@ async def process_url(
     reply_to_message_id: Optional[int] = None,
     requester_id: int = 0,
     settings: Optional[dict] = None,
+    progress: Optional[JobProgress] = None,
 ) -> bool:
     """
     Resolve → (cache | direct URL | download) → upload for one media URL.
@@ -294,6 +296,7 @@ async def process_url(
                 bot, chat_id, platform, norm, key, st,
                 reply_to_message_id=reply_to_message_id,
                 requester_id=requester_id,
+                progress=progress,
             )
     except IGError:
         raise
@@ -322,6 +325,7 @@ async def _run_job(
     *,
     reply_to_message_id: Optional[int],
     requester_id: int,
+    progress: Optional[JobProgress] = None,
 ) -> bool:
     async def _job() -> bool:
         t0 = time.perf_counter()
@@ -363,6 +367,8 @@ async def _run_job(
                 size_ok = not a.filesize or a.filesize <= max_bytes
                 if size_ok:
                     try:
+                        if progress is not None:
+                            progress.stage("upload")
                         sent = await transport.send_remote(
                             chat_id, a.url, a.kind,
                             caption=caption or "",
@@ -389,7 +395,9 @@ async def _run_job(
         job_dir = job_workdir(post.media_id)
         try:
             try:
-                files = await download_post(post, job_dir, max_bytes=max_bytes)
+                files = await download_post(
+                    post, job_dir, max_bytes=max_bytes, progress=progress
+                )
             except IGTooLarge:
                 raise  # size won't shrink on a re-resolve — skip the retry
             except Exception:
@@ -399,7 +407,11 @@ async def _run_job(
                 put_resolved(key, post)
                 caption = _build_caption(post, _safe_str(st, "captions", ig_config.captions), norm)
                 cache_keys = post.file_id_keys()
-                files = await download_post(post, job_dir, max_bytes=max_bytes)
+                files = await download_post(
+                    post, job_dir, max_bytes=max_bytes, progress=progress
+                )
+            if progress is not None:
+                progress.stage("upload")
             sent_any = False
             first = True
             for f in files:
@@ -437,13 +449,27 @@ async def _run_job(
 
 # ── Delayed status message (spec §48) ───────────────────────────
 
-async def _delayed_status(message, delay: float, enabled: bool, *, quote: bool):
-    """Send 'Fetching media…' only when the job exceeds *delay* seconds."""
+async def _delayed_status(
+    message,
+    delay: float,
+    enabled: bool,
+    *,
+    quote: bool,
+    progress: Optional[JobProgress] = None,
+    holder: Optional[dict] = None,
+):
+    """Send 'Fetching media…' only when the job exceeds *delay* seconds.
+
+    With *progress*, the message keeps editing itself (~4×/s, only when
+    the text changed) until _finish_status cancels this task.  The sent
+    Message is stashed in *holder* so _finish_status can still edit or
+    delete it after the cancellation.
+    """
     if not enabled or delay <= 0:
         return None
     try:
         await asyncio.sleep(delay)
-        return await reply_text(
+        status = await reply_text(
             message,
             f"{E.SPARKLE} Fetching media…",
             parse_mode=ParseMode.HTML,
@@ -453,22 +479,45 @@ async def _delayed_status(message, delay: float, enabled: bool, *, quote: bool):
         raise
     except Exception:
         return None
+    if status is None:
+        return None
+    if holder is not None:
+        holder["msg"] = status
+    if progress is None:
+        return status
+    # Live progress edits until _finish_status cancels this task.
+    while True:
+        try:
+            await asyncio.sleep(0.25)
+            text = progress.text_for_edit()
+            if text is None:
+                continue
+            await status.edit_text(text, parse_mode=ParseMode.HTML)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Flood waits / "message is not modified" — best effort only.
+            continue
 
 
 async def _finish_status(status_task, *, success: bool, error: Optional[Exception] = None,
-                         message=None, url: Optional[str] = None) -> None:
+                         message=None, url: Optional[str] = None,
+                         holder: Optional[dict] = None) -> None:
     """Cancel/collect the delayed status; surface errors when it was sent."""
-    status = None
+    status = holder.get("msg") if holder else None
     if status_task.done() and not status_task.cancelled():
-        try:
-            status = status_task.result()
-        except Exception:
-            status = None
+        if status is None:
+            try:
+                status = status_task.result()
+            except Exception:
+                status = None
     else:
         status_task.cancel()
         try:
-            await status_task
-        except (asyncio.CancelledError, Exception):
+            got = await status_task
+            if status is None:
+                status = got
+        except BaseException:
             pass
 
     if success:
@@ -519,10 +568,13 @@ async def auto_download_handler(message: Message, bot: Bot) -> None:
         return
 
     metrics.bump("auto_triggers")
+    prog = JobProgress()
+    status_holder: dict = {}
     status_task = asyncio.create_task(
         _delayed_status(
             message, ig_config.status_delay,
             bool(int(st.get("progress", 1))), quote=True,
+            progress=prog, holder=status_holder,
         )
     )
     try:
@@ -532,8 +584,9 @@ async def auto_download_handler(message: Message, bot: Bot) -> None:
             url,
             requester_id=user.id if user else 0,
             settings=st,
+            progress=prog,
         )
-        await _finish_status(status_task, success=True)
+        await _finish_status(status_task, success=True, holder=status_holder)
         if int(st.get("delete_source", 0)):
             try:
                 await message.delete()
@@ -541,7 +594,8 @@ async def auto_download_handler(message: Message, bot: Bot) -> None:
                 pass
     except Exception as e:
         await _finish_status(
-            status_task, success=False, error=e, message=message, url=url
+            status_task, success=False, error=e, message=message, url=url,
+            holder=status_holder,
         )
 
 
@@ -591,8 +645,13 @@ async def dl_command(message: Message, bot: Bot, args: list) -> None:
         return
 
     url = found[1]
+    prog = JobProgress()
+    status_holder: dict = {}
     status_task = asyncio.create_task(
-        _delayed_status(message, ig_config.status_delay, True, quote=True)
+        _delayed_status(
+            message, ig_config.status_delay, True, quote=True,
+            progress=prog, holder=status_holder,
+        )
     )
     try:
         await process_url(
@@ -601,11 +660,13 @@ async def dl_command(message: Message, bot: Bot, args: list) -> None:
             url,
             reply_to_message_id=None,
             requester_id=message.from_user.id if message.from_user else 0,
+            progress=prog,
         )
-        await _finish_status(status_task, success=True)
+        await _finish_status(status_task, success=True, holder=status_holder)
     except Exception as e:
         await _finish_status(
-            status_task, success=False, error=e, message=message, url=url
+            status_task, success=False, error=e, message=message, url=url,
+            holder=status_holder,
         )
 
 

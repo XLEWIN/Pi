@@ -56,6 +56,7 @@ from bot.modules.media.handlers import (  # noqa: E402
     ig_callback,
 )
 from bot.modules.media.downloader import download_post  # noqa: E402
+from bot.modules.media.progress import JobProgress  # noqa: E402
 from bot.modules.media.resolver import classify_ytdlp_error  # noqa: E402
 from bot.modules.media.keyboards import settings_keyboard  # noqa: E402
 from bot.modules.media.merge import merge_command  # noqa: E402
@@ -968,7 +969,7 @@ class TestExhaustedError(unittest.TestCase):
         err = yt_mod._exhausted_error(True, None)
         self.assertIn("sign-in", err.user)
         self.assertIn("stream mirrors", err.user.lower())
-        self.assertIn("YOUTUBE_COOKIES_FILE", err.user)
+        self.assertIn("YOUTUBE_COOKIES_B64", err.user)
 
     def test_generic_falls_back_to_last_error(self):
         last = IGResolveFailed("plain failure")
@@ -1057,7 +1058,7 @@ class TestClassifyErrors(unittest.TestCase):
         e = Exception("ERROR: Sign in to confirm your age with this video")
         err = classify_ytdlp_error(e)
         self.assertIn("sign in", err.user.lower())
-        self.assertNotIn("YOUTUBE_COOKIES_FILE", err.user)
+        self.assertNotIn("YOUTUBE_COOKIES_B64", err.user)
 
     def test_age_restricted_detected(self):
         e = Exception("ERROR: [youtube] x: age-restricted — confirmation required")
@@ -1285,6 +1286,278 @@ class TestTikTokFallback(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(post.media_id, "7312345678901234567")
         finally:
             tk.extract_entry, tk._tikwm_api = orig_entry, orig_api
+
+
+# ═════════════════════════════════════════════════════════════════
+# Cookies env wiring + live progress + parallel ranged download
+# ═════════════════════════════════════════════════════════════════
+
+class TestYoutubeCookiesEnv(unittest.TestCase):
+    def _helper(self):
+        from bot.modules.media.config import _youtube_cookies_file
+        return _youtube_cookies_file
+
+    def test_explicit_path_wins(self):
+        with mock.patch.dict(os.environ, {"YOUTUBE_COOKIES_FILE": "/x/ck.txt"}):
+            self.assertEqual(self._helper()(), "/x/ck.txt")
+
+    def test_b64_decodes_to_runtime_file_outside_repo(self):
+        import base64
+
+        raw = (
+            "# Netscape HTTP Cookie File\n"
+            ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tabc123\n"
+        )
+        env = {
+            "YOUTUBE_COOKIES_B64": base64.b64encode(raw.encode()).decode(),
+        }
+        with mock.patch.dict(os.environ, env):
+            os.environ.pop("YOUTUBE_COOKIES_FILE", None)
+            path = self._helper()()
+        self.assertTrue(path, "b64 cookies not accepted")
+        try:
+            self.assertEqual(Path(path).read_text(encoding="utf-8"), raw)
+            # Credentials must never be written into the repo tree.
+            self.assertFalse(Path(path).is_relative_to(ROOT), path)
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def test_junk_content_and_bad_b64_are_refused(self):
+        env = {"YOUTUBE_COOKIES_B64": "aGVsbG8gd29ybGQ="}  # "hello world"
+        with mock.patch.dict(os.environ, env):
+            os.environ.pop("YOUTUBE_COOKIES_FILE", None)
+            self.assertEqual(self._helper()(), "", "non-cookie content accepted")
+        env = {"YOUTUBE_COOKIES_B64": "!!!not base64!!!"}
+        with mock.patch.dict(os.environ, env):
+            os.environ.pop("YOUTUBE_COOKIES_FILE", None)
+            self.assertEqual(self._helper()(), "", "garbage accepted")
+
+    def test_raw_text_env_supported(self):
+        env = {"YOUTUBE_COOKIES_TEXT": ".youtube.com\tTRUE\t/\t0\tSID\tx"}
+        with mock.patch.dict(os.environ, env):
+            os.environ.pop("YOUTUBE_COOKIES_FILE", None)
+            os.environ.pop("YOUTUBE_COOKIES_B64", None)
+            path = self._helper()()
+        self.assertTrue(path)
+        try:
+            self.assertIn("youtube.com", Path(path).read_text(encoding="utf-8"))
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+
+class TestCookiesInBaseOpts(unittest.TestCase):
+    def test_base_opts_carry_cookiefile_for_every_strategy(self):
+        from bot.modules.media import config as cfg_mod
+        from bot.modules.media import resolver as res_mod
+
+        original = cfg_mod.ig_config
+        try:
+            cfg_mod.ig_config = dataclasses.replace(
+                original, youtube_cookies_file="ck.txt"
+            )
+            self.assertEqual(
+                res_mod.base_ydl_opts().get("cookiefile"), "ck.txt"
+            )
+            cfg_mod.ig_config = dataclasses.replace(
+                original, youtube_cookies_file=""
+            )
+            self.assertNotIn("cookiefile", res_mod.base_ydl_opts())
+        finally:
+            cfg_mod.ig_config = original
+
+
+class TestJobProgress(unittest.TestCase):
+    def test_percent_and_display_clamp(self):
+        p = JobProgress()
+        p.expect(100)
+        p.add(50)
+        self.assertEqual(p.percent(), 50.0)
+        self.assertEqual(p.done, 50)
+        p.add(200)  # retries may recount — display never exceeds 100%
+        self.assertEqual(p.percent(), 100.0)
+        self.assertEqual(p.done, 100)
+        self.assertEqual(p.raw, 250)
+
+    def test_speed_over_time_window(self):
+        t = [1000.0]
+        p = JobProgress(clock=lambda: t[0])
+        p.expect(1000)
+        p.add(100)
+        t[0] = 1002.0
+        p.add(500)
+        # (600 raw - 100 first bucket) / 2 s = 250 B/s
+        self.assertAlmostEqual(p.speed(), 250.0)
+
+    def test_text_throttle_and_stage_change(self):
+        t = [5.0]
+        p = JobProgress(edit_interval=0.9, clock=lambda: t[0])
+        self.assertIn("Resolving", p.text_for_edit())
+        t[0] = 5.5
+        self.assertIsNone(p.text_for_edit(), "interval not enforced")
+        t[0] = 6.0
+        self.assertIsNone(p.text_for_edit(), "unchanged text resent")
+        p.stage("download")
+        p.expect(1000)
+        p.add(500)
+        text = p.text_for_edit()
+        self.assertIsNotNone(text, "stage change not surfaced")
+        self.assertIn("Downloading", text)
+        self.assertIn("50%", text)
+        self.assertIn("500 B/1000 B", text)
+
+    def test_download_text_without_total(self):
+        p = JobProgress(edit_interval=0.0)
+        p.stage("download")
+        p.add(4096)
+        self.assertIn("Downloading… (4.0 KB)", p.text())
+
+
+class TestParallelDownload(unittest.IsolatedAsyncioTestCase):
+    URL = "https://redirector.googlevideo.com/videoplayback?id=x"
+    SIZE = 8192
+
+    class _Resp:
+        def __init__(self, status, headers, body):
+            self.status_code = status
+            self.headers = headers
+            self._body = body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def aiter_bytes(self, n):
+            for i in range(0, len(self._body), n):
+                yield self._body[i : i + n]
+
+    class _Client:
+        def __init__(self, handler):
+            self._handler = handler
+            self.calls = []
+
+        def stream(self, method, url, headers=None):
+            h = dict(headers or {})
+            self.calls.append(h)
+            return self._handler(h)
+
+    def _payload(self):
+        return (b"0123456789abcdef" * (self.SIZE // 16))[: self.SIZE]
+
+    def _range_handler(self, payload, honor_range=True):
+        def handler(h):
+            if "Range" in h and honor_range:
+                a, b = h["Range"].split("=")[1].split("-")
+                a, b = int(a), int(b)
+                return self._Resp(
+                    206,
+                    {
+                        "content-range": f"bytes {a}-{b}/{len(payload)}",
+                        "content-type": "video/mp4",
+                    },
+                    payload[a : b + 1],
+                )
+            return self._Resp(200, {"content-type": "video/mp4"}, payload)
+        return handler
+
+    async def _download(self, payload, handler, *, filesize=None, progress=None):
+        from bot.modules.media import downloader as dl_mod
+
+        dest = Path(tempfile.mkdtemp(prefix="pi_par_dl_"))
+        self.addCleanup(shutil.rmtree, dest, ignore_errors=True)
+        asset = MediaAsset(
+            url=self.URL,
+            kind=MediaKind.VIDEO,
+            filesize=len(payload) if filesize is None else filesize,
+        )
+        client = self._Client(handler)
+        with mock.patch.object(dl_mod, "_get_http_client", return_value=client), \
+                mock.patch.object(dl_mod, "_PARALLEL_MIN", 1024):
+            paths = await dl_mod._http_download(
+                self.URL, dest, asset, platform="youtube", progress=progress
+            )
+        return paths, client, dest
+
+    async def test_honored_ranges_assemble_exact_bytes(self):
+        payload = self._payload()
+        prog = JobProgress()
+        paths, client, dest = await self._download(
+            payload, self._range_handler(payload), progress=prog
+        )
+        self.assertEqual(paths[0].read_bytes(), payload)
+        self.assertEqual(len(client.calls), 2, "expected two range workers")
+        self.assertTrue(all("Range" in c for c in client.calls))
+        self.assertEqual(prog.raw, self.SIZE, "progress missed ranged bytes")
+        leftovers = [p.name for p in dest.iterdir()]
+        self.assertEqual(leftovers, ["media.mp4"], leftovers)
+
+    async def test_range_ignored_falls_back_to_single_stream(self):
+        payload = self._payload()
+        paths, client, dest = await self._download(
+            payload, self._range_handler(payload, honor_range=False)
+        )
+        self.assertEqual(paths[0].read_bytes(), payload)
+        # Two range workers (both refused) + one plain GET.
+        self.assertEqual(len(client.calls), 3, "range workers + plain GET")
+        self.assertIn("Range", client.calls[0])
+        self.assertIn("Range", client.calls[1])
+        self.assertNotIn("Range", client.calls[2])
+        self.assertEqual([p.name for p in dest.iterdir()], ["media.mp4"])
+
+    async def test_small_file_stays_single_stream(self):
+        payload = self._payload()[:512]
+        paths, client, dest = await self._download(
+            payload,
+            self._range_handler(payload),
+            filesize=512,
+        )
+        self.assertEqual(paths[0].read_bytes(), payload)
+        self.assertEqual(len(client.calls), 1, "small file must not fan out")
+        self.assertNotIn("Range", client.calls[0])
+
+
+class TestStatusProgress(unittest.IsolatedAsyncioTestCase):
+    async def test_progress_edits_then_finish_deletes(self):
+        from bot.modules.media import handlers as h
+
+        sent = SimpleNamespace(edit_calls=[], deleted=False)
+
+        async def _edit(text=None, **kw):
+            sent.edit_calls.append(text)
+
+        async def _delete():
+            sent.deleted = True
+
+        async def _reply(*a, **kw):
+            return sent
+
+        sent.edit_text = _edit
+        sent.delete = _delete
+
+        prog = JobProgress(edit_interval=0.0)
+        holder = {}
+        orig_reply = h.reply_text
+        h.reply_text = _reply
+        try:
+            task = asyncio.create_task(
+                h._delayed_status(
+                    object(), 0.01, True, quote=True,
+                    progress=prog, holder=holder,
+                )
+            )
+            await asyncio.sleep(0.35)
+            self.assertIs(holder.get("msg"), sent, "holder not populated")
+            prog.stage("download")
+            prog.expect(100)
+            prog.add(42)
+            await asyncio.sleep(0.35)
+            self.assertTrue(sent.edit_calls, "no live progress edit")
+            self.assertIn("Downloading", sent.edit_calls[-1])
+            await h._finish_status(task, success=True, holder=holder)
+            self.assertTrue(sent.deleted, "status not deleted on success")
+        finally:
+            h.reply_text = orig_reply
 
 
 if __name__ == "__main__":
