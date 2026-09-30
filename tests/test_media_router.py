@@ -1560,5 +1560,102 @@ class TestStatusProgress(unittest.IsolatedAsyncioTestCase):
             h.reply_text = orig_reply
 
 
+# ═════════════════════════════════════════════════════════════════
+# Instagram DASH audio pairing (silent-video fix)
+# ═════════════════════════════════════════════════════════════════
+
+_DASH_VIDEO = {
+    "url": "https://scontent.cdninstagram.com/v/videoonly.mp4",
+    "vcodec": "h264",
+    "acodec": "none",
+    "height": 1080,
+    "tbr": 2500,
+    "ext": "mp4",
+}
+_DASH_AUDIO = {
+    "url": "https://scontent.cdninstagram.com/v/audio.m4a",
+    "vcodec": "none",
+    "acodec": "mp4a.40.2",
+    "tbr": 128,
+    "ext": "m4a",
+}
+
+
+class TestIgDashAudioPair(unittest.TestCase):
+    def test_video_only_gets_audio_pair(self):
+        from bot.modules.media.resolver import _assets_from_entry, _is_merge_pair
+
+        entry = {"formats": [dict(_DASH_VIDEO), dict(_DASH_AUDIO)]}
+        assets = _assets_from_entry(entry, True)
+        self.assertEqual(len(assets), 2, "video-only pick must fetch its audio pair")
+        video, audio = assets
+        self.assertEqual(video.kind, MediaKind.VIDEO)
+        self.assertEqual(video.merge_role, "v")
+        self.assertEqual(audio.kind, MediaKind.AUDIO)
+        self.assertEqual(audio.merge_role, "a")
+        self.assertEqual(audio.ext, "m4a")
+        self.assertTrue(_is_merge_pair(assets))
+
+    def test_progressive_stays_single_asset(self):
+        from bot.modules.media.resolver import _assets_from_entry, _is_merge_pair
+
+        progressive = dict(_DASH_VIDEO, acodec="mp4a.40.2", url=_DASH_VIDEO["url"])
+        entry = {"formats": [progressive]}
+        assets = _assets_from_entry(entry, True)
+        self.assertEqual(len(assets), 1, "progressive stream already has audio")
+        self.assertIsNone(assets[0].merge_role)
+        self.assertFalse(_is_merge_pair(assets))
+
+    def test_video_only_without_audio_stream(self):
+        from bot.modules.media.resolver import _assets_from_entry, _is_merge_pair
+
+        assets = _assets_from_entry({"formats": [dict(_DASH_VIDEO)]}, True)
+        self.assertEqual(len(assets), 1)
+        self.assertFalse(_is_merge_pair(assets))
+
+    def test_sidecar_recursion_does_not_pair(self):
+        from bot.modules.media.resolver import _assets_from_entry, _is_merge_pair
+
+        entry = {
+            "entries": [
+                {"formats": [dict(_DASH_VIDEO), dict(_DASH_AUDIO)]},
+                {"formats": [dict(_DASH_VIDEO)]},
+            ],
+        }
+        assets = _assets_from_entry(entry, True)
+        self.assertEqual(len(assets), 2, "sidecar items are delivered separately")
+        self.assertFalse(_is_merge_pair(assets))
+
+    def test_merge_pair_helper_exact_roles(self):
+        from bot.modules.media.models import MediaAsset
+        from bot.modules.media.resolver import _is_merge_pair
+
+        def a(role):
+            return MediaAsset(
+                url="https://scontent.cdninstagram.com/x", kind=MediaKind.VIDEO,
+                merge_role=role,
+            )
+
+        self.assertTrue(_is_merge_pair([a("v"), a("a")]))
+        self.assertFalse(_is_merge_pair([a("v")]))
+        self.assertFalse(_is_merge_pair([a("a")]))
+        self.assertFalse(_is_merge_pair([a("v"), a("v")]))
+        self.assertFalse(_is_merge_pair([a("v"), a("a"), a(None)]))
+
+    def test_audio_pair_survives_dedup_and_flags_post(self):
+        """YtDlp-style pass: pair + uniq must still yield needs_merge=True."""
+        from bot.modules.media.resolver import _assets_from_entry, _is_merge_pair
+
+        entry = {"formats": [dict(_DASH_VIDEO), dict(_DASH_AUDIO), dict(_DASH_VIDEO)]}
+        assets = _assets_from_entry(entry, True)
+        seen, uniq = set(), []
+        for x in assets:
+            if x.url in seen:
+                continue
+            seen.add(x.url)
+            uniq.append(x)
+        self.assertTrue(_is_merge_pair(uniq))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

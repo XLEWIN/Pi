@@ -169,7 +169,41 @@ def _best_format(fmts: List[Dict[str, Any]], prefer_video: bool) -> Optional[Dic
     return scored[0][1]
 
 
-def _assets_from_entry(entry: Dict[str, Any], prefer_video: bool) -> List[MediaAsset]:
+def _fmt_has_video(f: Dict[str, Any]) -> bool:
+    return f.get("vcodec") not in (None, "none", "")
+
+
+def _fmt_has_audio(f: Dict[str, Any]) -> bool:
+    return f.get("acodec") not in (None, "none", "")
+
+
+def _best_audio_only(fmts: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Best audio-only stream in *fmts* (DASH audio for merge pairing)."""
+    cands = [
+        f for f in fmts
+        if f.get("url") and _fmt_has_audio(f) and not _fmt_has_video(f)
+    ]
+    if not cands:
+        return None
+    cands.sort(
+        key=lambda f: (
+            1 if (f.get("ext") or "") in {"m4a", "mp4", "mp3"} else 0,
+            float(f.get("tbr") or 0),
+            1 if str(f.get("protocol") or "").startswith("https") else 0,
+        ),
+        reverse=True,
+    )
+    return cands[0]
+
+
+def _is_merge_pair(assets: List[MediaAsset]) -> bool:
+    """True when *assets* is exactly one video + one audio split stream."""
+    return len(assets) == 2 and {a.merge_role for a in assets} == {"v", "a"}
+
+
+def _assets_from_entry(
+    entry: Dict[str, Any], prefer_video: bool, pair_audio: bool = True
+) -> List[MediaAsset]:
     assets: List[MediaAsset] = []
 
     entries = entry.get("entries")
@@ -177,7 +211,9 @@ def _assets_from_entry(entry: Dict[str, Any], prefer_video: bool) -> List[MediaA
         for sub in entries:
             if not sub:
                 continue
-            assets.extend(_assets_from_entry(sub, prefer_video))
+            # Sidecar items are delivered item-by-item; only a standalone
+            # post's [video, audio] pair triggers the ffmpeg merge pass.
+            assets.extend(_assets_from_entry(sub, prefer_video, pair_audio=False))
         return assets
 
     url = entry.get("url")
@@ -185,6 +221,7 @@ def _assets_from_entry(entry: Dict[str, Any], prefer_video: bool) -> List[MediaA
     acodec = entry.get("acodec")
     ext = entry.get("ext") or "mp4"
     fmt = None
+    audio_fmt = None
     if entry.get("formats"):
         fmt = _best_format(entry["formats"], prefer_video)
         if fmt:
@@ -192,6 +229,12 @@ def _assets_from_entry(entry: Dict[str, Any], prefer_video: bool) -> List[MediaA
             vcodec = fmt.get("vcodec") or vcodec
             acodec = fmt.get("acodec") or acodec
             ext = fmt.get("ext") or ext
+            # Modern yt-dlp serves Instagram as DASH: video-only + audio-only
+            # formats with no progressive stream. Remember the audio pair so
+            # the downloader can merge them — otherwise the sent video is
+            # silent (the old IG bug).
+            if pair_audio and _fmt_has_video(fmt) and not _fmt_has_audio(fmt):
+                audio_fmt = _best_audio_only(entry["formats"])
 
     if not url:
         req = entry.get("requested_formats") or []
@@ -205,6 +248,8 @@ def _assets_from_entry(entry: Dict[str, Any], prefer_video: bool) -> List[MediaA
                 url = best_v.get("url")
                 vcodec = best_v.get("vcodec")
                 ext = best_v.get("ext") or ext
+                if pair_audio:
+                    audio_fmt = _best_audio_only(req)
 
     if not url:
         return assets
@@ -220,18 +265,36 @@ def _assets_from_entry(entry: Dict[str, Any], prefer_video: bool) -> List[MediaA
         except IGInvalidUrl:
             return assets
 
+    duration = entry.get("duration") or (fmt or {}).get("duration")
     assets.append(
         MediaAsset(
             url=url,
             kind=kind,
             width=entry.get("width") or (fmt or {}).get("width"),
             height=entry.get("height") or (fmt or {}).get("height"),
-            duration=entry.get("duration") or (fmt or {}).get("duration"),
+            duration=duration,
             filesize=int(filesize) if filesize else None,
             ext=ext or "mp4",
             codec=vcodec,
+            merge_role="v" if audio_fmt else None,
         )
     )
+
+    if audio_fmt:
+        a_url = audio_fmt.get("url")
+        a_size = audio_fmt.get("filesize") or audio_fmt.get("filesize_approx")
+        if a_url and host_allowed(a_url):
+            assets.append(
+                MediaAsset(
+                    url=a_url,
+                    kind=MediaKind.AUDIO,
+                    duration=audio_fmt.get("duration") or duration,
+                    filesize=int(a_size) if a_size else None,
+                    ext=audio_fmt.get("ext") or "m4a",
+                    codec=audio_fmt.get("acodec"),
+                    merge_role="a",
+                )
+            )
     return assets
 
 
@@ -328,6 +391,7 @@ class YtDlpResolver(BaseResolver):
             resolve_ms=elapsed,
             resolver=self.name,
             platform="instagram",
+            needs_merge=_is_merge_pair(assets),
         )
 
 
@@ -387,6 +451,7 @@ class FallbackResolver(BaseResolver):
                 resolve_ms=elapsed,
                 resolver=self.name,
                 platform="instagram",
+                needs_merge=_is_merge_pair(assets),
             )
 
         return await asyncio.to_thread(_alt)
