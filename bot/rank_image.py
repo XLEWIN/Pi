@@ -1,91 +1,90 @@
 # smash/modules/utils/rank_image.py
 """
-Dynamic rank-card renderer for /myrank.
+Dynamic rank-card renderer for /rank.
 
-Reproduces the reference layout: 1708x750 dark anime/gaming profile dashboard.
-Every value (name, username, avatar, level, progress, rank, statistics,
-background artwork) is passed in by the caller — nothing is hardcoded around
-placeholder data. Rendered at 2x supersampling and downscaled for smooth edges.
+The card is built on top of one of six pre-rendered master templates in
+``bot/templates/template_<id>.png`` (1708 x 750). Each template already
+contains the full dashboard — avatar slot, name/username pills, LEVEL
+box, progress track and the three stat cards — so PIL only overlays the
+live values (avatar, name, username, level, progress, statistics) on a
+2x supersampled layer and composites it down for smooth, crisp text.
+
+Template geometry (measured once from the master art, 1708 x 750):
+
+    avatar slot      (67, 128) - (238, 292)
+    name pill        x=291, baseline center y=184
+    username pill    x=291, center y=257
+    level box        center (1597, 187)
+    progress labels  centers (119, 361) and (1597, 361)
+    progress bar     x 194 -> 1522, y 357 -> 377
+    stat cards       text x = 90 / 637 / 1164, values y=552, subs y=605
+
+The layout is identical across every template — only the artwork, glow
+colour and card tint change — so text lands in the same place always.
 """
 
 import os
 import logging
-import random
 import threading
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageEnhance
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 logger = logging.getLogger(__name__)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ASSETS_DIR = os.path.join(BASE_DIR, "bot", "assets")
+TEMPLATES_DIR = os.path.join(BASE_DIR, "bot", "templates")
 OUTPUT_DIR = os.path.join(BASE_DIR, "temp_profiles")
-
-# Optional ambient artwork; if absent the caller may pass an avatar image to
-# reuse as the watermark background, otherwise a procedural backdrop is drawn.
-BG_IMAGE_PATH = os.path.join(ASSETS_DIR, "rank_bg.png")
-BG_IMAGE_PATH_ALT = os.path.join(ASSETS_DIR, "rank_bg.jpg")
 
 if not os.path.exists(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ----------------------------- palette --------------------------------------
-COLOR_BG = (14, 14, 14)          # 0E0E0E
-COLOR_BURGUNDY = (100, 19, 22)   # 641316  statistic pills
-COLOR_TRACK = (128, 21, 25)      # 801519  progress track
-COLOR_RED = (229, 37, 40)        # E52528  progress fill
-COLOR_BRIGHT = (239, 41, 44)     # EF292C  badge / icons circles / indicator
-COLOR_WHITE = (245, 245, 245)    # F5F5F5
-COLOR_MUTED = (220, 220, 220)    # DCDCDC
-COLOR_ICON = (8, 8, 8)           # 080808
+# ----------------------------- canvas ---------------------------------------
+CANVAS_W, CANVAS_H = 1708, 750
+SCALE = 2  # foreground overlay supersampling
 
-# ----------------------------- theme palettes --------------------------------
-# Maps template_id to (accent, pill_bg, track, fill, bright) colors
+# --------------------------- fixed geometry ---------------------------------
+AVATAR_BOX = (67, 128, 238, 292)      # inner area of the avatar slot
+AVATAR_RADIUS = 36
+
+NAME_X, NAME_CY, NAME_SIZE, NAME_MAX_W = 291, 184, 46, 440
+USER_X, USER_CY, USER_SIZE, USER_MAX_W = 291, 257, 26, 178
+
+LEVEL_CX, LEVEL_CY, LEVEL_SIZE, LEVEL_MAX_W = 1597, 187, 62, 96
+
+LEFT_LABEL_C, RIGHT_LABEL_C = (119, 361), (1597, 361)
+LABEL_SIZE, LABEL_MAX_W = 20, 102
+
+BAR_X0, BAR_Y0, BAR_X1, BAR_Y1 = 194, 357, 1522, 377
+
+CARD_TEXT_X = (90, 637, 1164)         # left padding of the three cards
+CARD_MAX_W = (450, 435, 450)
+VALUE_CY, SUB_CY = 552, 605
+VALUE_SIZE, SUB_SIZE = 50, 24
+
+# ----------------------------- colours --------------------------------------
+WHITE = (245, 245, 245, 255)
+MUTED = (190, 190, 198, 255)
+LABEL = (235, 235, 240, 255)
+PLACEHOLDER = (150, 150, 158, 255)
+
+# Per-template palette: accent = text accent, fill = progress-bar fill,
+# track = progress-bar empty track (sampled from the master templates).
 THEME_COLORS = {
-    1: {"accent": (190, 45, 255), "pill": (80, 20, 100), "track": (100, 30, 120), "fill": (190, 45, 255), "bright": (190, 45, 255)},
-    2: {"accent": (255, 30, 35),  "pill": (100, 19, 22), "track": (128, 21, 25), "fill": (255, 30, 35),  "bright": (255, 30, 35)},
-    3: {"accent": (100, 200, 255),"pill": (30, 80, 120), "track": (40, 100, 140),"fill": (100, 200, 255),"bright": (100, 200, 255)},
-    4: {"accent": (115, 220, 45), "pill": (40, 80, 20),  "track": (50, 100, 30), "fill": (115, 220, 45), "bright": (115, 220, 45)},
-    5: {"accent": (220, 180, 50), "pill": (90, 70, 20),  "track": (110, 90, 30), "fill": (220, 180, 50), "bright": (220, 180, 50)},
-    6: {"accent": (210, 145, 40), "pill": (85, 60, 15),  "track": (105, 75, 25), "fill": (210, 145, 40), "bright": (210, 145, 40)},
+    1: {"accent": (250, 175, 70),  "fill": (250, 163, 47), "track": (12, 6, 1)},
+    2: {"accent": (224, 233, 245), "fill": (224, 233, 245), "track": (16, 17, 22)},
+    3: {"accent": (236, 150, 252), "fill": (233, 139, 251), "track": (12, 4, 20)},
+    4: {"accent": (96, 140, 252),  "fill": (57, 105, 239),  "track": (3, 7, 22)},
+    5: {"accent": (170, 224, 253), "fill": (156, 218, 252), "track": (3, 4, 10)},
+    6: {"accent": (150, 251, 185), "fill": (139, 250, 179), "track": (2, 6, 3)},
 }
 
 
 def _get_theme_colors(template_id: int) -> dict:
-    """Get theme colors for a template, fallback to default red theme."""
-    return THEME_COLORS.get(template_id, THEME_COLORS[2])
-
-# ----------------------------- canvas metrics -------------------------------
-CANVAS_W, CANVAS_H = 1708, 750
-PAD_X = 95
-
-AVATAR_SIZE = 185
-AVATAR_RADIUS = 38
-AVATAR_X, AVATAR_Y = PAD_X, 78
-
-BADGE_W, BADGE_H, BADGE_RADIUS = 88, 58, 20
-BADGE_OFFSET_X, BADGE_OFFSET_Y = -26, -46   # relative to avatar bottom-left corner
-
-TEXT_STACK_X = AVATAR_X + AVATAR_SIZE + 48
-NAME_SIZE, USERNAME_SIZE = 40, 36
-
-LEVEL_LABEL_Y = 340
-LEVEL_TEXT_SIZE = 34
-
-BAR_X, BAR_Y, BAR_W, BAR_H = PAD_X, 392, CANVAS_W - 2 * PAD_X, 48
-INDICATOR_R = 34
-NEXT_NUM_PAD = 40
-
-HEADINGS_Y = 502
-HEADING_SIZE = 32
-PILL_Y = 550
-PILL_W, PILL_H, PILL_RADIUS = 370, 95, 48
-ICON_DIA, ICON_MARGIN_X = 70, 11
-VALUE_SIZE = 38
-COL_STEP = 506
-
-SCALE = 2
+    """Theme palette for a template, falling back to template 1."""
+    return THEME_COLORS.get(template_id, THEME_COLORS[1])
 
 
+# ----------------------------- fonts ----------------------------------------
 def _font_path():
     bold = os.path.join(ASSETS_DIR, "NotoSans-Bold.ttf")
     if os.path.exists(bold):
@@ -100,214 +99,145 @@ _font_cache = {}
 
 
 def _font(size):
-    key = size
-    if key not in _font_cache:
+    if size not in _font_cache:
         try:
-            _font_cache[key] = ImageFont.truetype(_FONT_FILE, size)
+            _font_cache[size] = ImageFont.truetype(_FONT_FILE, size)
         except Exception:
-            _font_cache[key] = ImageFont.load_default()
-    return _font_cache[key]
+            _font_cache[size] = ImageFont.load_default()
+    return _font_cache[size]
 
 
-def _fit_text(draw, text, font_size, max_width):
-    """Shrink/truncate with an ellipsis so text never overflows its slot."""
-    if text is None:
-        text = ""
-    text = str(text)
-    font = _font(font_size)
-    while draw.textlength(text, font=font) > max_width and len(text) > 1:
-        text = text[:-2].rstrip() + "\u2026"
-        if len(text) <= 2:
-            break
+def _fit(draw, text, size, max_width):
+    """Shrink the font so ``text`` never overflows its slot."""
+    text = "" if text is None else str(text)
+    if not text:
+        return text, _font(size)
+    while size > 12 and draw.textlength(text, font=_font(size)) > max_width:
+        size -= 1
+    font = _font(size)
+    if draw.textlength(text, font=font) > max_width:
+        while len(text) > 1 and draw.textlength(text + "\u2026", font=font) > max_width:
+            text = text[:-1]
+        text = text.rstrip() + "\u2026"
+        font = _font(size)
     return text, font
 
 
-def _rounded(draw, box, radius, fill):
-    draw.rounded_rectangle(box, radius=radius, fill=fill)
+# ----------------------------- templates ------------------------------------
+_tpl_lock = threading.Lock()
+_tpl_cache = {}
 
 
-# ------------------------------ icons ---------------------------------------
-def _icon_bar_chart(d, cx, cy):
-    s = SCALE
-    bw, gap = 12 * s, 12 * s
-    x0 = cx - (bw * 3 + gap * 2) // 2
-    heights = [22 * s, 38 * s, 54 * s]
-    base = cy + 27 * s
-    for i, h in enumerate(heights):
-        bx = x0 + i * (bw + gap)
-        d.rounded_rectangle((bx, base - h, bx + bw, base), radius=5 * s, fill=COLOR_ICON)
+def _load_template(template_id: int) -> Image.Image:
+    """Master template RGB image (cached; callers must not mutate it)."""
+    with _tpl_lock:
+        hit = _tpl_cache.get(template_id)
+    if hit is not None:
+        return hit
+    path = os.path.join(TEMPLATES_DIR, f"template_{template_id}.png")
+    try:
+        img = Image.open(path).convert("RGB")
+        if img.size != (CANVAS_W, CANVAS_H):
+            img = img.resize((CANVAS_W, CANVAS_H), Image.LANCZOS)
+    except Exception as e:
+        logger.warning(f"[rank_image] template {template_id} load failed: {e}")
+        img = Image.new("RGB", (CANVAS_W, CANVAS_H), (14, 14, 16))
+    with _tpl_lock:
+        _tpl_cache[template_id] = img
+    return img
 
 
-def _icon_chat(d, cx, cy):
-    s = SCALE
-    bw, bh = 56 * s, 42 * s
-    x0, y0 = cx - bw // 2, cy - bh // 2 - 3 * s
-    d.rounded_rectangle((x0, y0, x0 + bw, y0 + bh), radius=13 * s, fill=COLOR_ICON)
-    d.polygon(
-        [(x0 + 12 * s, y0 + bh - 4 * s), (x0 + 30 * s, y0 + bh - 4 * s), (x0 + 14 * s, y0 + bh + 14 * s)],
-        fill=COLOR_ICON,
-    )
+# ----------------------------- avatar ---------------------------------------
+def _paste_avatar(overlay, avatar_path):
+    """Center-crop + rounded-mask the avatar into the template's slot."""
+    x0, y0, x1, y1 = AVATAR_BOX
+    w, h = (x1 - x0) * SCALE, (y1 - y0) * SCALE
 
-
-def _icon_globe(d, cx, cy):
-    s = SCALE
-    r, lw = 28 * s, 5 * s
-    d.ellipse((cx - r, cy - r, cx + r, cy + r), outline=COLOR_ICON, width=lw)
-    d.line((cx - r, cy, cx + r, cy), fill=COLOR_ICON, width=lw)
-    d.ellipse((cx - int(r * 0.45), cy - r, cx + int(r * 0.45), cy + r), outline=COLOR_ICON, width=lw)
-
-
-ICONS = {"bar": _icon_bar_chart, "chat": _icon_chat, "globe": _icon_globe}
-
-
-# ---------------------------- background ------------------------------------
-def _cover_resize(img, size):
-    tw, th = size
-    iw, ih = img.size
-    scale = max(tw / iw, th / ih)
-    img = img.resize((max(1, int(iw * scale)), max(1, int(ih * scale))), Image.LANCZOS)
-    left = (img.width - tw) // 2
-    top = (img.height - th) // 2
-    return img.crop((left, top, left + tw, top + th))
-
-
-# The background artwork depends only on the PNG on disk, never on the
-# user, so it is built once and reused. Fonts already had this (:106);
-# the artwork did not — every /rank re-opened the template, then paid
-# cover-resize + GaussianBlur(7) + two ImageEnhance passes + a blend.
-_BG_ART_CACHE = {}
-_BG_ART_LOCK = threading.Lock()
-
-
-def _build_ambient(src):
-    art = _cover_resize(src, (CANVAS_W, CANVAS_H))
-    art = art.filter(ImageFilter.GaussianBlur(7))
-    art = ImageEnhance.Brightness(art).enhance(0.42)
-    art = ImageEnhance.Color(art).enhance(0.55)
-    tint = Image.new("RGB", art.size, COLOR_BURGUNDY)
-    art = Image.blend(art, tint, 0.32)
-    return art
-
-
-def _ambient_artwork(avatar_img):
-    """Return the heavily-darkened, blurred, red-tinted artwork layer.
-
-    PIL images are mutable, so callers get a copy of the cached layer —
-    one card's draw can never corrupt another's.
-    """
-    for path in (BG_IMAGE_PATH, BG_IMAGE_PATH_ALT):
-        if not os.path.exists(path):
-            continue
-        with _BG_ART_LOCK:
-            hit = _BG_ART_CACHE.get(path)
-        if hit is not None:
-            return hit.copy()
+    src = None
+    if avatar_path and os.path.exists(avatar_path):
         try:
-            src = Image.open(path).convert("RGB")
-        except Exception:
-            continue
-        art = _build_ambient(src)
-        with _BG_ART_LOCK:
-            _BG_ART_CACHE[path] = art
-        return art.copy()
+            src = Image.open(avatar_path).convert("RGB")
+        except Exception as e:
+            logger.warning(f"[rank_image] avatar load failed: {e}")
 
-    # No usable template: fall back to the avatar (per-user, not cached).
-    if avatar_img is not None:
-        src = avatar_img.convert("RGB").resize((760, 760), Image.LANCZOS)
-        return _build_ambient(src)
-    return None
+    if src is None:
+        d = ImageDraw.Draw(overlay)
+        d.text(
+            (((x0 + x1) // 2) * SCALE, ((y0 + y1) // 2) * SCALE),
+            "?", font=_font(78 * SCALE), fill=PLACEHOLDER, anchor="mm",
+        )
+        return
 
-
-_CONST_LOCK = threading.Lock()
-_const_cache = {}
-
-
-def _constant_layers():
-    """Glow / noise / vignette are user-independent — build them exactly once."""
-    with _CONST_LOCK:
-        if "vignette" in _const_cache:
-            return _const_cache
-
-        glow = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 0))
-        gd = ImageDraw.Draw(glow)
-        gd.ellipse((CANVAS_W * 0.42, -CANVAS_H * 0.55, CANVAS_W * 1.35, CANVAS_H * 0.85),
-                   fill=COLOR_RED + (16,))
-        glow = glow.filter(ImageFilter.GaussianBlur(180))
-
-        noise = Image.effect_noise((CANVAS_W, CANVAS_H), 10).convert("L")
-        noise_mask = noise.point(lambda v: 14 if v > 200 else 0)
-
-        vignette = Image.new("L", (CANVAS_W, CANVAS_H), 0)
-        vd = ImageDraw.Draw(vignette)
-        vd.rectangle((0, 0, CANVAS_W, CANVAS_H), fill=90)
-        vd.ellipse((-CANVAS_W * 0.18, -CANVAS_H * 0.30, CANVAS_W * 1.18, CANVAS_H * 1.30), fill=0)
-        vignette = vignette.filter(ImageFilter.GaussianBlur(120))
-
-        _const_cache["glow"] = glow
-        _const_cache["noise"] = noise_mask
-        _const_cache["vignette"] = vignette
-        return _const_cache
-
-
-def _build_background(avatar_img):
-    glow_layer = _constant_layers()["glow"]
-    noise_mask = _constant_layers()["noise"]
-    vignette_mask = _constant_layers()["vignette"]
-
-    canvas = Image.new("RGBA", (CANVAS_W, CANVAS_H), COLOR_BG + (255,))
-    art = _ambient_artwork(avatar_img)
-    if art is not None:
-        gray = art.convert("L")
-        mask = gray.point(lambda v: int(v * 0.20))          # watermark-level visibility
-        canvas.paste(art, (0, 0), mask)
-
-    canvas = Image.alpha_composite(canvas, glow_layer)
-
-    bright = ImageEnhance.Brightness(canvas).enhance(1.02)
-    canvas = Image.composite(bright, canvas, noise_mask)
-
-    canvas = Image.composite(Image.new("RGBA", canvas.size, (0, 0, 0, 255)), canvas, vignette_mask)
-    return canvas
-
-
-# --------------------------- avatar + badge ---------------------------------
-def _paste_avatar(canvas, avatar_img):
-    draw = ImageDraw.Draw(canvas)
-    ax, ay, s = AVATAR_X, AVATAR_Y, AVATAR_SIZE
-
-    if avatar_img is not None:
-        av = avatar_img.convert("RGB").resize((s * SCALE, s * SCALE), Image.LANCZOS).convert("RGBA")
-    else:
-        ph = Image.new("RGB", (s * SCALE, s * SCALE), COLOR_BURGUNDY)
-        pd = ImageDraw.Draw(ph)
-        pd.text((s * SCALE // 2, s * SCALE // 2), "?", font=_font(90 * SCALE),
-                fill=COLOR_WHITE, anchor="mm")
-        av = ph.convert("RGBA")
+    side = min(src.size)
+    left = (src.width - side) // 2
+    top = (src.height - side) // 2
+    av = src.crop((left, top, left + side, top + side)).resize(
+        (w, h), Image.LANCZOS
+    ).convert("RGBA")
 
     mask = Image.new("L", av.size, 0)
-    ImageDraw.Draw(mask).rounded_rectangle((0, 0, av.width - 1, av.height - 1),
-                                           radius=AVATAR_RADIUS * SCALE, fill=255)
-    av.putalpha(mask)                       # carry alpha so paste works on a clear overlay
-    canvas.paste(av, (ax * SCALE, ay * SCALE))
-
-    bx = ax + BADGE_OFFSET_X
-    by = ay + AVATAR_SIZE + BADGE_OFFSET_Y
-    _rounded(draw,
-             (bx * SCALE, by * SCALE, (bx + BADGE_W) * SCALE, (by + BADGE_H) * SCALE),
-             BADGE_RADIUS * SCALE, COLOR_BRIGHT)
-    return bx, by
+    ImageDraw.Draw(mask).rounded_rectangle(
+        (0, 0, w - 1, h - 1), radius=AVATAR_RADIUS * SCALE, fill=255
+    )
+    av.putalpha(mask)
+    overlay.paste(av, (x0 * SCALE, y0 * SCALE), av)
 
 
-def _draw_badge_text(canvas, badge_x, badge_y, rank_text):
-    draw = ImageDraw.Draw(canvas)
-    text, size = str(rank_text), 30
-    while size > 20 and draw.textlength(text, font=_font(size * SCALE)) > (BADGE_W - 16) * SCALE:
-        size -= 2
-    draw.text(((badge_x + BADGE_W / 2) * SCALE, (badge_y + BADGE_H / 2) * SCALE),
-              text, font=_font(size * SCALE), fill=COLOR_WHITE, anchor="mm")
+# ----------------------------- progress bar ---------------------------------
+def _bar_layer(pct: float, theme: dict):
+    """Build the glowing progress bar (incl. feathered shade) for ``pct``.
+
+    The shade neutralises the template's baked placeholder fill so the
+    real progress can start from zero without a ghost glow.
+    Returns (layer, paste_position).
+    """
+    s = SCALE
+    bw, bh = (BAR_X1 - BAR_X0) * s, (BAR_Y1 - BAR_Y0) * s
+    pad = 70 * s
+    fill_rgb, track_rgb = theme["fill"], theme["track"]
+
+    layer = Image.new("RGBA", (bw + 2 * pad, bh + 2 * pad), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    d.rounded_rectangle(
+        (pad, pad - 26 * s, pad + bw, pad + bh + 26 * s),
+        radius=30 * s, fill=(0, 0, 0, 170),
+    )
+    layer = layer.filter(ImageFilter.GaussianBlur(14 * s))
+
+    fill_w = int(bw * max(0.0, min(100.0, pct)) / 100)
+    if fill_w > 0:
+        glow = Image.new("RGBA", layer.size, (0, 0, 0, 0))
+        ImageDraw.Draw(glow).rounded_rectangle(
+            (pad, pad - 5 * s, pad + max(fill_w, bh), pad + bh + 5 * s),
+            radius=bh // 2, fill=fill_rgb + (175,),
+        )
+        glow = glow.filter(ImageFilter.GaussianBlur(11 * s))
+        layer = Image.alpha_composite(layer, glow)
+
+    d = ImageDraw.Draw(layer)
+    d.rounded_rectangle(
+        (pad, pad, pad + bw, pad + bh), radius=bh // 2, fill=track_rgb + (255,)
+    )
+    if fill_w > 4 * s:
+        d.rounded_rectangle(
+            (pad, pad, pad + fill_w, pad + bh),
+            radius=min(bh // 2, fill_w // 2),
+            fill=fill_rgb + (255,),
+        )
+    return layer, (BAR_X0 * s - pad, BAR_Y0 * s - pad)
 
 
 # ------------------------------- card ---------------------------------------
+def _split_rank(rank_text):
+    """``#3/57`` -> (``#3``, ``of 57``) — value + context line."""
+    text = "" if rank_text is None else str(rank_text)
+    if "/" in text:
+        value, _, total = text.partition("/")
+        value, total = value.strip(), total.strip()
+        return value, (f"of {total}" if total else "")
+    return text, ""
+
+
 def create_rank_card(
     name,
     username,
@@ -319,138 +249,99 @@ def create_rank_card(
     global_messages,
     output_path,
     avatar_path=None,
-    template_id=2,
+    template_id=1,
 ):
     """
-    Build the rank card.
+    Build the rank card over template_<template_id>.png.
 
     All display values are supplied dynamically:
       name / username       profile header strings
-      avatar_path           square source image (any size) or None
-      level / next_level    current + upcoming level numbers
-      progress_pct          0-100 fill of the level bar
-      rank_text             badge string (e.g. "#7")
-      messages              statistic pill 2 value
-      global_messages       statistic pill 3 value
-      output_path           where the PNG is written
-      template_id           theme template (1-6)
+      avatar_path            square source image (any size) or None
+      level / next_level     current + upcoming level numbers
+      progress_pct           0-100 fill of the level bar
+      rank_text              "rank/total" for stat card 1
+      messages               statistic card 2 value
+      global_messages        statistic card 3 value
+      output_path            where the PNG is written
+      template_id            theme template (1-6)
     Returns output_path on success, None on failure.
     """
-    # Get theme colors
     theme = _get_theme_colors(template_id)
-    c_bright = theme["bright"]
-    c_track = theme["track"]
-    c_fill = theme["fill"]
-    c_pill = theme["pill"]
+    accent = theme["accent"] + (255,)
 
     try:
-        avatar_img = None
-        if avatar_path and os.path.exists(avatar_path):
-            try:
-                avatar_img = Image.open(avatar_path)
-            except Exception as e:
-                logger.warning(f"[rank_image] avatar load failed: {e}")
-
-        # Foreground is drawn on a clear supersampled overlay; the atmospheric
-        # background stays at 1x and is composited underneath at the end.
-        canvas = Image.new("RGBA", (CANVAS_W * SCALE, CANVAS_H * SCALE), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(canvas)
+        base = _load_template(template_id)
+        overlay = Image.new(
+            "RGBA", (CANVAS_W * SCALE, CANVAS_H * SCALE), (0, 0, 0, 0)
+        )
+        draw = ImageDraw.Draw(overlay)
 
         # ---- profile header ----
-        badge_x, badge_y = _paste_avatar(canvas, avatar_img)
+        _paste_avatar(overlay, avatar_path)
 
-        name_txt, name_font = _fit_text(draw, str(name).upper(), NAME_SIZE * SCALE,
-                                        (CANVAS_W - TEXT_STACK_X - PAD_X) * SCALE)
-        user_txt, user_font = _fit_text(draw, username, USERNAME_SIZE * SCALE,
-                                        (CANVAS_W - TEXT_STACK_X - PAD_X) * SCALE)
-        draw.text((TEXT_STACK_X * SCALE, (AVATAR_Y + 62) * SCALE), name_txt,
-                  font=name_font, fill=COLOR_WHITE, anchor="lm")
-        draw.text((TEXT_STACK_X * SCALE, (AVATAR_Y + 122) * SCALE), user_txt,
-                  font=user_font, fill=c_bright, anchor="lm")
+        name_txt, name_font = _fit(
+            draw, str(name).upper(), NAME_SIZE * SCALE, NAME_MAX_W * SCALE
+        )
+        if name_txt:
+            draw.text((NAME_X * SCALE, NAME_CY * SCALE), name_txt,
+                      font=name_font, fill=WHITE, anchor="lm")
 
-        _draw_badge_text(canvas, badge_x, badge_y, rank_text)
+        user_txt, user_font = _fit(
+            draw, username, USER_SIZE * SCALE, USER_MAX_W * SCALE
+        )
+        if user_txt:
+            draw.text((USER_X * SCALE, USER_CY * SCALE), user_txt,
+                      font=user_font, fill=accent, anchor="lm")
 
-        # ---- level section ----
-        label = "Current Level:"
-        lf = _font(LEVEL_TEXT_SIZE * SCALE)
-        draw.text((PAD_X * SCALE, LEVEL_LABEL_Y * SCALE), label,
-                  font=lf, fill=COLOR_WHITE, anchor="lm")
-        num_w = draw.textlength(str(level), font=lf)
-        draw.text(((PAD_X + 16) * SCALE + draw.textlength(label, font=lf), LEVEL_LABEL_Y * SCALE),
-                  str(level), font=lf, fill=c_bright, anchor="lm")
+        # ---- level box ----
+        lvl_txt, lvl_font = _fit(
+            draw, str(level), LEVEL_SIZE * SCALE, LEVEL_MAX_W * SCALE
+        )
+        draw.text((LEVEL_CX * SCALE, LEVEL_CY * SCALE), lvl_txt,
+                  font=lvl_font, fill=accent, anchor="mm")
 
-        tx, ty, tw, th = BAR_X, BAR_Y, BAR_W, BAR_H
-        _rounded(draw, (tx * SCALE, ty * SCALE, (tx + tw) * SCALE, (ty + th) * SCALE),
-                 th // 2 * SCALE, c_track)
-
+        # ---- progress labels + bar ----
         pct = max(0.0, min(100.0, float(progress_pct or 0)))
-        fill_w = int(tw * pct / 100)
-        fill_w = min(max(fill_w, th // 2), tw - INDICATOR_R // 2)
-        if pct > 0:
-            _rounded(draw, (tx * SCALE, ty * SCALE, (tx + fill_w) * SCALE, (ty + th) * SCALE),
-                     th // 2 * SCALE, c_fill)
-        icx = min(tx + fill_w, tx + tw - INDICATOR_R - 6)
-        icy = ty + th // 2
-        draw.ellipse(((icx - INDICATOR_R) * SCALE, (icy - INDICATOR_R) * SCALE,
-                      (icx + INDICATOR_R) * SCALE, (icy + INDICATOR_R) * SCALE),
-                     fill=c_bright)
+        lbl_txt, lbl_font = _fit(
+            draw, f"{round(pct)}%", LABEL_SIZE * SCALE, LABEL_MAX_W * SCALE
+        )
+        draw.text((LEFT_LABEL_C[0] * SCALE, LEFT_LABEL_C[1] * SCALE), lbl_txt,
+                  font=lbl_font, fill=LABEL, anchor="mm")
 
-        nf = _font(NEXT_NUM_PAD * SCALE)
-        num_txt = str(next_level)
-        # Only draw the upcoming-level number when it clears the indicator dot.
-        num_left = tx + tw - NEXT_NUM_PAD - draw.textlength(num_txt, font=nf) / SCALE
-        if num_left > icx + INDICATOR_R + 14:
-            draw.text(((tx + tw - NEXT_NUM_PAD) * SCALE, icy * SCALE), num_txt,
-                      font=nf, fill=COLOR_WHITE, anchor="rm")
+        nxt_txt, nxt_font = _fit(
+            draw, f"NEXT: {next_level}", LABEL_SIZE * SCALE, LABEL_MAX_W * SCALE
+        )
+        draw.text((RIGHT_LABEL_C[0] * SCALE, RIGHT_LABEL_C[1] * SCALE), nxt_txt,
+                  font=nxt_font, fill=LABEL, anchor="mm")
+
+        bar, pos = _bar_layer(pct, theme)
+        overlay.alpha_composite(bar, dest=pos)
 
         # ---- statistics ----
-        stats = [
-            ("Rank", str(rank_text), "bar"),
-            ("Messages", messages, "chat"),
-            ("Global Messages", global_messages, "globe"),
-        ]
-        hf = _font(HEADING_SIZE * SCALE)
-        vf = _font(VALUE_SIZE * SCALE)
-        for i, (heading, value, icon_key) in enumerate(stats):
-            col_x = PAD_X + i * COL_STEP
-            draw.text((col_x * SCALE, HEADINGS_Y * SCALE), heading,
-                      font=hf, fill=COLOR_WHITE, anchor="lm")
+        rank_value, rank_sub = _split_rank(rank_text)
+        cards = (
+            (rank_value, rank_sub),
+            (messages, "this chat"),
+            (global_messages, "all chats"),
+        )
+        for i, (value, sub) in enumerate(cards):
+            tx = CARD_TEXT_X[i]
+            val_txt, val_font = _fit(
+                draw, value, VALUE_SIZE * SCALE, CARD_MAX_W[i] * SCALE
+            )
+            draw.text((tx * SCALE, VALUE_CY * SCALE), val_txt,
+                      font=val_font, fill=WHITE, anchor="lm")
+            if sub:
+                sub_txt, sub_font = _fit(
+                    draw, sub, SUB_SIZE * SCALE, CARD_MAX_W[i] * SCALE
+                )
+                draw.text((tx * SCALE, SUB_CY * SCALE), sub_txt,
+                          font=sub_font, fill=MUTED, anchor="lm")
 
-            px, py = col_x, PILL_Y
-            _rounded(draw, (px * SCALE, py * SCALE, (px + PILL_W) * SCALE, (py + PILL_H) * SCALE),
-                     PILL_RADIUS * SCALE, c_pill)
-
-            ccx = px + ICON_MARGIN_X + ICON_DIA // 2
-            ccy = py + PILL_H // 2
-            draw.ellipse(((ccx - ICON_DIA // 2) * SCALE, (ccy - ICON_DIA // 2) * SCALE,
-                          (ccx + ICON_DIA // 2) * SCALE, (ccy + ICON_DIA // 2) * SCALE),
-                         fill=c_bright)
-            ICONS[icon_key](draw, ccx * SCALE, ccy * SCALE)
-
-            val_txt, _ = _fit_text(draw, str(value), VALUE_SIZE * SCALE,
-                                   (PILL_W - ICON_DIA - ICON_MARGIN_X - 34) * SCALE)
-            draw.text(((px + ICON_MARGIN_X + ICON_DIA + 24) * SCALE, ccy * SCALE),
-                      val_txt, font=vf, fill=COLOR_WHITE, anchor="lm")
-
-        # ---- compose: background -> soft shadows -> foreground ----
-        fg = canvas.resize((CANVAS_W, CANVAS_H), Image.LANCZOS)
-
-        shadow = Image.new("L", (CANVAS_W, CANVAS_H), 0)
-        sd = ImageDraw.Draw(shadow)
-        sd.rounded_rectangle((BAR_X, BAR_Y + 4, BAR_X + BAR_W, BAR_Y + BAR_H + 4),
-                             radius=BAR_H // 2, fill=60)
-        for i in range(3):
-            sx = PAD_X + i * COL_STEP
-            sd.rounded_rectangle((sx, PILL_Y + 7, sx + PILL_W, PILL_Y + PILL_H + 7),
-                                 radius=PILL_RADIUS, fill=80)
-        shadow = shadow.filter(ImageFilter.GaussianBlur(5))
-
-        out = _build_background(avatar_img)
-        out = Image.composite(Image.new("RGBA", out.size, (0, 0, 0, 255)), out, shadow)
-        out = Image.alpha_composite(out, fg)
-
-        final = out.convert("RGB")
-        final.save(output_path, "PNG", compress_level=1)
+        # ---- compose ----
+        fg = overlay.resize((CANVAS_W, CANVAS_H), Image.LANCZOS)
+        out = Image.alpha_composite(base.convert("RGBA"), fg).convert("RGB")
+        out.save(output_path, "PNG", compress_level=1)
         return output_path
 
     except Exception as e:
@@ -467,11 +358,12 @@ def build_sample():
         level=7,
         next_level=8,
         progress_pct=62,
-        rank_text="#3",
+        rank_text="#3/57",
         messages="1,240",
         global_messages="9,483",
         output_path=out,
         avatar_path=None,
+        template_id=1,
     )
 
 

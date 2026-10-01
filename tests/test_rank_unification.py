@@ -705,8 +705,8 @@ class TestTemplateCommand(unittest.IsolatedAsyncioTestCase):
         text = msg.last[1]
         self.assertIn("Rank Templates", text)
         self.assertIn("Active:", text)             # current selection
-        self.assertIn("1. NEON CYBERPUNK", text)
-        self.assertIn("6. PIRATE", text)
+        self.assertIn("1. AMBER GLOW", text)
+        self.assertIn("6. NEON GREEN", text)
         self.assertIn("Usage:", text)
         self.assertIn("/template &lt;number&gt;", text)
         self.assertNotIn("photo", msg.last[2],
@@ -749,11 +749,11 @@ class TestTemplateCallback(unittest.IsolatedAsyncioTestCase):
         await call(template_mod.template_callback, query)
 
         self.assertEqual(db.get_user_rank_info(U1)["template"], 3)
-        self.assertIn("ICE FANTASY", query.answers[0]["text"] or "")
+        self.assertIn("PURPLE NEON", query.answers[0]["text"] or "")
         edits = _edits(msg)
         self.assertEqual(len(edits), 1, "stale-tap-safe edit must be sent")
         self.assertIn("Template Selected", edits[0]["text"])
-        self.assertIn("ICE FANTASY", edits[0]["text"])
+        self.assertIn("PURPLE NEON", edits[0]["text"])
         self.assertIn("Change anytime with /template", edits[0]["text"])
 
 

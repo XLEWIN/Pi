@@ -138,12 +138,12 @@ GLOBAL_VALUE_Y = 782
 # ============================================================
 
 THEMES = {
-    1: {"name": "NEON CYBERPUNK", "accent": PURPLE, "text": WHITE},
-    2: {"name": "RED DARK",       "accent": RED,    "text": WHITE},
-    3: {"name": "ICE FANTASY",    "accent": (100, 200, 255, 255), "text": WHITE},
-    4: {"name": "MILITARY",       "accent": (115, 220, 45, 255),  "text": WHITE},
-    5: {"name": "CINEMA",         "accent": (220, 180, 50, 255),  "text": WHITE},
-    6: {"name": "PIRATE",         "accent": (210, 145, 40, 255),  "text": WHITE},
+    1: {"name": "AMBER GLOW",     "accent": (250, 163, 47, 255),  "text": WHITE},
+    2: {"name": "NEON SILVER",    "accent": (224, 233, 245, 255), "text": WHITE},
+    3: {"name": "PURPLE NEON",    "accent": (233, 139, 251, 255), "text": WHITE},
+    4: {"name": "BLUE LIGHTNING", "accent": (77, 126, 247, 255),  "text": WHITE},
+    5: {"name": "NEON GALAXY",    "accent": (156, 218, 252, 255), "text": WHITE},
+    6: {"name": "NEON GREEN",     "accent": (139, 250, 179, 255), "text": WHITE},
 }
 
 
