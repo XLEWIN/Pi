@@ -135,7 +135,7 @@ class TestRankInfoConcurrency(unittest.TestCase):
         self.assertEqual(info["global_messages"], 50)
         self.assertEqual(info["chat_messages"], 40)
         self.assertEqual(info["chat_position"], 9)
-        self.assertEqual(info["template"], 1)        # presentation died
+        self.assertEqual(info["template"], 3)        # presentation died
         self.assertEqual(info["global_xp"], 0)
 
 

@@ -185,6 +185,7 @@ HELP_MENU: list[dict] = [
                 "/rank [@user] — View rank card",
                 "/template — Pick rank card template with preview (DM only)",
                 "/ranktemplate — Pick rank card template (DM only)",
+                "/wear — Equip the owner exclusive template (DM only)",
                 "/nextlevel — Messages needed for next rank",
                 "/streak — Your message streaks",
                 "/leaderboard /lb — Chat ranks by messages",

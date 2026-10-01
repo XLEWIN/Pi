@@ -135,16 +135,71 @@ GLOBAL_VALUE_Y = 782
 
 # ============================================================
 # THEMES (color overrides per template_id)
+#
+# section: "free" | "fictional" | "owner"  — /template grouping
+# need:    global-messages milestone to unlock, None = requirements
+#          not announced yet (stays locked), 0 = free from start.
+#          Owner-exclusive templates unlock only for the owner.
 # ============================================================
 
 THEMES = {
-    1: {"name": "AMBER GLOW",     "accent": (250, 163, 47, 255),  "text": WHITE},
-    2: {"name": "NEON SILVER",    "accent": (224, 233, 245, 255), "text": WHITE},
-    3: {"name": "PURPLE NEON",    "accent": (233, 139, 251, 255), "text": WHITE},
-    4: {"name": "BLUE LIGHTNING", "accent": (77, 126, 247, 255),  "text": WHITE},
-    5: {"name": "NEON GALAXY",    "accent": (156, 218, 252, 255), "text": WHITE},
-    6: {"name": "NEON GREEN",     "accent": (139, 250, 179, 255), "text": WHITE},
+    # ---- free: milestone unlocks (global messages) ----
+    1:  {"name": "AMBER GLOW",     "accent": (250, 163, 47, 255),  "text": WHITE, "section": "free", "need": 1000},
+    2:  {"name": "NEON SILVER",    "accent": (224, 233, 245, 255), "text": WHITE, "section": "free", "need": 5000},
+    3:  {"name": "PURPLE NEON",    "accent": (233, 139, 251, 255), "text": WHITE, "section": "free", "need": 0},
+    4:  {"name": "BLUE LIGHTNING", "accent": (77, 126, 247, 255),  "text": WHITE, "section": "free", "need": 3000},
+    5:  {"name": "NEON GALAXY",    "accent": (156, 218, 252, 255), "text": WHITE, "section": "free", "need": 2500},
+    6:  {"name": "NEON GREEN",     "accent": (139, 250, 179, 255), "text": WHITE, "section": "free", "need": 3500},
+    7:  {"name": "WINGED ARCHER",  "accent": (140, 175, 220, 255), "text": WHITE, "section": "free", "need": 0},
+    # ---- fictional: requirements announced later ----
+    8:  {"name": "CRIMSON FEATHER", "accent": (232, 150, 150, 255), "text": WHITE, "section": "fictional", "need": None},
+    9:  {"name": "MONO MANGA",      "accent": (218, 218, 218, 255), "text": WHITE, "section": "fictional", "need": None},
+    10: {"name": "MONO HUD",        "accent": (170, 170, 170, 255), "text": WHITE, "section": "fictional", "need": None},
+    11: {"name": "INK OVERLAY",     "accent": (210, 210, 210, 255), "text": WHITE, "section": "fictional", "need": None},
+    12: {"name": "NEON FANTASY",    "accent": (211, 172, 212, 255), "text": WHITE, "section": "fictional", "need": None},
+    13: {"name": "ROMAN TRIUMPH",   "accent": (231, 116, 114, 255), "text": WHITE, "section": "fictional", "need": None},
+    14: {"name": "CYBER NOIR",      "accent": (172, 211, 231, 255), "text": WHITE, "section": "fictional", "need": None},
+    15: {"name": "RETRO GRUNGE",    "accent": (179, 206, 225, 255), "text": WHITE, "section": "fictional", "need": None},
+    16: {"name": "GRUNGE PEGASUS",  "accent": (200, 140, 136, 255), "text": WHITE, "section": "fictional", "need": None},
+    17: {"name": "CYBER GRUNGE",    "accent": (216, 216, 216, 255), "text": WHITE, "section": "fictional", "need": None},
+    18: {"name": "SAMURAI INK",     "accent": (170, 170, 170, 255), "text": WHITE, "section": "fictional", "need": None},
+    # ---- owner exclusive: equipped through /wear ----
+    19: {"name": "PHANTOM RIDER",   "accent": (170, 202, 229, 255), "text": WHITE, "section": "owner", "need": None},
 }
+
+# Section button order for /template.
+SECTIONS = ("free", "fictional")
+
+SECTION_TITLES = {"free": "Free", "fictional": "Fictional"}
+
+
+def templates_in_section(section: str) -> dict:
+    """Ordered {template_id: theme} for one section."""
+    return {tid: t for tid, t in THEMES.items() if t.get("section") == section}
+
+
+def check_unlock(template_id, global_messages=0, is_owner=False):
+    """Is ``template_id`` equippable by this user?
+
+    Returns ``(ok, reason)`` — reason is a short user-facing string for
+    locked templates ("" when ok). Unlocking is evaluated at equip time
+    only; an already-equipped template always renders.
+    """
+    theme = THEMES.get(template_id)
+    if theme is None:
+        return False, "Unknown template."
+    if is_owner:
+        return True, ""
+    if theme.get("section") == "owner":
+        return False, "Owner exclusive."
+    need = theme.get("need")
+    if need is None:
+        return False, "Requirements coming soon."
+    if need <= 0:
+        return True, ""
+    if int(global_messages or 0) >= need:
+        return True, ""
+    return False, f"Needs {need:,} global messages."
 
 
 # ============================================================
@@ -304,8 +359,8 @@ def generate_template_preview(
     avatar_bytes=None,
 ):
     """
-    Generate a combined preview image showing all 6 templates.
-    Layout: 2 columns x 3 rows of scaled-down cards with template numbers.
+    Generate a combined preview image showing every template.
+    Layout: 2 columns of scaled-down cards with template numbers.
     Returns BytesIO ready for Telegram reply_photo().
     """
     # Card dimensions (scaled down for preview)

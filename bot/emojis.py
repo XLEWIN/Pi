@@ -569,6 +569,7 @@ class E:
     CHECK       = check()
     CROSS       = cross()
     DISAPPROVE  = disapprove()
+    LOCK        = custom_emoji("\U0001f512", "5296369303661067030")
 
     # Authority
     ADMIN       = admin()
@@ -673,6 +674,7 @@ class EID:
     CHECK       = "6325687241536440125"
     CROSS       = "5040042498634810056"
     DISAPPROVE  = "5121063440311386962"
+    LOCK        = "5296369303661067030"
     
     # Authority
     ADMIN       = "5042334757040423886"

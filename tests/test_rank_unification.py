@@ -225,7 +225,7 @@ class TestRankInfo(_Base):
         info = db.get_user_rank_info(U1, CHAT)
         self.assertEqual(info["streak_current"], 1)
         self.assertGreater(info["global_xp"], 0)
-        self.assertIn(info["template"], range(1, 7))
+        self.assertIn(info["template"], range(1, 20))
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -691,11 +691,12 @@ class TestTemplatePreview(unittest.TestCase):
 class TestTemplateCommand(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         _cleanup()
+        db.add_user(U1, "u1", "U1", None)
 
     def tearDown(self):
         _cleanup()
 
-    async def test_dm_reply_is_text_with_list_and_buttons(self):
+    async def test_dm_reply_is_main_screen_with_section_buttons(self):
         from bot.modules import template as template_mod
 
         _seed(CHAT, U1, 150)
@@ -705,8 +706,7 @@ class TestTemplateCommand(unittest.IsolatedAsyncioTestCase):
         text = msg.last[1]
         self.assertIn("Rank Templates", text)
         self.assertIn("Active:", text)             # current selection
-        self.assertIn("1. AMBER GLOW", text)
-        self.assertIn("6. NEON GREEN", text)
+        self.assertIn("Pick a category below", text)
         self.assertIn("Usage:", text)
         self.assertIn("/template &lt;number&gt;", text)
         self.assertNotIn("photo", msg.last[2],
@@ -714,13 +714,85 @@ class TestTemplateCommand(unittest.IsolatedAsyncioTestCase):
 
         markup = msg.last[2]["reply_markup"]
         flat = [b for row in markup.inline_keyboard for b in row]
-        self.assertEqual(len(flat), 6)
-        self.assertEqual(flat[0].callback_data, "template:1")
+        self.assertEqual(len(flat), 2, "main screen = two section buttons")
+        self.assertEqual(flat[0].callback_data, "template:sec:free")
         self.assertEqual(flat[0].style, "primary")
+        self.assertIn("Free (7)", flat[0].text)
+        self.assertEqual(flat[1].callback_data, "template:sec:fictional")
         self.assertEqual(flat[1].style, "success")
-        self.assertEqual(flat[2].style, "danger")
-        for btn in flat:
-            self.assertEqual(btn.icon_custom_emoji_id, EID.SPARKLE)
+        self.assertIn("Fictional (11)", flat[1].text)
+
+    async def test_free_section_lists_templates_with_lock_state(self):
+        from bot.modules import template as template_mod
+
+        _seed(CHAT, U1, 150)  # 150 global messages: #1 needs 1,000 → locked
+        msg = _msg("original", chat_type="private", chat_id=U1)
+        query = make_callback("template:sec:free", message=msg, user_id=U1)
+        await call(template_mod.template_callback, query)
+
+        edits = _edits(msg)
+        self.assertEqual(len(edits), 1, "section screen must edit in place")
+        text = edits[0]["text"]
+        self.assertIn("Rank Templates — Free", text)
+        self.assertIn("1. AMBER GLOW", text)
+        self.assertIn("6. NEON GREEN", text)
+        self.assertIn("7. WINGED ARCHER", text)
+        self.assertIn("1,000 GM", text)       # milestone hint on locked #1
+        self.assertIn("active", text)
+
+        flat = [b for row in edits[0]["reply_markup"].inline_keyboard
+                for b in row]
+        self.assertEqual(len(flat), 8, "7 templates + Back")
+        self.assertEqual(flat[0].callback_data, "template:1")
+        self.assertEqual(flat[0].icon_custom_emoji_id, EID.LOCK)
+        btn3 = next(b for b in flat if b.callback_data == "template:3")
+        self.assertEqual(btn3.icon_custom_emoji_id, EID.SPARKLE)
+        self.assertEqual(flat[-1].callback_data, "template:sec:main")
+
+    async def test_fictional_section_stays_locked_with_lock_icons(self):
+        from bot.modules import template as template_mod
+
+        msg = _msg("original", chat_type="private", chat_id=U1)
+        query = make_callback("template:sec:fictional", message=msg,
+                              user_id=U1)
+        await call(template_mod.template_callback, query)
+
+        edits = _edits(msg)
+        self.assertEqual(len(edits), 1)
+        text = edits[0]["text"]
+        self.assertIn("Rank Templates — Fictional", text)
+        self.assertIn("8. CRIMSON FEATHER", text)
+        self.assertIn("18. SAMURAI INK", text)
+        self.assertIn("soon", text)
+
+        flat = [b for row in edits[0]["reply_markup"].inline_keyboard
+                for b in row]
+        self.assertEqual(len(flat), 12, "11 templates + Back")
+        for btn in flat[:-1]:
+            self.assertEqual(btn.icon_custom_emoji_id, EID.LOCK)
+
+    async def test_direct_number_sets_unlocked_template(self):
+        from bot.modules import template as template_mod
+
+        msg = _msg("/template", chat_type="private", chat_id=U1)
+        await call(template_mod.template_command, msg, args=["3"])
+
+        text = msg.last[1]
+        self.assertIn("Template Selected", text)
+        self.assertIn("PURPLE NEON", text)
+        self.assertEqual(db.get_user_rank_info(U1)["template"], 3)
+
+    async def test_direct_number_refuses_locked_template(self):
+        from bot.modules import template as template_mod
+
+        msg = _msg("/template", chat_type="private", chat_id=U1)
+        await call(template_mod.template_command, msg, args=["1"])
+
+        text = msg.last[1]
+        self.assertIn("locked", text)
+        self.assertIn("1,000", text)
+        self.assertEqual(db.get_user_rank_info(U1)["template"], 3,
+                         "locked template must not be equipped")
 
     async def test_group_is_redirected_to_dm(self):
         from bot.modules import template as template_mod
@@ -755,6 +827,60 @@ class TestTemplateCallback(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Template Selected", edits[0]["text"])
         self.assertIn("PURPLE NEON", edits[0]["text"])
         self.assertIn("Change anytime with /template", edits[0]["text"])
+
+    async def test_locked_milestone_tap_refused(self):
+        from bot.modules import template as template_mod
+
+        msg = _msg("original")
+        query = make_callback("template:1", message=msg, user_id=U1)
+        await call(template_mod.template_callback, query)
+
+        ans = query.answers[0]
+        self.assertTrue(ans["show_alert"], "lock reason must alert")
+        self.assertIn("1,000", ans["text"])
+        self.assertEqual(db.get_user_rank_info(U1)["template"], 3)
+        self.assertEqual(_edits(msg), [], "no confirmation on refusal")
+
+    async def test_fictional_template_refused_until_requirements(self):
+        from bot.modules import template as template_mod
+
+        msg = _msg("original")
+        query = make_callback("template:8", message=msg, user_id=U1)
+        await call(template_mod.template_callback, query)
+
+        ans = query.answers[0]
+        self.assertTrue(ans["show_alert"])
+        self.assertIn("coming soon", ans["text"])
+        self.assertEqual(db.get_user_rank_info(U1)["template"], 3)
+
+    async def test_wear_equips_owner_template(self):
+        from unittest import mock
+
+        from bot.modules import template as template_mod
+
+        msg = _msg("/wear", chat_type="private", chat_id=U1)
+        with mock.patch.object(template_mod, "settings",
+                               SimpleNamespace(owner_id=U1)):
+            await call(template_mod.wear_command, msg)
+
+        self.assertEqual(db.get_user_rank_info(U1)["template"], 19)
+        text = msg.last[1]
+        self.assertIn("Template Worn", text)
+        self.assertIn("PHANTOM RIDER", text)
+
+    async def test_wear_refuses_non_owner(self):
+        from unittest import mock
+
+        from bot.modules import template as template_mod
+
+        msg = _msg("/wear", chat_type="private", chat_id=U1)
+        with mock.patch.object(template_mod, "settings",
+                               SimpleNamespace(owner_id=0)):
+            await call(template_mod.wear_command, msg)
+
+        self.assertIn("owner exclusive", msg.last[1])
+        self.assertEqual(db.get_user_rank_info(U1)["template"], 3,
+                         "template must not change")
 
 
 if __name__ == "__main__":

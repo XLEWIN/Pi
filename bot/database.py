@@ -2473,7 +2473,7 @@ class Database:
             if doc:
                 return doc
             return {"user_id": user_id, "global_level": 1, "global_xp": 0, "global_messages": 0,
-                    "template": 1, "streak_current": 0, "streak_best": 0,
+                    "template": 3, "streak_current": 0, "streak_best": 0,
                     "last_message_date": None, "last_streak_date": None}
         except Exception as e:
             logger.error(f"Error getting user level: {e}")
@@ -2495,7 +2495,7 @@ class Database:
         """
         defaults = {
             "global_level": 1, "global_xp": 0, "global_messages": 0,
-            "template": 1, "streak_current": 0, "streak_best": 0,
+            "template": 3, "streak_current": 0, "streak_best": 0,
             "last_message_date": None, "last_streak_date": None,
         }
         try:
@@ -2725,7 +2725,7 @@ class Database:
             "chat_members": 0,
             "global_messages": 0, "global_rank": 1, "global_position": None,
             "global_members": 0,
-            "template": 1, "global_xp": 0,
+            "template": 3, "global_xp": 0,
             "streak_current": 0, "streak_best": 0,
         }
         try:
@@ -2777,7 +2777,7 @@ class Database:
             async def _presentation() -> None:
                 # Presentation extras (template / xp / streaks — no counters).
                 lvl = await self.get_user_level(user_id)
-                info["template"] = int(lvl.get("template") or 1)
+                info["template"] = int(lvl.get("template") or 3)
                 info["global_xp"] = int(lvl.get("global_xp") or 0)
                 info["streak_current"] = int(lvl.get("streak_current") or 0)
                 info["streak_best"] = int(lvl.get("streak_best") or 0)

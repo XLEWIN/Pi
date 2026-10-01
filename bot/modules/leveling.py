@@ -21,10 +21,11 @@ from aiogram.types import CallbackQuery, FSInputFile, Message
 from bot.command_handler import COMMAND
 from bot.pipeline import cmd, on
 from bot.reply import reply_text, reply_photo
+from bot.config import settings
 from bot.constants import CHAT_RANK_MESSAGES, GLOBAL_RANK_MESSAGES
 from bot.database import db
 from bot.keyboards.colored import btn_primary, btn_url, build_keyboard
-from bot.profile_templates import get_theme_list, THEMES
+from bot.profile_templates import check_unlock, get_theme_list, THEMES
 from bot.rank_image import create_rank_card
 from bot.emojis import E, EID
 from bot.timeutils import ist_monday, ist_month_start
@@ -306,12 +307,26 @@ async def ranktemplate_command(message: Message, args: list):
     try:
         template = int(args[0])
         if template not in THEMES:
-            await reply_text(message, f"{E.ERROR} Invalid template. Choose 1-6.",
+            await reply_text(message, f"{E.ERROR} Invalid template. Choose 1-{len(THEMES)}.",
             parse_mode=ParseMode.HTML)
             return
     except ValueError:
-        await reply_text(message, f"{E.ERROR} Please provide a number (1-6).",
+        await reply_text(message, f"{E.ERROR} Please provide a number (1-{len(THEMES)}).",
             parse_mode=ParseMode.HTML)
+        return
+
+    # Unlock gate — same rules as /template (owner bypasses everything;
+    # an already-equipped template keeps rendering regardless).
+    info = await adb(db.get_user_rank_info(message.from_user.id))
+    is_owner = bool(settings.owner_id
+                    and message.from_user.id == settings.owner_id)
+    ok, reason = check_unlock(template, info["global_messages"], is_owner)
+    if not ok:
+        await reply_text(
+            message,
+            f"{E.LOCK} <b>{THEMES[template]['name']}</b> is locked — {reason}",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     await adb(db.set_template(message.from_user.id, template))

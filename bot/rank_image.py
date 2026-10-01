@@ -2,14 +2,17 @@
 """
 Dynamic rank-card renderer for /rank.
 
-The card is built on top of one of six pre-rendered master templates in
+The card is built on top of one of the pre-rendered master templates in
 ``bot/templates/template_<id>.png`` (1708 x 750). Each template already
-contains the full dashboard — avatar slot, name/username pills, LEVEL
-box, progress track and the three stat cards — so PIL only overlays the
-live values (avatar, name, username, level, progress, statistics) on a
-2x supersampled layer and composites it down for smooth, crisp text.
+contains the full dashboard — avatar slot, name/username pills, level
+cells, progress track and the three stat cards — so PIL only overlays
+the live values (avatar, name, username, level, progress, statistics)
+on a 2x supersampled layer and composites it down for smooth, crisp
+text.
 
-Template geometry (measured once from the master art, 1708 x 750):
+Two geometry families exist:
+
+v1 (templates 1-6) — flat cards:
 
     avatar slot      (67, 128) - (238, 292)
     name pill        x=291, baseline center y=184
@@ -19,8 +22,13 @@ Template geometry (measured once from the master art, 1708 x 750):
     progress bar     x 194 -> 1522, y 357 -> 377
     stat cards       text x = 90 / 637 / 1164, values y=552, subs y=605
 
-The layout is identical across every template — only the artwork, glow
-colour and card tint change — so text lands in the same place always.
+v2 (templates 7-19) — frosted dashboard (see ``V2``): dual level cells,
+full-width bar, label chips that cover the baked percentage text, and
+value/sub boxes with background-sampled ink.
+
+Within each family the layout is identical across every template — only
+the artwork, glow colour and card tint change — so text always lands in
+the same place.
 """
 
 import os
@@ -68,14 +76,55 @@ LABEL = (235, 235, 240, 255)
 PLACEHOLDER = (150, 150, 158, 255)
 
 # Per-template palette: accent = text accent, fill = progress-bar fill,
-# track = progress-bar empty track (sampled from the master templates).
+# track = progress-bar empty track (sampled from the master templates),
+# layout = geometry family (v1 = original six, v2 = dashboard cards).
 THEME_COLORS = {
-    1: {"accent": (250, 175, 70),  "fill": (250, 163, 47), "track": (12, 6, 1)},
-    2: {"accent": (224, 233, 245), "fill": (224, 233, 245), "track": (16, 17, 22)},
-    3: {"accent": (236, 150, 252), "fill": (233, 139, 251), "track": (12, 4, 20)},
-    4: {"accent": (96, 140, 252),  "fill": (57, 105, 239),  "track": (3, 7, 22)},
-    5: {"accent": (170, 224, 253), "fill": (156, 218, 252), "track": (3, 4, 10)},
-    6: {"accent": (150, 251, 185), "fill": (139, 250, 179), "track": (2, 6, 3)},
+    1:  {"accent": (250, 175, 70),  "fill": (250, 163, 47), "track": (12, 6, 1),   "layout": "v1"},
+    2:  {"accent": (224, 233, 245), "fill": (224, 233, 245), "track": (16, 17, 22), "layout": "v1"},
+    3:  {"accent": (236, 150, 252), "fill": (233, 139, 251), "track": (12, 4, 20),  "layout": "v1"},
+    4:  {"accent": (96, 140, 252),  "fill": (57, 105, 239),  "track": (3, 7, 22),   "layout": "v1"},
+    5:  {"accent": (170, 224, 253), "fill": (156, 218, 252), "track": (3, 4, 10),   "layout": "v1"},
+    6:  {"accent": (150, 251, 185), "fill": (139, 250, 179), "track": (2, 6, 3),    "layout": "v1"},
+    7:  {"accent": (150, 185, 225), "fill": (120, 143, 171), "track": (4, 14, 35),  "layout": "v2"},
+    8:  {"accent": (240, 120, 120), "fill": (232, 185, 181), "track": (13, 5, 3),   "layout": "v2"},
+    9:  {"accent": (230, 230, 230), "fill": (218, 218, 218), "track": (3, 3, 3),    "layout": "v2"},
+    10: {"accent": (180, 180, 180), "fill": (138, 138, 138), "track": (6, 6, 6),    "layout": "v2"},
+    11: {"accent": (225, 225, 225), "fill": (210, 210, 210), "track": (14, 14, 14), "layout": "v2"},
+    12: {"accent": (225, 150, 235), "fill": (211, 172, 212), "track": (16, 8, 20),  "layout": "v2"},
+    13: {"accent": (240, 140, 130), "fill": (231, 116, 114), "track": (19, 2, 1),   "layout": "v2"},
+    14: {"accent": (170, 215, 240), "fill": (172, 211, 231), "track": (4, 8, 16),   "layout": "v2"},
+    15: {"accent": (150, 190, 230), "fill": (179, 206, 225), "track": (8, 21, 42),  "layout": "v2"},
+    16: {"accent": (200, 140, 136), "fill": (148, 107, 104), "track": (13, 5, 4),   "layout": "v2"},
+    17: {"accent": (225, 225, 228), "fill": (216, 216, 216), "track": (4, 6, 9),    "layout": "v2"},
+    18: {"accent": (185, 185, 185), "fill": (134, 134, 134), "track": (11, 11, 11), "layout": "v2"},
+    19: {"accent": (170, 205, 235), "fill": (170, 202, 229), "track": (3, 8, 17),   "layout": "v2"},
+}
+
+# --------------------------- v2 geometry ------------------------------------
+# Dashboard layout shared by templates 7-19 (1708 x 750; measured, all
+# thirteen agree within a few px). Boxes are (x0, y0, x1, y1) unless noted.
+V2 = {
+    "avatar":        (59, 95, 246, 265),
+    "avatar_radius": 30,
+    "name":          (291, 149, 400),     # x, baseline-center y, max width
+    "name_box":      (271, 116, 707, 182),
+    "user":          (291, 222, 171),
+    "user_box":      (271, 194, 474, 251),
+    "cell_label":    (1526, 105, 1643, 166),   # upper cell: "LEVEL"
+    "cell_value":    (1526, 174, 1643, 240),   # lower cell: level number
+    "lbl_l":         (65, 357),            # left label anchor (lm), center y
+    "lbl_r":         (1645, 357),          # right label anchor (rm), center y
+    "lbl_size":      23,
+    "lbl_l_chip":    (54, 341, 305, 376),  # cover for baked "NN% to next level"
+    "lbl_r_chip":    (1428, 341, 1656, 376),  # cover for baked "Next: Level N"
+    "bar":           (59, 388, 1660, 411),
+    "cards": (
+        # value + sub boxes per card (headers are baked into the art)
+        (86, 546, 226, 623), (86, 632, 179, 667),
+        (626, 546, 766, 623), (626, 632, 719, 667),
+        (1153, 546, 1293, 623), (1153, 632, 1246, 667),
+    ),
+    "chip_fill":     (10, 10, 12, 240),    # solid chip hides baked label text
 }
 
 
@@ -148,9 +197,10 @@ def _load_template(template_id: int) -> Image.Image:
 
 
 # ----------------------------- avatar ---------------------------------------
-def _paste_avatar(overlay, avatar_path):
+def _paste_avatar(overlay, avatar_path, box=None, radius=None):
     """Center-crop + rounded-mask the avatar into the template's slot."""
-    x0, y0, x1, y1 = AVATAR_BOX
+    x0, y0, x1, y1 = box if box else AVATAR_BOX
+    radius = AVATAR_RADIUS if radius is None else radius
     w, h = (x1 - x0) * SCALE, (y1 - y0) * SCALE
 
     src = None
@@ -177,14 +227,14 @@ def _paste_avatar(overlay, avatar_path):
 
     mask = Image.new("L", av.size, 0)
     ImageDraw.Draw(mask).rounded_rectangle(
-        (0, 0, w - 1, h - 1), radius=AVATAR_RADIUS * SCALE, fill=255
+        (0, 0, w - 1, h - 1), radius=radius * SCALE, fill=255
     )
     av.putalpha(mask)
     overlay.paste(av, (x0 * SCALE, y0 * SCALE), av)
 
 
 # ----------------------------- progress bar ---------------------------------
-def _bar_layer(pct: float, theme: dict):
+def _bar_layer(pct: float, theme: dict, rect=None):
     """Build the glowing progress bar (incl. feathered shade) for ``pct``.
 
     The shade neutralises the template's baked placeholder fill so the
@@ -192,7 +242,8 @@ def _bar_layer(pct: float, theme: dict):
     Returns (layer, paste_position).
     """
     s = SCALE
-    bw, bh = (BAR_X1 - BAR_X0) * s, (BAR_Y1 - BAR_Y0) * s
+    bx0, by0, bx1, by1 = rect if rect else (BAR_X0, BAR_Y0, BAR_X1, BAR_Y1)
+    bw, bh = (bx1 - bx0) * s, (by1 - by0) * s
     pad = 70 * s
     fill_rgb, track_rgb = theme["fill"], theme["track"]
 
@@ -224,7 +275,7 @@ def _bar_layer(pct: float, theme: dict):
             radius=min(bh // 2, fill_w // 2),
             fill=fill_rgb + (255,),
         )
-    return layer, (BAR_X0 * s - pad, BAR_Y0 * s - pad)
+    return layer, (bx0 * s - pad, by0 * s - pad)
 
 
 # ------------------------------- card ---------------------------------------
@@ -236,6 +287,184 @@ def _split_rank(rank_text):
         value, total = value.strip(), total.strip()
         return value, (f"of {total}" if total else "")
     return text, ""
+
+
+# ------------------------------- contrast -----------------------------------
+def _bg_lum(base, box):
+    """Mean luminance of a box interior (15% inset) on the base art."""
+    x0, y0, x1, y1 = box
+    ix, iy = max(2, int((x1 - x0) * 0.15)), max(2, int((y1 - y0) * 0.15))
+    reg = base.crop((x0 + ix, y0 + iy, x1 - ix, y1 - iy)).convert("RGB").resize((6, 6))
+    px = list(reg.getdata())
+    return sum(0.299 * r + 0.587 * g + 0.114 * b for r, g, b in px) / len(px)
+
+
+def _ink(lum, color=WHITE, dark=(24, 26, 34, 255)):
+    """Readable text colour: flip to dark ink on bright frosted boxes."""
+    return dark if lum > 155 else color
+
+
+def _accent_ink(lum, accent):
+    """Accent colour, darkened when the background is bright."""
+    if lum > 155:
+        return tuple(int(c * 0.5) for c in accent[:3]) + (255,)
+    return accent
+
+
+# ------------------------------- v1 drawing ---------------------------------
+def _draw_v1(base, overlay, theme, name, username, level, next_level,
+             progress_pct, rank_text, messages, global_messages, avatar_path):
+    accent = theme["accent"] + (255,)
+    draw = ImageDraw.Draw(overlay)
+
+    # ---- profile header ----
+    _paste_avatar(overlay, avatar_path)
+
+    name_txt, name_font = _fit(
+        draw, str(name).upper(), NAME_SIZE * SCALE, NAME_MAX_W * SCALE
+    )
+    if name_txt:
+        draw.text((NAME_X * SCALE, NAME_CY * SCALE), name_txt,
+                  font=name_font, fill=WHITE, anchor="lm")
+
+    user_txt, user_font = _fit(
+        draw, username, USER_SIZE * SCALE, USER_MAX_W * SCALE
+    )
+    if user_txt:
+        draw.text((USER_X * SCALE, USER_CY * SCALE), user_txt,
+                  font=user_font, fill=accent, anchor="lm")
+
+    # ---- level box ----
+    lvl_txt, lvl_font = _fit(
+        draw, str(level), LEVEL_SIZE * SCALE, LEVEL_MAX_W * SCALE
+    )
+    draw.text((LEVEL_CX * SCALE, LEVEL_CY * SCALE), lvl_txt,
+              font=lvl_font, fill=accent, anchor="mm")
+
+    # ---- progress labels + bar ----
+    pct = max(0.0, min(100.0, float(progress_pct or 0)))
+    lbl_txt, lbl_font = _fit(
+        draw, f"{round(pct)}%", LABEL_SIZE * SCALE, LABEL_MAX_W * SCALE
+    )
+    draw.text((LEFT_LABEL_C[0] * SCALE, LEFT_LABEL_C[1] * SCALE), lbl_txt,
+              font=lbl_font, fill=LABEL, anchor="mm")
+
+    nxt_txt, nxt_font = _fit(
+        draw, f"NEXT: {next_level}", LABEL_SIZE * SCALE, LABEL_MAX_W * SCALE
+    )
+    draw.text((RIGHT_LABEL_C[0] * SCALE, RIGHT_LABEL_C[1] * SCALE), nxt_txt,
+              font=nxt_font, fill=LABEL, anchor="mm")
+
+    bar, pos = _bar_layer(pct, theme)
+    overlay.alpha_composite(bar, dest=pos)
+
+    # ---- statistics ----
+    rank_value, rank_sub = _split_rank(rank_text)
+    cards = (
+        (rank_value, rank_sub),
+        (messages, "this chat"),
+        (global_messages, "all chats"),
+    )
+    for i, (value, sub) in enumerate(cards):
+        tx = CARD_TEXT_X[i]
+        val_txt, val_font = _fit(
+            draw, value, VALUE_SIZE * SCALE, CARD_MAX_W[i] * SCALE
+        )
+        draw.text((tx * SCALE, VALUE_CY * SCALE), val_txt,
+                  font=val_font, fill=WHITE, anchor="lm")
+        if sub:
+            sub_txt, sub_font = _fit(
+                draw, sub, SUB_SIZE * SCALE, CARD_MAX_W[i] * SCALE
+            )
+            draw.text((tx * SCALE, SUB_CY * SCALE), sub_txt,
+                      font=sub_font, fill=MUTED, anchor="lm")
+
+
+# ------------------------------- v2 drawing ---------------------------------
+def _draw_v2(base, overlay, theme, name, username, level, next_level,
+             progress_pct, rank_text, messages, global_messages, avatar_path):
+    """Dashboard layout for templates 7-19.
+
+    Labels above the bar are baked into the art ("72% to next level" /
+    "Next: Level 29"), so a solid chip covers them before the live text
+    is drawn; card headers are baked and left untouched. Every frosted
+    box gets its ink sampled so light variants stay readable.
+    """
+    accent = theme["accent"] + (255,)
+    draw = ImageDraw.Draw(overlay)
+    s = SCALE
+
+    def sc(box):
+        return tuple(int(v * s) for v in box)
+
+    def cxy(box):
+        return ((box[0] + box[2]) / 2 * s, (box[1] + box[3]) / 2 * s)
+
+    # ---- profile header ----
+    _paste_avatar(overlay, avatar_path, V2["avatar"], V2["avatar_radius"])
+
+    nx, ncy, nmax = V2["name"]
+    name_lum = _bg_lum(base, V2["name_box"])
+    name_txt, name_font = _fit(draw, str(name), 44 * s, nmax * s)
+    if name_txt:
+        draw.text((nx * s, ncy * s), name_txt, font=name_font,
+                  fill=_ink(name_lum), anchor="lm")
+
+    ux, ucy, umax = V2["user"]
+    user_lum = _bg_lum(base, V2["user_box"])
+    user_txt, user_font = _fit(draw, username, 26 * s, umax * s)
+    if user_txt:
+        draw.text((ux * s, ucy * s), user_txt, font=user_font,
+                  fill=_accent_ink(user_lum, accent), anchor="lm")
+
+    # ---- level cells: LEVEL label (upper) + number (lower) ----
+    c1, c2 = V2["cell_label"], V2["cell_value"]
+    c1_lum, c2_lum = _bg_lum(base, c1), _bg_lum(base, c2)
+    lbl_txt, lbl_font = _fit(draw, "LEVEL", 20 * s, (c1[2] - c1[0] - 14) * s)
+    draw.text(cxy(c1), lbl_txt, font=lbl_font,
+              fill=_ink(c1_lum, LABEL), anchor="mm")
+    lvl_txt, lvl_font = _fit(draw, str(level), 42 * s, (c2[2] - c2[0] - 14) * s)
+    draw.text(cxy(c2), lvl_txt, font=lvl_font,
+              fill=_accent_ink(c2_lum, accent), anchor="mm")
+
+    # ---- progress labels (chip covers baked text) + bar ----
+    pct = max(0.0, min(100.0, float(progress_pct or 0)))
+    draw.rounded_rectangle(sc(V2["lbl_l_chip"]), radius=9 * s,
+                           fill=V2["chip_fill"])
+    draw.rounded_rectangle(sc(V2["lbl_r_chip"]), radius=9 * s,
+                           fill=V2["chip_fill"])
+
+    lx, lcy = V2["lbl_l"]
+    lbl_txt, lbl_font = _fit(draw, f"{round(pct)}% to next level",
+                             V2["lbl_size"] * s, (V2["lbl_l_chip"][2] - lx - 8) * s)
+    draw.text((lx * s, lcy * s), lbl_txt, font=lbl_font, fill=LABEL, anchor="lm")
+
+    rx, rcy = V2["lbl_r"]
+    nxt_txt, nxt_font = _fit(draw, f"Next: Level {next_level}",
+                             V2["lbl_size"] * s, (rx - V2["lbl_r_chip"][0] - 8) * s)
+    draw.text((rx * s, rcy * s), nxt_txt, font=nxt_font, fill=LABEL, anchor="rm")
+
+    bar, pos = _bar_layer(pct, theme, V2["bar"])
+    overlay.alpha_composite(bar, dest=pos)
+
+    # ---- statistics: centred inside the frosted value/sub boxes ----
+    rank_value, rank_sub = _split_rank(rank_text)
+    cards = (
+        (rank_value, rank_sub),
+        (messages, "this chat"),
+        (global_messages, "all chats"),
+    )
+    boxes = V2["cards"]
+    for i, (value, sub) in enumerate(cards):
+        vbox, sbox = boxes[i * 2], boxes[i * 2 + 1]
+        vlum, slum = _bg_lum(base, vbox), _bg_lum(base, sbox)
+        val_txt, val_font = _fit(draw, value, 46 * s, (vbox[2] - vbox[0] - 14) * s)
+        draw.text(cxy(vbox), val_txt, font=val_font,
+                  fill=_ink(vlum), anchor="mm")
+        if sub:
+            sub_txt, sub_font = _fit(draw, sub, 19 * s, (sbox[2] - sbox[0] - 10) * s)
+            draw.text(cxy(sbox), sub_txt, font=sub_font,
+                      fill=_ink(slum, MUTED, dark=(70, 72, 80, 255)), anchor="mm")
 
 
 def create_rank_card(
@@ -263,80 +492,23 @@ def create_rank_card(
       messages               statistic card 2 value
       global_messages        statistic card 3 value
       output_path            where the PNG is written
-      template_id            theme template (1-6)
+      template_id            theme template (1-19)
     Returns output_path on success, None on failure.
     """
     theme = _get_theme_colors(template_id)
-    accent = theme["accent"] + (255,)
 
     try:
         base = _load_template(template_id)
         overlay = Image.new(
             "RGBA", (CANVAS_W * SCALE, CANVAS_H * SCALE), (0, 0, 0, 0)
         )
-        draw = ImageDraw.Draw(overlay)
 
-        # ---- profile header ----
-        _paste_avatar(overlay, avatar_path)
-
-        name_txt, name_font = _fit(
-            draw, str(name).upper(), NAME_SIZE * SCALE, NAME_MAX_W * SCALE
-        )
-        if name_txt:
-            draw.text((NAME_X * SCALE, NAME_CY * SCALE), name_txt,
-                      font=name_font, fill=WHITE, anchor="lm")
-
-        user_txt, user_font = _fit(
-            draw, username, USER_SIZE * SCALE, USER_MAX_W * SCALE
-        )
-        if user_txt:
-            draw.text((USER_X * SCALE, USER_CY * SCALE), user_txt,
-                      font=user_font, fill=accent, anchor="lm")
-
-        # ---- level box ----
-        lvl_txt, lvl_font = _fit(
-            draw, str(level), LEVEL_SIZE * SCALE, LEVEL_MAX_W * SCALE
-        )
-        draw.text((LEVEL_CX * SCALE, LEVEL_CY * SCALE), lvl_txt,
-                  font=lvl_font, fill=accent, anchor="mm")
-
-        # ---- progress labels + bar ----
-        pct = max(0.0, min(100.0, float(progress_pct or 0)))
-        lbl_txt, lbl_font = _fit(
-            draw, f"{round(pct)}%", LABEL_SIZE * SCALE, LABEL_MAX_W * SCALE
-        )
-        draw.text((LEFT_LABEL_C[0] * SCALE, LEFT_LABEL_C[1] * SCALE), lbl_txt,
-                  font=lbl_font, fill=LABEL, anchor="mm")
-
-        nxt_txt, nxt_font = _fit(
-            draw, f"NEXT: {next_level}", LABEL_SIZE * SCALE, LABEL_MAX_W * SCALE
-        )
-        draw.text((RIGHT_LABEL_C[0] * SCALE, RIGHT_LABEL_C[1] * SCALE), nxt_txt,
-                  font=nxt_font, fill=LABEL, anchor="mm")
-
-        bar, pos = _bar_layer(pct, theme)
-        overlay.alpha_composite(bar, dest=pos)
-
-        # ---- statistics ----
-        rank_value, rank_sub = _split_rank(rank_text)
-        cards = (
-            (rank_value, rank_sub),
-            (messages, "this chat"),
-            (global_messages, "all chats"),
-        )
-        for i, (value, sub) in enumerate(cards):
-            tx = CARD_TEXT_X[i]
-            val_txt, val_font = _fit(
-                draw, value, VALUE_SIZE * SCALE, CARD_MAX_W[i] * SCALE
-            )
-            draw.text((tx * SCALE, VALUE_CY * SCALE), val_txt,
-                      font=val_font, fill=WHITE, anchor="lm")
-            if sub:
-                sub_txt, sub_font = _fit(
-                    draw, sub, SUB_SIZE * SCALE, CARD_MAX_W[i] * SCALE
-                )
-                draw.text((tx * SCALE, SUB_CY * SCALE), sub_txt,
-                          font=sub_font, fill=MUTED, anchor="lm")
+        args = (base, overlay, theme, name, username, level, next_level,
+                progress_pct, rank_text, messages, global_messages, avatar_path)
+        if theme.get("layout") == "v2":
+            _draw_v2(*args)
+        else:
+            _draw_v1(*args)
 
         # ---- compose ----
         fg = overlay.resize((CANVAS_W, CANVAS_H), Image.LANCZOS)
