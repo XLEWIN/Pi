@@ -137,10 +137,17 @@ GLOBAL_VALUE_Y = 782
 # THEMES (color overrides per template_id)
 #
 # section: "free" | "fictional" | "owner"  — /template grouping
-# need:    global-messages milestone to unlock, None = requirements
-#          not announced yet (stays locked), 0 = free from start.
-#          Owner-exclusive templates unlock only for the owner.
+# need:    global-messages milestone to unlock, 0 = free from
+#          start. Owner-exclusive templates unlock only for
+#          the owner.
+# req:     profile requirement checked against the live user —
+#          {"kind": "group"}            bot added to a group
+#          {"kind": "bio",   "text": s} user bio contains s
+#          {"kind": "name",  "text": s} display name contains s
 # ============================================================
+
+BIO_TAG = "@PIModulerBot"
+NAME_TAG = "@PI"
 
 THEMES = {
     # ---- free: milestone unlocks (global messages) ----
@@ -150,19 +157,18 @@ THEMES = {
     4:  {"name": "BLUE LIGHTNING", "accent": (77, 126, 247, 255),  "text": WHITE, "section": "free", "need": 3000},
     5:  {"name": "NEON GALAXY",    "accent": (156, 218, 252, 255), "text": WHITE, "section": "free", "need": 2500},
     6:  {"name": "NEON GREEN",     "accent": (139, 250, 179, 255), "text": WHITE, "section": "free", "need": 3500},
-    7:  {"name": "WINGED ARCHER",  "accent": (140, 175, 220, 255), "text": WHITE, "section": "free", "need": 0},
-    # ---- fictional: requirements announced later ----
-    8:  {"name": "CRIMSON FEATHER", "accent": (232, 150, 150, 255), "text": WHITE, "section": "fictional", "need": None},
-    9:  {"name": "MONO MANGA",      "accent": (218, 218, 218, 255), "text": WHITE, "section": "fictional", "need": None},
-    10: {"name": "MONO HUD",        "accent": (170, 170, 170, 255), "text": WHITE, "section": "fictional", "need": None},
-    11: {"name": "INK OVERLAY",     "accent": (210, 210, 210, 255), "text": WHITE, "section": "fictional", "need": None},
-    12: {"name": "NEON FANTASY",    "accent": (211, 172, 212, 255), "text": WHITE, "section": "fictional", "need": None},
-    13: {"name": "ROMAN TRIUMPH",   "accent": (231, 116, 114, 255), "text": WHITE, "section": "fictional", "need": None},
-    14: {"name": "CYBER NOIR",      "accent": (172, 211, 231, 255), "text": WHITE, "section": "fictional", "need": None},
-    15: {"name": "RETRO GRUNGE",    "accent": (179, 206, 225, 255), "text": WHITE, "section": "fictional", "need": None},
-    16: {"name": "GRUNGE PEGASUS",  "accent": (200, 140, 136, 255), "text": WHITE, "section": "fictional", "need": None},
-    17: {"name": "CYBER GRUNGE",    "accent": (216, 216, 216, 255), "text": WHITE, "section": "fictional", "need": None},
-    18: {"name": "SAMURAI INK",     "accent": (170, 170, 170, 255), "text": WHITE, "section": "fictional", "need": None},
+    # ---- fictional: profile requirements (see fetch_unlock_profile) ----
+    8:  {"name": "CRIMSON FEATHER", "accent": (232, 150, 150, 255), "text": WHITE, "section": "fictional", "req": {"kind": "group"}},
+    9:  {"name": "MONO MANGA",      "accent": (218, 218, 218, 255), "text": WHITE, "section": "fictional", "req": {"kind": "bio", "text": BIO_TAG}},
+    10: {"name": "MONO HUD",        "accent": (170, 170, 170, 255), "text": WHITE, "section": "fictional", "req": {"kind": "name", "text": NAME_TAG}},
+    11: {"name": "INK OVERLAY",     "accent": (210, 210, 210, 255), "text": WHITE, "section": "fictional", "req": {"kind": "bio", "text": BIO_TAG}},
+    12: {"name": "NEON FANTASY",    "accent": (211, 172, 212, 255), "text": WHITE, "section": "fictional", "req": {"kind": "name", "text": NAME_TAG}},
+    13: {"name": "ROMAN TRIUMPH",   "accent": (231, 116, 114, 255), "text": WHITE, "section": "fictional", "req": {"kind": "bio", "text": BIO_TAG}},
+    14: {"name": "CYBER NOIR",      "accent": (172, 211, 231, 255), "text": WHITE, "section": "fictional", "req": {"kind": "bio", "text": BIO_TAG}},
+    15: {"name": "RETRO GRUNGE",    "accent": (179, 206, 225, 255), "text": WHITE, "section": "fictional", "req": {"kind": "bio", "text": BIO_TAG}},
+    16: {"name": "GRUNGE PEGASUS",  "accent": (200, 140, 136, 255), "text": WHITE, "section": "fictional", "req": {"kind": "bio", "text": BIO_TAG}},
+    17: {"name": "CYBER GRUNGE",    "accent": (216, 216, 216, 255), "text": WHITE, "section": "fictional", "req": {"kind": "bio", "text": BIO_TAG}},
+    18: {"name": "SAMURAI INK",     "accent": (170, 170, 170, 255), "text": WHITE, "section": "fictional", "req": {"kind": "bio", "text": BIO_TAG}},
     # ---- owner exclusive: equipped through /wear ----
     19: {"name": "PHANTOM RIDER",   "accent": (170, 202, 229, 255), "text": WHITE, "section": "owner", "need": None},
 }
@@ -178,12 +184,16 @@ def templates_in_section(section: str) -> dict:
     return {tid: t for tid, t in THEMES.items() if t.get("section") == section}
 
 
-def check_unlock(template_id, global_messages=0, is_owner=False):
+def check_unlock(template_id, global_messages=0, is_owner=False, profile=None):
     """Is ``template_id`` equippable by this user?
 
     Returns ``(ok, reason)`` — reason is a short user-facing string for
     locked templates ("" when ok). Unlocking is evaluated at equip time
     only; an already-equipped template always renders.
+
+    ``profile`` is the snapshot from :func:`fetch_unlock_profile` and is
+    only required for templates carrying a ``req`` entry; without it a
+    requirement counts as unmet.
     """
     theme = THEMES.get(template_id)
     if theme is None:
@@ -192,6 +202,25 @@ def check_unlock(template_id, global_messages=0, is_owner=False):
         return True, ""
     if theme.get("section") == "owner":
         return False, "Owner exclusive."
+    req = theme.get("req")
+    if req is not None:
+        profile = profile or {}
+        kind = req.get("kind")
+        if kind == "group":
+            if profile.get("in_group"):
+                return True, ""
+            return False, "Add the bot to one group first."
+        if kind == "bio":
+            bio = (profile.get("bio") or "").lower()
+            if req["text"].lower() in bio:
+                return True, ""
+            return False, f"Add {req['text']} to your Telegram bio."
+        if kind == "name":
+            name = (profile.get("name") or "").lower()
+            if req["text"].lower() in name:
+                return True, ""
+            return False, f"Add {req['text']} to your name."
+        return False, "Requirements coming soon."
     need = theme.get("need")
     if need is None:
         return False, "Requirements coming soon."
@@ -200,6 +229,38 @@ def check_unlock(template_id, global_messages=0, is_owner=False):
     if int(global_messages or 0) >= need:
         return True, ""
     return False, f"Needs {need:,} global messages."
+
+
+async def fetch_unlock_profile(bot, user) -> dict:
+    """Live requirement context for one user (name, bio, group add).
+
+    * name — from the ``User`` object Telegram already sent (first +
+      last name), no API call.
+    * bio — via ``getChat``; bots only see it through that call, and an
+      error just means "not met".
+    * in_group — this user sharing at least one group with the bot
+      (the my_chat_member add event records the adder immediately;
+      any group message registers the sender too).
+    """
+    first = getattr(user, "first_name", None) or ""
+    last = getattr(user, "last_name", None) or ""
+    profile = {
+        "name": f"{first} {last}".strip(),
+        "bio": "",
+        "in_group": False,
+    }
+    try:
+        chat = await bot.get_chat(user.id)
+        profile["bio"] = getattr(chat, "bio", None) or ""
+    except Exception:
+        pass
+    try:
+        from bot.async_bridge import adb
+        from bot.database import db
+        profile["in_group"] = (await adb(db.count_user_groups(user.id))) >= 1
+    except Exception:
+        pass
+    return profile
 
 
 # ============================================================

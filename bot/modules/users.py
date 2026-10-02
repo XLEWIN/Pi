@@ -221,6 +221,16 @@ async def handle_bot_membership(chat_member: ChatMemberUpdated, bot: Bot):
 
     chat = chat_member.chat
     if added:
+        if getattr(chat, "type", "") in ("group", "supergroup"):
+            # Register the group — and the member who added the bot —
+            # right on the add event: "add bot to one group"
+            # (template #8's requirement) flips instantly, no need to
+            # wait for someone to talk in the group.
+            try:
+                await adb(db.add_group(chat.id, chat.title or str(chat.id)))
+                await adb(db.add_group_member(chat.id, actor.id, "member"))
+            except Exception:
+                logger.warning("group registration failed for %s", chat.id)
         try:
             n = await asyncio.wait_for(
                 bot.get_chat_member_count(chat.id), timeout=5

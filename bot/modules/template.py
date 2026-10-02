@@ -3,7 +3,9 @@
 /templates are grouped into two sections shown as two-column buttons:
 
 * **Free** — milestone unlocks (global messages), listed with lock state
-* **Fictional** — requirements announced later (stay locked)
+* **Fictional** — profile requirements: group add / bio tag / name tag
+  (checked live against the user; tapping a locked one shows the exact
+  requirement)
 
 Opening a section shows its preview collage as a photo whose caption
 carries the section list (names + lock states); Telegram cannot turn a
@@ -16,7 +18,7 @@ list, and tapping one answers with the exact reason it is locked.
 import os
 import re
 
-from aiogram import F
+from aiogram import Bot, F
 from aiogram.enums import ParseMode
 from aiogram.types import CallbackQuery, FSInputFile, Message
 
@@ -30,6 +32,7 @@ from bot.profile_templates import (
     SECTION_TITLES,
     THEMES,
     check_unlock,
+    fetch_unlock_profile,
     templates_in_section,
 )
 from bot.reply import reply_text
@@ -73,7 +76,8 @@ def _main_buttons():
     return build_keyboard([row])
 
 
-def _section_buttons(section: str, global_messages: int, is_owner: bool):
+def _section_buttons(section: str, global_messages: int, is_owner: bool,
+                     profile: dict | None = None):
     """Colored keyboard — one icon-tagged button per template in section.
 
     Colors keep the original mapping: #1 primary, evens success,
@@ -84,7 +88,7 @@ def _section_buttons(section: str, global_messages: int, is_owner: bool):
     for tid, theme in templates_in_section(section).items():
         label = f"{tid}. {theme['name']}"
         data = f"template:{tid}"
-        ok, _ = check_unlock(tid, global_messages, is_owner)
+        ok, _ = check_unlock(tid, global_messages, is_owner, profile)
         icon = EID.SPARKLE if ok else EID.LOCK
         if tid == 1:
             btn = btn_primary(label, data, icon_emoji_id=icon)
@@ -121,8 +125,9 @@ def _main_body(active_name: str, active_id: int) -> str:
 
 
 def _section_line(tid: int, theme: dict, active_id: int,
-                  global_messages: int, is_owner: bool) -> str:
-    ok, reason = check_unlock(tid, global_messages, is_owner)
+                  global_messages: int, is_owner: bool,
+                  profile: dict | None = None) -> str:
+    ok, reason = check_unlock(tid, global_messages, is_owner, profile)
     if tid == active_id:
         mark = f" {E.CHECK} <b>(active)</b>"
     elif ok:
@@ -131,15 +136,22 @@ def _section_line(tid: int, theme: dict, active_id: int,
         mark = f" {E.LOCK} soon"
     elif reason == "Owner exclusive.":
         mark = f" {E.LOCK} owner"
-    else:
+    elif reason.startswith("Needs "):
         # "Needs 1,000 global messages." -> compact "1,000 GM"
         need = reason.split("Needs ", 1)[1].split(" ", 1)[0]
         mark = f" {E.LOCK} {need} GM"
+    elif "group" in reason.lower():
+        mark = f" {E.LOCK} group"
+    elif "bio" in reason.lower():
+        mark = f" {E.LOCK} bio"
+    else:
+        mark = f" {E.LOCK} name"
     return f"├ {tid}. {theme['name']}{mark}"
 
 
 def _section_body(section: str, active_name: str, active_id: int,
-                  global_messages: int, is_owner: bool) -> str:
+                  global_messages: int, is_owner: bool,
+                  profile: dict | None = None) -> str:
     title = SECTION_TITLES[section]
     lines = [
         f"{E.SPARKLE} <b>Rank Templates — {title}</b>",
@@ -148,7 +160,7 @@ def _section_body(section: str, active_name: str, active_id: int,
     ]
     for tid, theme in templates_in_section(section).items():
         lines.append(_section_line(tid, theme, active_id,
-                                   global_messages, is_owner))
+                                   global_messages, is_owner, profile))
     lines.append(
         f"└ {E.SETTINGS} Usage: <code>/template &lt;number&gt;</code>"
         f" · Example: <code>/template 3</code>"
@@ -214,7 +226,7 @@ async def _show_screen(message, section: str, text: str, markup):
         pass
 
 
-async def template_command(message: Message, args: list):
+async def template_command(message: Message, args: list, bot: Bot):
     """Handle /template — sections, list + inline selection, or direct set."""
     if message.chat.type != "private":
         await reply_text(
@@ -241,8 +253,11 @@ async def template_command(message: Message, args: list):
                 parse_mode=ParseMode.HTML,
             )
             return
+        profile = None
+        if THEMES[tid].get("req") and bot is not None:
+            profile = await fetch_unlock_profile(bot, message.from_user)
         ok, reason = check_unlock(
-            tid, info["global_messages"], _is_owner(message.from_user)
+            tid, info["global_messages"], _is_owner(message.from_user), profile
         )
         if not ok:
             await reply_text(
@@ -271,7 +286,7 @@ async def template_command(message: Message, args: list):
     )
 
 
-async def template_callback(query: CallbackQuery):
+async def template_callback(query: CallbackQuery, bot: Bot):
     """Handle template callbacks: section navigation + selection."""
     data = query.data
     if not data.startswith("template:"):
@@ -289,11 +304,16 @@ async def template_callback(query: CallbackQuery):
         active_id = info["template"]
         active_name = THEMES.get(active_id, THEMES[1])["name"]
         gm, owner = info["global_messages"], _is_owner(query.from_user)
+        profile = None
+        if section != "main" and any(
+            t.get("req") for t in templates_in_section(section).values()
+        ):
+            profile = await fetch_unlock_profile(bot, query.from_user)
         if section == "main":
             text, markup = _main_body(active_name, active_id), _main_buttons()
         else:
-            text = _section_body(section, active_name, active_id, gm, owner)
-            markup = _section_buttons(section, gm, owner)
+            text = _section_body(section, active_name, active_id, gm, owner, profile)
+            markup = _section_buttons(section, gm, owner, profile)
         await query.answer()
         await _show_screen(query.message, section, text, markup)
         return
@@ -309,8 +329,11 @@ async def template_callback(query: CallbackQuery):
         return
 
     info = await _rank_info(query.from_user.id)
+    profile = None
+    if THEMES[template_id].get("req"):
+        profile = await fetch_unlock_profile(bot, query.from_user)
     ok, reason = check_unlock(
-        template_id, info["global_messages"], _is_owner(query.from_user)
+        template_id, info["global_messages"], _is_owner(query.from_user), profile
     )
     if not ok:
         await query.answer(reason, show_alert=True)

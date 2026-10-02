@@ -224,6 +224,47 @@ class TestHandleBotMembership(unittest.IsolatedAsyncioTestCase):
         captured = await self._run(None)
         self.assertEqual(captured, [])
 
+    async def test_added_to_group_registers_group_and_adder(self):
+        """The add event records the group AND the member who added the
+        bot — that is what flips template #8's requirement ("add the bot
+        to one group") instantly, without waiting for group activity.
+        """
+        from bot.database import db
+
+        chat = _chat(cid=-100555111, title="Req Group")
+        chat.type = "supergroup"
+        self.addCleanup(db.collection("groups").delete_many,
+                        {"chat_id": -100555111})
+        self.addCleanup(db.collection("group_members").delete_many,
+                        {"chat_id": -100555111})
+        cmu = _cmu("left", "member", _actor(), chat=chat)
+        captured = await self._run(cmu)
+
+        self.assertEqual(len(captured), 1, "#BOT_ADDED log still sent")
+        self.assertIsNotNone(
+            db.collection("groups").find_one({"chat_id": -100555111}),
+            "group registered on the add event")
+        self.assertIsNotNone(
+            db.collection("group_members").find_one(
+                {"chat_id": -100555111, "user_id": 7544264351}),
+            "the adder is recorded as a member")
+
+    async def test_added_in_private_chat_registers_nothing(self):
+        """my_chat_member also fires for block/unblock in DMs — no group."""
+        from bot.database import db
+
+        chat = _chat(cid=7544264351, title=None, username=None)  # private
+        chat.type = "private"
+        self.addCleanup(db.collection("groups").delete_many,
+                        {"chat_id": 7544264351})
+        cmu = _cmu("kicked", "member", _actor(), chat=chat)
+        captured = await self._run(cmu)
+
+        self.assertEqual(len(captured), 1, "log still sent")
+        self.assertIsNone(
+            db.collection("groups").find_one({"chat_id": 7544264351}),
+            "private chats never register as groups")
+
 
 class TestNoUserJoinChannelLog(unittest.IsolatedAsyncioTestCase):
     """register_user must NOT post joins to the log channel (owner request).

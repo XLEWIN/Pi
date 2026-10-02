@@ -40,7 +40,7 @@ atexit.register(shutil.rmtree, _TEST_DIR, ignore_errors=True)
 # ── Imports (after env) ───────────────────────────────────────────
 from aiogram.dispatcher.event.handler import FilterObject, HandlerObject  # noqa: E402
 
-from aiofakes import call, make_callback, make_message  # noqa: E402
+from aiofakes import FakeBot, call, make_callback, make_message  # noqa: E402
 from bot import pipeline  # noqa: E402
 from bot.constants import (  # noqa: E402
     CHAT_RANK_MESSAGES,
@@ -733,7 +733,7 @@ class TestTemplateCommand(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(flat), 2, "main screen = two section buttons")
         self.assertEqual(flat[0].callback_data, "template:sec:free")
         self.assertEqual(flat[0].style, "primary")
-        self.assertIn("Free (7)", flat[0].text)
+        self.assertIn("Free (6)", flat[0].text)
         self.assertEqual(flat[1].callback_data, "template:sec:fictional")
         self.assertEqual(flat[1].style, "success")
         self.assertIn("Fictional (11)", flat[1].text)
@@ -762,13 +762,15 @@ class TestTemplateCommand(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Rank Templates — Free", text)
         self.assertIn("1. AMBER GLOW", text)
         self.assertIn("6. NEON GREEN", text)
-        self.assertIn("7. WINGED ARCHER", text)
+        self.assertNotIn("WINGED", text,
+                         "#7 was removed from the free section")
+        self.assertNotIn("7.", text, "no 7th entry remains in free")
         self.assertIn("1,000 GM", text)       # milestone hint on locked #1
         self.assertIn("active", text)
 
         flat = [b for row in photos[0]["reply_markup"].inline_keyboard
                 for b in row]
-        self.assertEqual(len(flat), 8, "7 templates + Back")
+        self.assertEqual(len(flat), 7, "6 templates + Back")
         self.assertEqual(flat[0].callback_data, "template:1")
         self.assertEqual(flat[0].icon_custom_emoji_id, EID.LOCK)
         btn3 = next(b for b in flat if b.callback_data == "template:3")
@@ -795,7 +797,9 @@ class TestTemplateCommand(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Rank Templates — Fictional", text)
         self.assertIn("8. CRIMSON FEATHER", text)
         self.assertIn("18. SAMURAI INK", text)
-        self.assertIn("soon", text)
+        self.assertIn("group", text)   # #8's requirement mark
+        self.assertIn("bio", text)     # bio-tagged templates
+        self.assertIn("name", text)    # name-tagged templates
 
         flat = [b for row in photos[0]["reply_markup"].inline_keyboard
                 for b in row]
@@ -856,6 +860,19 @@ class TestTemplateCommand(unittest.IsolatedAsyncioTestCase):
         self.assertIn("DM", text)
         self.assertNotIn("photo", msg.last[2])
 
+    async def test_removed_number_is_unknown(self):
+        """#7 (WINGED ARCHER) was dropped — the number no longer resolves."""
+        from bot.modules import template as template_mod
+
+        msg = _msg("/template", chat_type="private", chat_id=U1)
+        await call(template_mod.template_command, msg, args=["7"])
+
+        text = msg.last[1]
+        self.assertIn("Unknown template", text)
+        self.assertIn("pick 1-18", text)
+        self.assertEqual(db.get_user_rank_info(U1)["template"], 3,
+                         "removed template must not be equipped")
+
 
 class TestTemplateCallback(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -911,7 +928,7 @@ class TestTemplateCallback(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(db.get_user_rank_info(U1)["template"], 3)
         self.assertEqual(_edits(msg), [], "no confirmation on refusal")
 
-    async def test_fictional_template_refused_until_requirements(self):
+    async def test_group_requirement_refused_without_group(self):
         from bot.modules import template as template_mod
 
         msg = _msg("original")
@@ -920,7 +937,7 @@ class TestTemplateCallback(unittest.IsolatedAsyncioTestCase):
 
         ans = query.answers[0]
         self.assertTrue(ans["show_alert"])
-        self.assertIn("coming soon", ans["text"])
+        self.assertIn("group", ans["text"])
         self.assertEqual(db.get_user_rank_info(U1)["template"], 3)
 
     async def test_wear_equips_owner_template(self):
@@ -951,6 +968,84 @@ class TestTemplateCallback(unittest.IsolatedAsyncioTestCase):
         self.assertIn("owner exclusive", msg.last[1])
         self.assertEqual(db.get_user_rank_info(U1)["template"], 3,
                          "template must not change")
+
+
+class TestFictionalRequirements(unittest.IsolatedAsyncioTestCase):
+    """Live requirement detection for the fictional section.
+
+    * #8  — user shares a group with the bot (added there)
+    * #9, #11, #13–#18 — Telegram bio contains @PIModulerBot
+    * #10, #12         — display name contains @PI
+    """
+
+    def setUp(self):
+        _cleanup()
+        db.add_user(U1, "u1", "U1", None)
+
+    def tearDown(self):
+        _cleanup()
+
+    async def test_bio_does_not_unlock_name_template(self):
+        from bot.modules import template as template_mod
+
+        bot = FakeBot()
+        bot.chats[U1] = SimpleNamespace(id=U1, type="private",
+                                        bio="code @PIModulerBot bot")
+        msg = _msg("original", chat_type="private", chat_id=U1)
+        query = make_callback("template:10", message=msg, user_id=U1)
+        await call(template_mod.template_callback, query, bot=bot)
+
+        ans = query.answers[0]
+        self.assertTrue(ans["show_alert"])
+        self.assertIn("name", ans["text"])
+        self.assertEqual(db.get_user_rank_info(U1)["template"], 3)
+
+    async def test_bio_tag_unlocks_bio_template(self):
+        from bot.modules import template as template_mod
+
+        bot = FakeBot()
+        bot.chats[U1] = SimpleNamespace(id=U1, type="private",
+                                        bio="just a bio @pimodulerbot enjoy")
+        msg = _msg("original", chat_type="private", chat_id=U1)
+        query = make_callback("template:9", message=msg, user_id=U1)
+        await call(template_mod.template_callback, query, bot=bot)
+
+        self.assertEqual(db.get_user_rank_info(U1)["template"], 9)
+        self.assertIn("MONO MANGA", query.answers[0]["text"] or "")
+
+    async def test_group_member_unlocks_group_template(self):
+        from bot.modules import template as template_mod
+
+        db.collection("groups").update_one(
+            {"chat_id": CHAT},
+            {"$set": {"chat_id": CHAT, "chat_title": "Rank Group",
+                      "is_active": 1}},
+            upsert=True,
+        )
+        db.collection("group_members").update_one(
+            {"chat_id": CHAT, "user_id": U1},
+            {"$set": {"chat_id": CHAT, "user_id": U1, "role": "member"}},
+            upsert=True,
+        )
+        bot = FakeBot()   # no bio — only the group requirement is met
+        msg = _msg("original", chat_type="private", chat_id=U1)
+        query = make_callback("template:8", message=msg, user_id=U1)
+        await call(template_mod.template_callback, query, bot=bot)
+
+        self.assertEqual(db.get_user_rank_info(U1)["template"], 8)
+        self.assertIn("CRIMSON FEATHER", query.answers[0]["text"] or "")
+
+    async def test_name_tag_unlocks_name_template(self):
+        from bot.modules import template as template_mod
+
+        msg = _msg("/template", chat_type="private", chat_id=U1,
+                   first_name="@PI Tester")
+        await call(template_mod.template_command, msg, args=["10"])
+
+        text = msg.last[1]
+        self.assertIn("Template Selected", text)
+        self.assertIn("MONO HUD", text)
+        self.assertEqual(db.get_user_rank_info(U1)["template"], 10)
 
 
 if __name__ == "__main__":

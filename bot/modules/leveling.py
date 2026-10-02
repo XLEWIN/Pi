@@ -25,7 +25,7 @@ from bot.config import settings
 from bot.constants import CHAT_RANK_MESSAGES, GLOBAL_RANK_MESSAGES
 from bot.database import db
 from bot.keyboards.colored import btn_primary, btn_url, build_keyboard
-from bot.profile_templates import check_unlock, get_theme_list, THEMES
+from bot.profile_templates import check_unlock, fetch_unlock_profile, get_theme_list, THEMES
 from bot.rank_image import create_rank_card
 from bot.emojis import E, EID
 from bot.timeutils import ist_monday, ist_month_start
@@ -287,7 +287,7 @@ async def rank_command(message: Message, bot: Bot, args: list, bot_data: dict):
                     pass
 
 
-async def ranktemplate_command(message: Message, args: list):
+async def ranktemplate_command(message: Message, args: list, bot: Bot):
     """Handle /ranktemplate — pick rank card template (DM only)."""
     if message.chat.type != "private":
         await reply_text(message, f"{E.INFO} Use this command in my DM for privacy.",
@@ -320,7 +320,10 @@ async def ranktemplate_command(message: Message, args: list):
     info = await adb(db.get_user_rank_info(message.from_user.id))
     is_owner = bool(settings.owner_id
                     and message.from_user.id == settings.owner_id)
-    ok, reason = check_unlock(template, info["global_messages"], is_owner)
+    profile = None
+    if THEMES[template].get("req"):
+        profile = await fetch_unlock_profile(bot, message.from_user)
+    ok, reason = check_unlock(template, info["global_messages"], is_owner, profile)
     if not ok:
         await reply_text(
             message,
