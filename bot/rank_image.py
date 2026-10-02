@@ -112,8 +112,8 @@ V2 = {
     "user_box":      (271, 194, 474, 251),
     "cell_label":    (1526, 105, 1643, 166),   # upper cell: "LEVEL"
     "cell_value":    (1526, 174, 1643, 240),   # lower cell: level number
-    "lbl_l":         (65, 357),            # left label anchor (lm), center y
-    "lbl_r":         (1645, 357),          # right label anchor (rm), center y
+    "lbl_l":         (65, 352),            # left label anchor (lm), center y
+    "lbl_r":         (1645, 352),          # right label anchor (rm), center y
     "lbl_size":      23,
     "lbl_l_chip":    (54, 341, 305, 376),  # cover for baked "NN% to next level"
     "lbl_r_chip":    (1428, 341, 1656, 376),  # cover for baked "Next: Level N"
@@ -126,6 +126,32 @@ V2 = {
     ),
     "chip_fill":     (10, 10, 12, 240),    # solid chip hides baked label text
 }
+
+# Measured header geometry per v2 template. Pill/cell centre-y read from each
+# art's borders (accent-colour + column scans, cross-checked per template);
+# the shared boxes above are only the legacy average. Text is centred on the
+# per-template values so name/username/LEVEL/level sit inside their slots on
+# every template, including #19 whose art matches #18 after the owner swap.
+V2_HDR = {
+    7:  {"name": 136.5, "user": 207.5, "cell_u": 123.0, "cell_l": 204.0},
+    8:  {"name": 148.5, "user": 215.5, "cell_u": 134.0, "cell_l": 209.0},
+    9:  {"name": 137.5, "user": 207.5, "cell_u": 126.5, "cell_l": 202.0},
+    10: {"name": 144.0, "user": 211.5, "cell_u": 127.0, "cell_l": 210.0},
+    11: {"name": 141.0, "user": 209.0, "cell_u": 116.5, "cell_l": 193.5},
+    12: {"name": 137.5, "user": 205.0, "cell_u": 120.0, "cell_l": 201.5},
+    13: {"name": 140.5, "user": 205.5, "cell_u": 126.5, "cell_l": 207.0},
+    14: {"name": 139.5, "user": 208.5, "cell_u": 123.5, "cell_l": 200.0},
+    15: {"name": 166.0, "user": 234.0, "cell_u": 143.5, "cell_l": 224.0},
+    16: {"name": 143.5, "user": 212.5, "cell_u": 131.5, "cell_l": 204.5},
+    17: {"name": 145.5, "user": 213.0, "cell_u": 125.5, "cell_l": 202.5},
+    18: {"name": 145.0, "user": 213.5, "cell_u": 125.0, "cell_l": 200.0},
+    19: {"name": 145.0, "user": 213.5, "cell_u": 125.0, "cell_l": 200.0},
+}
+# Ink centre minus anchor y for the sample strings (measured on renders):
+# name/user use anchor "lm", the cells use "mm".
+_V2_BIAS = {"name": 0.5, "user": 3.0, "cell_u": 0.5, "cell_l": 1.0}
+# Legacy fixed ink centres (pre per-template fix) - fallback for unknown ids.
+_V2_LEGACY = {"name": 149.5, "user": 225.0, "cell_u": 136.0, "cell_l": 208.0}
 
 
 def _get_theme_colors(template_id: int) -> dict:
@@ -382,17 +408,20 @@ def _draw_v1(base, overlay, theme, name, username, level, next_level,
 
 # ------------------------------- v2 drawing ---------------------------------
 def _draw_v2(base, overlay, theme, name, username, level, next_level,
-             progress_pct, rank_text, messages, global_messages, avatar_path):
+             progress_pct, rank_text, messages, global_messages, avatar_path,
+             template_id=1):
     """Dashboard layout for templates 7-19.
 
     Labels above the bar are baked into the art ("72% to next level" /
     "Next: Level 29"), so a solid chip covers them before the live text
     is drawn; card headers are baked and left untouched. Every frosted
-    box gets its ink sampled so light variants stay readable.
+    box gets its ink sampled so light variants stay readable. Header text
+    is centred on the per-template pill/cell geometry from V2_HDR.
     """
     accent = theme["accent"] + (255,)
     draw = ImageDraw.Draw(overlay)
     s = SCALE
+    hdr = V2_HDR.get(template_id, _V2_LEGACY)
 
     def sc(box):
         return tuple(int(v * s) for v in box)
@@ -400,31 +429,43 @@ def _draw_v2(base, overlay, theme, name, username, level, next_level,
     def cxy(box):
         return ((box[0] + box[2]) / 2 * s, (box[1] + box[3]) / 2 * s)
 
+    def rebox(box, centre, legacy):
+        """Recentre a frosted box on the template's measured slot centre."""
+        dy = centre - legacy
+        return (box[0], box[1] + dy, box[2], box[3] + dy)
+
     # ---- profile header ----
     _paste_avatar(overlay, avatar_path, V2["avatar"], V2["avatar_radius"])
 
-    nx, ncy, nmax = V2["name"]
-    name_lum = _bg_lum(base, V2["name_box"])
+    nx, _, nmax = V2["name"]
+    ncy = hdr["name"] - _V2_BIAS["name"]
+    name_box = rebox(V2["name_box"], hdr["name"], _V2_LEGACY["name"])
+    name_lum = _bg_lum(base, name_box)
     name_txt, name_font = _fit(draw, str(name), 44 * s, nmax * s)
     if name_txt:
         draw.text((nx * s, ncy * s), name_txt, font=name_font,
                   fill=_ink(name_lum), anchor="lm")
 
-    ux, ucy, umax = V2["user"]
-    user_lum = _bg_lum(base, V2["user_box"])
+    ux, _, umax = V2["user"]
+    ucy = hdr["user"] - _V2_BIAS["user"]
+    user_box = rebox(V2["user_box"], hdr["user"], _V2_LEGACY["user"])
+    user_lum = _bg_lum(base, user_box)
     user_txt, user_font = _fit(draw, username, 26 * s, umax * s)
     if user_txt:
         draw.text((ux * s, ucy * s), user_txt, font=user_font,
                   fill=_accent_ink(user_lum, accent), anchor="lm")
 
     # ---- level cells: LEVEL label (upper) + number (lower) ----
-    c1, c2 = V2["cell_label"], V2["cell_value"]
+    c1 = rebox(V2["cell_label"], hdr["cell_u"], _V2_LEGACY["cell_u"])
+    c2 = rebox(V2["cell_value"], hdr["cell_l"], _V2_LEGACY["cell_l"])
     c1_lum, c2_lum = _bg_lum(base, c1), _bg_lum(base, c2)
     lbl_txt, lbl_font = _fit(draw, "LEVEL", 20 * s, (c1[2] - c1[0] - 14) * s)
-    draw.text(cxy(c1), lbl_txt, font=lbl_font,
+    draw.text((cxy(c1)[0], (hdr["cell_u"] - _V2_BIAS["cell_u"]) * s),
+              lbl_txt, font=lbl_font,
               fill=_ink(c1_lum, LABEL), anchor="mm")
     lvl_txt, lvl_font = _fit(draw, str(level), 42 * s, (c2[2] - c2[0] - 14) * s)
-    draw.text(cxy(c2), lvl_txt, font=lvl_font,
+    draw.text((cxy(c2)[0], (hdr["cell_l"] - _V2_BIAS["cell_l"]) * s),
+              lvl_txt, font=lvl_font,
               fill=_accent_ink(c2_lum, accent), anchor="mm")
 
     # ---- progress labels (chip covers baked text) + bar ----
@@ -506,7 +547,7 @@ def create_rank_card(
         args = (base, overlay, theme, name, username, level, next_level,
                 progress_pct, rank_text, messages, global_messages, avatar_path)
         if theme.get("layout") == "v2":
-            _draw_v2(*args)
+            _draw_v2(*args, template_id=template_id)
         else:
             _draw_v1(*args)
 

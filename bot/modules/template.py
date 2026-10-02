@@ -5,16 +5,20 @@
 * **Free** — milestone unlocks (global messages), listed with lock state
 * **Fictional** — requirements announced later (stay locked)
 
+Opening a section shows its preview collage as a photo whose caption
+carries the section list (names + lock states); Telegram cannot turn a
+text message into a photo, so the old text is replaced by the photo.
 Locked templates wear the premium lock emoji on their button and in the
 list, and tapping one answers with the exact reason it is locked.
 ``/wear`` equips the owner-exclusive template (#19).
 """
 
+import os
 import re
 
 from aiogram import F
 from aiogram.enums import ParseMode
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, FSInputFile, Message
 
 from bot.config import settings
 from bot.database import db
@@ -32,6 +36,18 @@ from bot.reply import reply_text
 from bot.async_bridge import adb
 
 OWNER_TEMPLATE = 19
+
+# Section preview collages (see module docstring). Keyed by SECTIONS name.
+_ASSETS = os.path.join(os.path.dirname(__file__), os.pardir, "assets")
+PREVIEWS = {
+    "free": os.path.join(_ASSETS, "preview_free.jpg"),
+    "fictional": os.path.join(_ASSETS, "preview_fictional.jpg"),
+}
+
+
+def _is_photo_message(message) -> bool:
+    """True when the callback targets a photo message (section screen)."""
+    return bool(getattr(message, "photo", None))
 
 
 def _is_owner(user) -> bool:
@@ -148,6 +164,56 @@ async def _rank_info(user_id: int) -> dict:
     return await adb(db.get_user_rank_info(user_id))
 
 
+async def _show_screen(message, section: str, text: str, markup):
+    """Render one picker screen, swapping text <-> photo where needed.
+
+    Section screens are photos (preview collage + caption); the main
+    screen is plain text. Telegram cannot convert one kind into the
+    other in place, so the new screen is sent first and the old message
+    is deleted right after - a send failure falls back to editing the
+    existing message so the picker never dead-ends.
+    """
+    html = ParseMode.HTML
+    preview = None if section == "main" else PREVIEWS.get(section)
+    if preview and not _is_photo_message(message):
+        # text -> photo: send the collage, then drop the old text
+        try:
+            await message.answer_photo(
+                FSInputFile(preview), caption=text,
+                reply_markup=markup, parse_mode=html,
+            )
+        except Exception:
+            try:
+                await message.edit_text(text, reply_markup=markup, parse_mode=html)
+            except Exception:
+                pass
+            return
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        return
+    if not preview and _is_photo_message(message):
+        # photo -> text (Back): send the main screen, then drop the photo
+        try:
+            await message.answer(text, reply_markup=markup, parse_mode=html)
+        except Exception:
+            pass
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        return
+    # same message kind: edit in place
+    try:
+        if _is_photo_message(message):
+            await message.edit_caption(text, reply_markup=markup, parse_mode=html)
+        else:
+            await message.edit_text(text, reply_markup=markup, parse_mode=html)
+    except Exception:
+        pass
+
+
 async def template_command(message: Message, args: list):
     """Handle /template — sections, list + inline selection, or direct set."""
     if message.chat.type != "private":
@@ -229,12 +295,7 @@ async def template_callback(query: CallbackQuery):
             text = _section_body(section, active_name, active_id, gm, owner)
             markup = _section_buttons(section, gm, owner)
         await query.answer()
-        try:
-            await query.message.edit_text(
-                text, reply_markup=markup, parse_mode=ParseMode.HTML
-            )
-        except Exception:
-            pass
+        await _show_screen(query.message, section, text, markup)
         return
 
     # ---- template selection ----
@@ -260,16 +321,20 @@ async def template_callback(query: CallbackQuery):
 
     await query.answer(f"Template set to {theme_name}!", show_alert=False)
 
-    # Update the message with confirmation (it's a text message now —
-    # edit_message_text, not edit_message_caption; stale taps stay silent).
+    # Update the message with confirmation (photo sections edit their
+    # caption; plain messages edit text - stale taps stay silent).
+    confirm = (
+        f"{E.CHECK} <b>Template Selected</b>\n"
+        f"├ {E.SPARKLE} Style: <b>{theme_name}</b> (#{template_id})\n"
+        f"├ {E.INFO} Applied to: your /rank card\n"
+        f"└ {E.SETTINGS} Change anytime with /template"
+    )
     try:
-        await query.message.edit_text(
-            f"{E.CHECK} <b>Template Selected</b>\n"
-            f"├ {E.SPARKLE} Style: <b>{theme_name}</b> (#{template_id})\n"
-            f"├ {E.INFO} Applied to: your /rank card\n"
-            f"└ {E.SETTINGS} Change anytime with /template",
-            parse_mode=ParseMode.HTML,
-        )
+        if _is_photo_message(query.message):
+            await query.message.edit_caption(confirm,
+                                             parse_mode=ParseMode.HTML)
+        else:
+            await query.message.edit_text(confirm, parse_mode=ParseMode.HTML)
     except Exception:
         pass
 

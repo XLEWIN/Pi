@@ -112,6 +112,22 @@ def _edits(msg):
     return [{"text": t, **kw} for (k, t, kw) in msg.calls if k == "edit_text"]
 
 
+def _photos(msg):
+    """[{"photo", **kw}] for every ("answer_photo", …) record on msg."""
+    return [{"photo": p, **kw} for (k, p, kw) in msg.calls
+            if k == "answer_photo"]
+
+
+def _captions(msg):
+    """[{"caption", **kw}] for every ("edit_caption", …) record on msg."""
+    return [{"caption": c, **kw} for (k, c, kw) in msg.calls
+            if k == "edit_caption"]
+
+
+def _deleted(msg) -> bool:
+    return any(k == "delete" for (k, _, _) in msg.calls)
+
+
 class _Base(unittest.TestCase):
     def setUp(self):
         _cleanup()
@@ -730,9 +746,19 @@ class TestTemplateCommand(unittest.IsolatedAsyncioTestCase):
         query = make_callback("template:sec:free", message=msg, user_id=U1)
         await call(template_mod.template_callback, query)
 
-        edits = _edits(msg)
-        self.assertEqual(len(edits), 1, "section screen must edit in place")
-        text = edits[0]["text"]
+        photos = _photos(msg)
+        self.assertEqual(len(photos), 1,
+                         "section screen must send the preview photo")
+        self.assertEqual(_edits(msg), [], "photo replaces the text, no edit")
+        self.assertTrue(_deleted(msg), "old text message must be removed")
+        media = photos[0]["photo"]
+        self.assertTrue(str(getattr(media, "path", "")).endswith(
+            os.path.join("assets", "preview_free.jpg")),
+            "Free section uses its collage preview")
+        self.assertTrue(os.path.exists(template_mod.PREVIEWS["free"]),
+                        "preview asset ships with the bot")
+
+        text = photos[0]["caption"]
         self.assertIn("Rank Templates — Free", text)
         self.assertIn("1. AMBER GLOW", text)
         self.assertIn("6. NEON GREEN", text)
@@ -740,7 +766,7 @@ class TestTemplateCommand(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1,000 GM", text)       # milestone hint on locked #1
         self.assertIn("active", text)
 
-        flat = [b for row in edits[0]["reply_markup"].inline_keyboard
+        flat = [b for row in photos[0]["reply_markup"].inline_keyboard
                 for b in row]
         self.assertEqual(len(flat), 8, "7 templates + Back")
         self.assertEqual(flat[0].callback_data, "template:1")
@@ -757,19 +783,45 @@ class TestTemplateCommand(unittest.IsolatedAsyncioTestCase):
                               user_id=U1)
         await call(template_mod.template_callback, query)
 
-        edits = _edits(msg)
-        self.assertEqual(len(edits), 1)
-        text = edits[0]["text"]
+        photos = _photos(msg)
+        self.assertEqual(len(photos), 1)
+        self.assertTrue(_deleted(msg), "old text message must be removed")
+        media = photos[0]["photo"]
+        self.assertTrue(str(getattr(media, "path", "")).endswith(
+            os.path.join("assets", "preview_fictional.jpg")),
+            "Fictional section uses its collage preview")
+
+        text = photos[0]["caption"]
         self.assertIn("Rank Templates — Fictional", text)
         self.assertIn("8. CRIMSON FEATHER", text)
         self.assertIn("18. SAMURAI INK", text)
         self.assertIn("soon", text)
 
-        flat = [b for row in edits[0]["reply_markup"].inline_keyboard
+        flat = [b for row in photos[0]["reply_markup"].inline_keyboard
                 for b in row]
         self.assertEqual(len(flat), 12, "11 templates + Back")
         for btn in flat[:-1]:
             self.assertEqual(btn.icon_custom_emoji_id, EID.LOCK)
+
+    async def test_back_from_photo_screen_sends_main_text(self):
+        """Back on a photo section deletes the collage and posts main."""
+        from bot.modules import template as template_mod
+
+        _seed(CHAT, U1, 150)
+        msg = _msg("collage", chat_type="private", chat_id=U1,
+                   photo=[{"file_id": "x"}])
+        query = make_callback("template:sec:main", message=msg, user_id=U1)
+        await call(template_mod.template_callback, query)
+
+        self.assertTrue(_deleted(msg), "photo screen must be removed")
+        self.assertEqual(_photos(msg), [], "main stays a text screen")
+        answers = [t for (k, t, kw) in msg.calls if k == "answer"]
+        self.assertEqual(len(answers), 1, "main screen sent as new text")
+        self.assertIn("Rank Templates", answers[0])
+        self.assertIn("Pick a category below", answers[0])
+        ans = next(kw for (k, t, kw) in msg.calls if k == "answer")
+        flat = [b for row in ans["reply_markup"].inline_keyboard for b in row]
+        self.assertEqual(len(flat), 2)
 
     async def test_direct_number_sets_unlocked_template(self):
         from bot.modules import template as template_mod
@@ -827,6 +879,24 @@ class TestTemplateCallback(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Template Selected", edits[0]["text"])
         self.assertIn("PURPLE NEON", edits[0]["text"])
         self.assertIn("Change anytime with /template", edits[0]["text"])
+
+    async def test_selection_on_photo_screen_edits_caption(self):
+        """Choosing a template on the preview photo edits its caption."""
+        from bot.modules import template as template_mod
+
+        msg = _msg("collage", photo=[{"file_id": "x"}])
+        query = make_callback("template:3", message=msg, user_id=U1)
+        await call(template_mod.template_callback, query)
+
+        self.assertEqual(db.get_user_rank_info(U1)["template"], 3)
+        self.assertIn("PURPLE NEON", query.answers[0]["text"] or "")
+        caps = _captions(msg)
+        self.assertEqual(len(caps), 1,
+                         "photo confirmation must edit the caption")
+        self.assertEqual(_edits(msg), [], "no edit_text on a photo message")
+        self.assertIn("Template Selected", caps[0]["caption"])
+        self.assertIn("PURPLE NEON", caps[0]["caption"])
+        self.assertIn("Change anytime with /template", caps[0]["caption"])
 
     async def test_locked_milestone_tap_refused(self):
         from bot.modules import template as template_mod
