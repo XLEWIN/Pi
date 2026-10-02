@@ -353,21 +353,20 @@ class TestOwnerGateCommand(unittest.IsolatedAsyncioTestCase):
         bot = _FakeBot(statuses={})           # would raise on any call
         with _owner(), _db(_rows(3)):
             await call(mm.mychats_command, msg, bot=bot, bot_data={})
-        self.assertIn("Only the bot owner", msg.last["text"])
-        self.assertIn("/mychats", msg.last["text"])
+        self.assertIsNone(msg.last)
         self.assertEqual(bot.calls, [])
 
     async def test_missing_user_denied(self):
         msg = _Msg(user_id=None)
         with _owner(), _db([]):
             await call(mm.mychats_command, msg, bot=_FakeBot(), bot_data={})
-        self.assertIn("Only the bot owner", msg.last["text"])
+        self.assertIsNone(msg.last)
 
     async def test_unconfigured_owner_denies_everyone(self):
         msg = _Msg(user_id=0)
         with mock.patch.object(mm, "settings", SimpleNamespace(owner_id=0)):
             await call(mm.mychats_command, msg, bot=_FakeBot(), bot_data={})
-        self.assertIn("Only the bot owner", msg.last["text"])
+        self.assertIsNone(msg.last)
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -375,14 +374,14 @@ class TestOwnerGateCommand(unittest.IsolatedAsyncioTestCase):
 # ═════════════════════════════════════════════════════════════════
 
 class TestOwnerGateCallback(unittest.IsolatedAsyncioTestCase):
-    async def test_non_owner_gets_alert_and_no_edit(self):
+    async def test_non_owner_gets_silent_ack_and_no_edit(self):
         q = _Query("mychats:page:1", user_id=99)
         bot = _FakeBot()
         with _owner(), _db(_rows(6)):
             await call(mm.mychats_callback, q, bot=bot, bot_data={})
         self.assertEqual(len(q.answers), 1)
-        self.assertIn("Only the bot owner", q.answers[0]["text"])
-        self.assertTrue(q.answers[0]["show_alert"])
+        self.assertFalse(q.answers[0]["text"])
+        self.assertFalse(q.answers[0]["show_alert"])
         self.assertEqual(q.edits, [])
         self.assertEqual(bot.calls, [])        # denied BEFORE any scan
 
@@ -390,7 +389,7 @@ class TestOwnerGateCallback(unittest.IsolatedAsyncioTestCase):
         q = _Query("mychats:noop", user_id=0)
         with mock.patch.object(mm, "settings", SimpleNamespace(owner_id=0)):
             await call(mm.mychats_callback, q, bot=_FakeBot(), bot_data={})
-        self.assertTrue(q.answers[0]["show_alert"])
+        self.assertFalse(q.answers[0]["show_alert"])
 
     async def test_unknown_action_is_flagged(self):
         q = _Query("mychats:bogus")

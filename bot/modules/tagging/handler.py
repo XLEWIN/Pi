@@ -99,7 +99,6 @@ async def all_command(message: Message, bot: Bot) -> None:
         await _reply(message, plain_error(config.MSG_RUNNING))
         return
     if not await permissions.is_admin(chat.id, user.id, bot):
-        await _reply(message, plain_error(config.MSG_NOT_ADMIN))
         return
 
     get_manager().kick()  # deferred MTProto startup (needs a running loop)
@@ -182,7 +181,6 @@ async def tagabort_command(message: Message, bot: Bot) -> None:
         await _reply(message, plain_error(config.MSG_NO_SESSION))
         return
     if not await permissions.is_admin(chat.id, user.id, bot):
-        await _reply(message, plain_error(config.MSG_NOT_ADMIN))
         return
 
     s.token.cancel()
@@ -215,7 +213,6 @@ async def allsettings_command(message: Message, bot: Bot, args: list) -> None:
         await _reply(message, plain_error(config.MSG_NOT_GROUP))
         return
     if not await permissions.is_admin(chat.id, user.id, bot):
-        await _reply(message, plain_error(config.MSG_NOT_ADMIN))
         return
 
     args = args or []
@@ -254,7 +251,6 @@ async def tagstats_command(message: Message, bot: Bot) -> None:
         await _reply(message, plain_error(config.MSG_NOT_GROUP))
         return
     if not await permissions.is_admin(chat.id, user.id, bot):
-        await _reply(message, plain_error(config.MSG_NOT_ADMIN))
         return
 
     def _stats() -> tuple:
@@ -326,7 +322,7 @@ async def _handle_abort_click(callback_query: CallbackQuery, bot: Bot) -> None:
         await _safe_answer(query, config.MSG_NO_SESSION, alert=True)
         return
     if not await permissions.is_admin(chat.id, user.id, bot):
-        await _safe_answer(query, config.MSG_NOT_ADMIN, alert=True)
+        await _safe_answer(query, "")
         return
     s.token.cancel()
     await _safe_answer(
@@ -348,7 +344,7 @@ async def _handle_set_click(
         await _safe_answer(query, config.MSG_NOT_GROUP, alert=True)
         return
     if not await permissions.is_admin(chat.id, user.id, bot):
-        await _safe_answer(query, config.MSG_NOT_ADMIN, alert=True)
+        await _safe_answer(query, "")
         return
     try:
         st = await asyncio.to_thread(settings_mod.cycle, chat.id, key)

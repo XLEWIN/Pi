@@ -127,15 +127,14 @@ class TestOwnerGate(unittest.IsolatedAsyncioTestCase):
         msg = _Msg(user_id=99)
         with _deny_case() as ex:
             await call(rm.restart_command, msg)
-        self.assertIn("Only the bot owner", msg.last["text"])
-        self.assertIn("restart me", msg.last["text"])
+        self.assertIsNone(msg.last)
         ex.assert_not_called()
 
     async def test_missing_user_denied(self):
         msg = _Msg(user_id=None)
         with _deny_case() as ex:
             await call(rm.restart_command, msg)
-        self.assertIn("Only the bot owner", msg.last["text"])
+        self.assertIsNone(msg.last)
         ex.assert_not_called()
 
     async def test_unconfigured_owner_id_denies_everyone(self):
@@ -146,7 +145,7 @@ class TestOwnerGate(unittest.IsolatedAsyncioTestCase):
                     rm.os, "execvp",
                     side_effect=AssertionError("exec must not run")) as ex:
             await call(rm.restart_command, msg)
-        self.assertIn("Only the bot owner", msg.last["text"])
+        self.assertIsNone(msg.last)
         ex.assert_not_called()
 
 

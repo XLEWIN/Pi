@@ -377,11 +377,6 @@ async def wear_command(message: Message):
         return
 
     if not _is_owner(message.from_user):
-        await reply_text(
-            message,
-            f"{E.LOCK} That style is owner exclusive.",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     theme = THEMES[OWNER_TEMPLATE]

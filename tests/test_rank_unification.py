@@ -955,7 +955,7 @@ class TestTemplateCallback(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Template Worn", text)
         self.assertIn("PHANTOM RIDER", text)
 
-    async def test_wear_refuses_non_owner(self):
+    async def test_wear_ignores_non_owner_silently(self):
         from unittest import mock
 
         from bot.modules import template as template_mod
@@ -965,7 +965,7 @@ class TestTemplateCallback(unittest.IsolatedAsyncioTestCase):
                                SimpleNamespace(owner_id=0)):
             await call(template_mod.wear_command, msg)
 
-        self.assertIn("owner exclusive", msg.last[1])
+        self.assertIsNone(msg.last)  # owner-exclusive -> ignored, no reply
         self.assertEqual(db.get_user_rank_info(U1)["template"], 3,
                          "template must not change")
 

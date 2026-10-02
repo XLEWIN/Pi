@@ -69,14 +69,10 @@ async def _edit(query, text: str, reply_markup: Optional[InlineKeyboardMarkup]) 
 
 
 async def _deny_non_admin(query, bot, chat_id: int, user_id: int) -> bool:
-    """Return True (and answer) if the user is no longer a group admin."""
+    """Return True (and silently answer) if the user is not a group admin."""
     if await is_group_admin(bot, chat_id, user_id):
         return False
-    await _safe_answer(query, "Admin rights required.", alert=True)
-    try:
-        await query.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
+    await _safe_answer(query)
     return True
 
 

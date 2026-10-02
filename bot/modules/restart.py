@@ -101,11 +101,6 @@ async def restart_command(message: Message) -> None:
         return
     user = message.from_user
     if user is None or not settings.owner_id or user.id != settings.owner_id:
-        await reply_text(
-            msg,
-            f"{E.CROWN} Only the bot owner can restart me.",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     card = action_card(

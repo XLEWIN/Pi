@@ -189,7 +189,7 @@ async def _gate(query, bot, chat_id: int, user_id: int) -> bool:
     """Admin re-verification — called on EVERY callback press."""
     if await _is_admin(bot, chat_id, user_id):
         return True
-    await _answer(query, "Group admins only.", alert=True)
+    await _answer(query)
     return False
 
 
@@ -888,9 +888,6 @@ async def adminbox_command(message: Message, bot: Bot, chat_data: dict) -> None:
         )
         return
     if not await _is_admin(bot, chat.id, user.id):
-        await reply_text(message,
-            f"{E.ERROR} Group admins only.", parse_mode=ParseMode.HTML
-        )
         return
 
     # A fresh panel retires any stale prompt this admin had open.

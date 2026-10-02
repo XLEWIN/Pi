@@ -67,8 +67,6 @@ async def setwelcome_command(message: Message, bot: Bot, args: list):
         return
 
     if not await _is_admin(message, bot):
-        await reply_text(message, f"{E.ERROR} Only admins can change welcome settings.",
-            parse_mode=ParseMode.HTML)
         return
 
     if not args and not message.reply_to_message:
@@ -112,8 +110,6 @@ async def setgoodbye_command(message: Message, bot: Bot, args: list):
         return
 
     if not await _is_admin(message, bot):
-        await reply_text(message, f"{E.ERROR} Only admins can change goodbye settings.",
-            parse_mode=ParseMode.HTML)
         return
 
     if not args and not message.reply_to_message:
@@ -157,7 +153,6 @@ async def resetwelcome_command(message: Message, bot: Bot):
         return
 
     if not await _is_admin(message, bot):
-        await reply_text(message, "Only admins can reset welcome.")
         return
 
     await adb(db.reset_welcome(message.chat.id))
@@ -172,7 +167,6 @@ async def resetgoodbye_command(message: Message, bot: Bot):
         return
 
     if not await _is_admin(message, bot):
-        await reply_text(message, "Only admins can reset goodbye.")
         return
 
     await adb(db.reset_goodbye(message.chat.id))
@@ -187,7 +181,6 @@ async def welcome_command(message: Message, bot: Bot, args: list):
         return
 
     if not await _is_admin(message, bot):
-        await reply_text(message, "Only admins can manage welcome settings.")
         return
 
     chat_id = message.chat.id
@@ -236,7 +229,6 @@ async def goodbye_command(message: Message, bot: Bot, args: list):
         return
 
     if not await _is_admin(message, bot):
-        await reply_text(message, "Only admins can manage goodbye settings.")
         return
 
     chat_id = message.chat.id
@@ -283,8 +275,6 @@ async def cleanwelcome_command(message: Message, bot: Bot, args: list):
         return
 
     if not await _is_admin(message, bot):
-        await reply_text(message, f"{E.ERROR} Only admins can change this setting.",
-            parse_mode=ParseMode.HTML)
         return
 
     if not args:
@@ -315,8 +305,6 @@ async def cleangoodbye_command(message: Message, bot: Bot, args: list):
         return
 
     if not await _is_admin(message, bot):
-        await reply_text(message, f"{E.ERROR} Only admins can change this setting.",
-            parse_mode=ParseMode.HTML)
         return
 
     if not args:

@@ -233,7 +233,7 @@ class TestCommands(unittest.IsolatedAsyncioTestCase):
         with _patched(is_admin=False):
             await call(lm.lock_command, msg, args=["photo"])
         text, _ = _last_reply(msg)
-        self.assertIn("Only admins", text)
+        self.assertIsNone(text)
 
     async def test_lock_usage_without_args(self):
         msg = _msg("/lock")
@@ -287,7 +287,7 @@ class TestCommands(unittest.IsolatedAsyncioTestCase):
         with _patched(locks=["photo"], is_admin=False):
             await call(lm.unlock_command, msg, args=["photo"])
         text, _ = _last_reply(msg)
-        self.assertIn("Only admins", text)
+        self.assertIsNone(text)
 
     async def test_locks_listing_empty(self):
         msg = _msg("/locks")

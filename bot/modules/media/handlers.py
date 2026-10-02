@@ -702,11 +702,6 @@ async def mediasettings_command(message: Message, bot: Bot, args: list) -> None:
     if not message or not message.chat:
         return
     if not await _is_admin(message, bot):
-        await reply_text(
-            message,
-            error_card("Not allowed", escape("Admins only.")),
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     chat_id = message.chat.id
@@ -738,11 +733,6 @@ async def mediastats_command(message: Message, bot: Bot) -> None:
     if not message:
         return
     if not await _is_admin(message, bot):
-        await reply_text(
-            message,
-            error_card("Not allowed", escape("Admins only.")),
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     snap = metrics.snapshot()
@@ -779,11 +769,6 @@ async def mediacache_command(message: Message, args: list) -> None:
     if not message or not message.from_user:
         return
     if not _is_owner(message.from_user.id):
-        await reply_text(
-            message,
-            error_card("Not allowed", escape("Owner only.")),
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     args = [a.lower() for a in (args or [])]
@@ -815,11 +800,6 @@ async def mediabench_command(message: Message, args: list) -> None:
     if not message or not message.from_user:
         return
     if not _is_owner(message.from_user.id):
-        await reply_text(
-            message,
-            error_card("Not allowed", escape("Owner only.")),
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     found = None
@@ -892,7 +872,7 @@ async def ig_callback(callback_query: CallbackQuery, bot: Bot) -> None:
     if chat_id is None:
         return
     if not await _member_is_admin(bot, chat_id, query.from_user.id):
-        await query.answer("Admins only.", show_alert=True)
+        await query.answer()
         return
 
     if data in {"ig:set:auto", "ig:set:max"}:

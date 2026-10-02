@@ -165,11 +165,6 @@ async def bstats_command(message: Message) -> None:
     if msg is None:
         return
     if not _is_owner(message.from_user):
-        await reply_text(
-            msg,
-            f"{E.CROWN} Only the bot owner can use /bstats.",
-            parse_mode=ParseMode.HTML,
-        )
         return
     await reply_text(
         msg,
@@ -212,8 +207,7 @@ async def stats_callback(callback_query: CallbackQuery,
 
     if data.startswith(f"{_CB_BSTATS}:"):
         if not owner:
-            await _answer(query, "Only the bot owner can use this.",
-                          alert=True)
+            await _answer(query)
             return
         action = data.split(":")[1] if ":" in data else ""
         if action == "refresh":

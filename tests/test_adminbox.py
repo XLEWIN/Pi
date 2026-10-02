@@ -350,8 +350,7 @@ class TestCommand(unittest.IsolatedAsyncioTestCase):
         msg = _cmd_msg()
         await call(ab.adminbox_command, msg,
                    bot=_FakeBot(presser_status="member"), chat_data={})
-        self.assertEqual(len(_sent(msg)), 1)
-        self.assertIn("admins only", _last(msg)["text"])
+        self.assertEqual(len(_sent(msg)), 0)
 
     async def test_opens_main_panel(self):
         msg = _cmd_msg()
@@ -391,14 +390,15 @@ class TestCommand(unittest.IsolatedAsyncioTestCase):
 # ═════════════════════════════════════════════════════════════════
 
 class TestCallbackGate(unittest.IsolatedAsyncioTestCase):
-    async def test_non_admin_is_alerted_and_nothing_happens(self):
+    async def test_non_admin_gets_silent_ack_and_nothing_happens(self):
         for data in ("abox:main:0", "abox:admins:0", "abox:close",
                      "abox:demote:333:0", "abox:name:0"):
             query, bot, chat_data = _cb(data,
                                         bot=_FakeBot(presser_status="member"))
             await call(ab.adminbox_callback, query, bot=bot, chat_data=chat_data)
             self.assertTrue(query.answers, f"no answer for {data}")
-            self.assertTrue(query.answers[-1]["show_alert"], data)
+            self.assertEqual(query.answers[-1]["text"], "", data)
+            self.assertFalse(query.answers[-1]["show_alert"], data)
             self.assertEqual(_edits(query), [], data)
             self.assertEqual(bot.calls, [], data)
             self.assertFalse(_deleted(query), data)

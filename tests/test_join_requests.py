@@ -220,7 +220,7 @@ class TestRequestCommand(unittest.IsolatedAsyncioTestCase):
         msg, bot = _cmd()
         bot.member_status = "member"
         await call(req.request_command, msg, bot=bot, args=["on"])
-        self.assertIn("admin rights", _text(msg))
+        self.assertIsNone(_text(msg))
         self.assertFalse(db.get_join_requests(CHAT_ID))
 
     async def test_private_denied(self):
@@ -309,7 +309,7 @@ class TestJoinRequestCallback(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.declined, [])
         self.assertEqual(_edits(cb.message), [])
         self.assertEqual(len(cb.answers), 1)
-        self.assertTrue(cb.answers[0]["show_alert"])
+        self.assertFalse(cb.answers[0]["show_alert"])
 
     async def test_owner_status_accepted(self):
         cb, bot = _cb(

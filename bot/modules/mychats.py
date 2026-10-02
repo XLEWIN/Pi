@@ -232,10 +232,6 @@ async def mychats_command(message: Message, bot: Bot, bot_data: dict) -> None:
     if msg is None:
         return
     if not _is_owner(message.from_user):
-        await reply_text(msg, 
-            f"{E.CROWN} Only the bot owner can use /mychats.",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     chats = await _fresh_chats(bot, bot_data)   # command always rescans
@@ -295,8 +291,7 @@ async def mychats_callback(callback_query: CallbackQuery, bot: Bot, bot_data: di
     if query is None or not str(query.data or "").startswith(f"{_CB}:"):
         return
     if not _is_owner(query.from_user):
-        await _answer(query, "Only the bot owner can use this.",
-                      alert=True)
+        await _answer(query, "")
         return
 
     parts = str(query.data).split(":")

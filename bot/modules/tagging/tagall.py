@@ -139,7 +139,6 @@ async def _start(message: Message, bot: Bot, *,
         await reply_text(message, plain_error(config.MSG_RUNNING), parse_mode="HTML")
         return
     if not await permissions.is_admin(chat.id, user.id, bot):
-        await reply_text(message, plain_error(config.MSG_NOT_ADMIN), parse_mode="HTML")
         return
 
     # Authoritative admin exclusion — fetched fresh for every run.

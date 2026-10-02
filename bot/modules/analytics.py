@@ -134,9 +134,6 @@ async def stats_command(message: Message, bot: Bot, args: list):
         )
         return
     if not await _is_admin(message, bot):
-        await reply_text(message,
-            f"{E.ERROR} Only admins can view analytics.", parse_mode=ParseMode.HTML
-        )
         return
 
     chat_id = message.chat.id
@@ -204,9 +201,6 @@ async def topactive_command(message: Message, bot: Bot, args: list):
         )
         return
     if not await _is_admin(message, bot):
-        await reply_text(message,
-            f"{E.ERROR} Only admins can view analytics.", parse_mode=ParseMode.HTML
-        )
         return
 
     chat_id = message.chat.id
@@ -248,9 +242,6 @@ async def peakhours_command(message: Message, bot: Bot, args: list):
         )
         return
     if not await _is_admin(message, bot):
-        await reply_text(message,
-            f"{E.ERROR} Only admins can view analytics.", parse_mode=ParseMode.HTML
-        )
         return
 
     chat_id = message.chat.id

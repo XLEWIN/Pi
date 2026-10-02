@@ -279,7 +279,7 @@ class TestTagallCommand(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
     async def test_requires_admin(self):
         msg = _FakeMessage(text="/tagall hi")
         await call(tagall_command, msg, bot=_FakeBot(invoker_status="member"))
-        self.assertIn(config.MSG_NOT_ADMIN, msg.last)
+        self.assertEqual(msg.last, "")
 
     async def test_running_blocks_new_start(self):
         status = _fake_status()

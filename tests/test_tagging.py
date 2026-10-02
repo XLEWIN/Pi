@@ -976,7 +976,7 @@ class TestAllCommand(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
     async def test_requires_admin(self):
         msg = _FakeMessage(reply_to=_fake_source())
         await call(all_command, msg, bot=_FakeBot(invoker_status="member"))
-        self.assertIn(config.MSG_NOT_ADMIN, msg.last)
+        self.assertEqual(msg.last, "")
 
     async def test_admin_fetch_failure_is_fatal(self):
         msg = _FakeMessage(reply_to=_fake_source())
@@ -1017,7 +1017,7 @@ class TestTagabort(_DbCleanupMixin, unittest.IsolatedAsyncioTestCase):
         )
         msg = _FakeMessage()
         await call(tagabort_command, msg, bot=_FakeBot(invoker_status="member"))
-        self.assertIn(config.MSG_NOT_ADMIN, msg.last)
+        self.assertEqual(msg.last, "")
 
     async def test_abort_replies_stopped(self):
         st = settings_mod.get(CHAT)

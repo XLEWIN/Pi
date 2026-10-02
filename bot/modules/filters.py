@@ -65,8 +65,6 @@ async def add_filter(message: Message, bot: Bot, args: list):
         return
 
     if not await _is_admin(message, bot):
-        await reply_text(message, f"{E.ERROR} You need admin rights to manage filters.",
-            parse_mode=ParseMode.HTML)
         return
 
     if not args or len(args) < 1:
@@ -147,8 +145,6 @@ async def stop_filter(message: Message, bot: Bot, args: list):
         return
 
     if not await _is_admin(message, bot):
-        await reply_text(message, f"{E.ERROR} You need admin rights to manage filters.",
-            parse_mode=ParseMode.HTML)
         return
 
     if not args:

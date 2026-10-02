@@ -157,9 +157,6 @@ async def lock_command(message: Message, bot: Bot, args: list):
                          parse_mode=ParseMode.HTML)
         return
     if not await _is_admin(message, bot):
-        await reply_text(message,
-                         f"{E.ERROR} Only admins can configure locks.",
-                         parse_mode=ParseMode.HTML)
         return
     if not args:
         await reply_text(
@@ -195,9 +192,6 @@ async def unlock_command(message: Message, bot: Bot, args: list):
                          parse_mode=ParseMode.HTML)
         return
     if not await _is_admin(message, bot):
-        await reply_text(message,
-                         f"{E.ERROR} Only admins can configure locks.",
-                         parse_mode=ParseMode.HTML)
         return
     if not args:
         await reply_text(

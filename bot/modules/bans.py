@@ -17,6 +17,7 @@ from bot.database import db
 from bot.emojis import E
 from bot.responses import (
     action_card,
+    failed,
     field_by,
     field_extra,
     field_reason,
@@ -61,8 +62,6 @@ async def _get_target_user(message: Message, bot: Bot, args: list):
 
 async def addsudo_command(message: Message, bot: Bot, args: list):
     if not is_owner(message.from_user.id):
-        await reply_text(message, f"{E.CROWN} Only the bot owner can manage sudo users.",
-            parse_mode=ParseMode.HTML)
         return
     target = await _get_target_user(message, bot, args)
     if not target:
@@ -87,8 +86,6 @@ async def addsudo_command(message: Message, bot: Bot, args: list):
 
 async def rmsudo_command(message: Message, bot: Bot, args: list):
     if not is_owner(message.from_user.id):
-        await reply_text(message, f"{E.CROWN} Only the bot owner can manage sudo users.",
-            parse_mode=ParseMode.HTML)
         return
     target = await _get_target_user(message, bot, args)
     if not target:
@@ -115,8 +112,6 @@ async def rmsudo_command(message: Message, bot: Bot, args: list):
 
 async def sudolist_command(message: Message, bot: Bot):
     if not is_owner(message.from_user.id):
-        await reply_text(message, f"{E.CROWN} Only the bot owner can view sudo users.",
-            parse_mode=ParseMode.HTML)
         return
     sudo_ids = await adb(db.get_sudo_users())
     if not sudo_ids:
@@ -152,8 +147,6 @@ async def sudolist_command(message: Message, bot: Bot):
 
 async def gban_command(message: Message, bot: Bot, args: list):
     if not await asyncio.to_thread(is_sudo, message.from_user.id):
-        await reply_text(message, f"{E.ERROR} Only sudo/owner users can use gban.",
-            parse_mode=ParseMode.HTML)
         return
     target = await _get_target_user(message, bot, args)
     if not target:
@@ -200,8 +193,6 @@ async def gban_command(message: Message, bot: Bot, args: list):
 
 async def ungban_command(message: Message, bot: Bot, args: list):
     if not await asyncio.to_thread(is_sudo, message.from_user.id):
-        await reply_text(message, f"{E.ERROR} Only sudo/owner users can use ungban.",
-            parse_mode=ParseMode.HTML)
         return
     target = await _get_target_user(message, bot, args)
     if not target:
@@ -232,8 +223,6 @@ async def ungban_command(message: Message, bot: Bot, args: list):
 
 async def gbanlist_command(message: Message):
     if not await asyncio.to_thread(is_sudo, message.from_user.id):
-        await reply_text(message, f"{E.ERROR} Only sudo/owner users can view gbans.",
-            parse_mode=ParseMode.HTML)
         return
     gbanned = await adb(db.get_gbanned_users())
     if not gbanned:
@@ -249,8 +238,6 @@ async def gbanlist_command(message: Message):
 
 async def massban_command(message: Message, bot: Bot, args: list):
     if not is_owner(message.from_user.id):
-        await reply_text(message, f"{E.CROWN} Only the bot owner can mass ban.",
-            parse_mode=ParseMode.HTML)
         return
     if not args:
         await reply_text(message, f"{E.ERROR} Provide user IDs: /massban 123456 789012 345678",
@@ -282,8 +269,6 @@ async def massban_command(message: Message, bot: Bot, args: list):
 
 async def sudopromote_command(message: Message, bot: Bot, args: list):
     if not await asyncio.to_thread(is_sudo, message.from_user.id):
-        await reply_text(message, f"{E.ERROR} Only sudo/owner users can use this.",
-            parse_mode=ParseMode.HTML)
         return
     target = await _get_target_user(message, bot, args)
     if not target:
@@ -312,7 +297,7 @@ async def sudopromote_command(message: Message, bot: Bot, args: list):
             user=target,
         )
     except Exception as e:
-        await reply_text(message, plain_error(f"Failed to promote: {e}"),
+        await reply_text(message, failed("promote that user", e, permission="Add Admins"),
             parse_mode=ParseMode.HTML)
 
 

@@ -105,8 +105,6 @@ async def add_blocklist(message: Message, bot: Bot, args: list):
         return
 
     if not await _is_admin(message, bot):
-        await reply_text(message, f"{E.ERROR} You need admin rights to manage the blocklist.",
-            parse_mode=ParseMode.HTML)
         return
 
     if not args:
@@ -150,8 +148,6 @@ async def remove_blocklist(message: Message, bot: Bot, args: list):
         return
 
     if not await _is_admin(message, bot):
-        await reply_text(message, f"{E.ERROR} You need admin rights to manage the blocklist.",
-            parse_mode=ParseMode.HTML)
         return
 
     if not args:
@@ -198,8 +194,6 @@ async def clear_blocklist(message: Message, bot: Bot):
         return
 
     if not await _is_admin(message, bot):
-        await reply_text(message, f"{E.ERROR} You need admin rights.",
-            parse_mode=ParseMode.HTML)
         return
 
     chat_id = message.chat.id
@@ -220,8 +214,6 @@ async def set_blocklist_action(message: Message, bot: Bot, args: list):
         return
 
     if not await _is_admin(message, bot):
-        await reply_text(message, f"{E.ERROR} You need admin rights.",
-            parse_mode=ParseMode.HTML)
         return
 
     if not args or args[0].lower() not in ["delete", "warn", "mute", "kick", "ban"]:
@@ -244,8 +236,6 @@ async def set_blocklist_reason(message: Message, bot: Bot, args: list):
         return
 
     if not await _is_admin(message, bot):
-        await reply_text(message, f"{E.ERROR} You need admin rights.",
-            parse_mode=ParseMode.HTML)
         return
 
     if not args:

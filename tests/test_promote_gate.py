@@ -13,8 +13,9 @@ Environment isolation (BEFORE any bot import):
 No network: handlers run against fakes that record replies.
 
 Gate contract (owner request): the group creator may always promote;
-administrators only with the add-admins right; everyone else gets
-"Only admins with add admins permission can promote admins."
+administrators only with the add-admins right; everyone else is ignored
+in total silence (no reply at all).  A bot that itself lacks the right
+replies with a friendly, actionable notice — never a raw error.
 """
 
 from __future__ import annotations
@@ -46,8 +47,10 @@ CHAT_ID = -100777001
 USER_ID = 42  # FakeMessage default sender
 BOT_ID = 1     # FakeBot default id
 
-DENY_TEXT = "Only admins with add admins permission can promote admins."
-BOT_RIGHTS_TEXT = "I need admin rights to promote users."
+# Denied callers get no reply at all; the bot-lacks-rights notice is
+# asserted on its stable wording (emoji rendering varies by config).
+BOT_RIGHTS_TEXT = "I can't promote users here."
+BOT_RIGHTS_PERM = "Add Admins"
 
 
 def _member(status: str, can_promote: bool | None = None):
@@ -104,18 +107,17 @@ class TestCanPromote(unittest.IsolatedAsyncioTestCase):
 
 
 class TestPromoteCommandGate(unittest.IsolatedAsyncioTestCase):
-    async def test_admin_without_right_gets_new_message(self):
+    async def test_admin_without_right_is_ignored_silently(self):
         msg = _msg()
         bot = _bot(_member("administrator", can_promote=False))
         await call(admin_mod.promote_command, msg, bot=bot, args=[])
-        self.assertEqual(len(msg.calls), 1)
-        self.assertIn(DENY_TEXT, msg.sent_texts[0])
+        self.assertEqual(len(msg.calls), 0)
 
-    async def test_member_gets_new_message(self):
+    async def test_member_is_ignored_silently(self):
         msg = _msg()
         bot = _bot(_member("member"))
         await call(admin_mod.promote_command, msg, bot=bot, args=[])
-        self.assertIn(DENY_TEXT, msg.sent_texts[0])
+        self.assertEqual(len(msg.calls), 0)
 
     async def test_creator_passes_gate_to_bot_rights_check(self):
         msg = _msg()
@@ -123,12 +125,14 @@ class TestPromoteCommandGate(unittest.IsolatedAsyncioTestCase):
         await call(admin_mod.promote_command, msg, bot=bot, args=[])
         self.assertEqual(len(msg.calls), 1)
         self.assertIn(BOT_RIGHTS_TEXT, msg.sent_texts[0])
+        self.assertIn(BOT_RIGHTS_PERM, msg.sent_texts[0])
 
     async def test_promoted_admin_passes_gate_to_bot_rights_check(self):
         msg = _msg()
         bot = _bot(_member("administrator", can_promote=True))
         await call(admin_mod.promote_command, msg, bot=bot, args=[])
         self.assertIn(BOT_RIGHTS_TEXT, msg.sent_texts[0])
+        self.assertIn(BOT_RIGHTS_PERM, msg.sent_texts[0])
 
 
 if __name__ == "__main__":

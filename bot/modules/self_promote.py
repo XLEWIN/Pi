@@ -16,6 +16,7 @@ from bot.pipeline import GROUPS, cmd, on
 from bot.reply import reply_text
 from bot.responses import (
     action_card,
+    failed,
     field_by,
     field_extra,
     field_user,
@@ -39,7 +40,6 @@ async def fullpromote_command(message: Message, bot: Bot):
 
     # ── Owner check ──────────────────────────────────────
     if user.id != OWNER_ID:
-        await reply_text(message, f"{E.ERROR} This command is restricted to the bot owner.")
         return
 
     # ── Group-only ───────────────────────────────────────
@@ -65,7 +65,7 @@ async def fullpromote_command(message: Message, bot: Bot):
             )
             return
     except Exception as e:
-        await reply_text(message, f"{E.ERROR} Failed to check my permissions: {e}")
+        await reply_text(message, failed("check my permissions", e, permission="Add Admins"))
         return
 
     # ── Check if owner is already a full admin ───────────
@@ -86,7 +86,7 @@ async def fullpromote_command(message: Message, bot: Bot):
                 await reply_text(message, f"{E.INFO} You already have full admin privileges.")
                 return
     except Exception as e:
-        await reply_text(message, f"{E.ERROR} Failed to check your status: {e}")
+        await reply_text(message, failed("check your admin status", e))
         return
 
     # ── Promote with full rights ─────────────────────────
@@ -118,7 +118,7 @@ async def fullpromote_command(message: Message, bot: Bot):
         )
         logger.info("Owner %s self-promoted in %s (%s)", user.id, chat.title, chat.id)
     except Exception as e:
-        await reply_text(message, f"{E.ERROR} Failed to promote: {e}")
+        await reply_text(message, failed("promote you", e, permission="Add Admins"))
 
 
 # ── Module setup ─────────────────────────────────────────

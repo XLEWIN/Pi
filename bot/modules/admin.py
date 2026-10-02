@@ -17,11 +17,12 @@ from bot.reply import reply_text
 from bot.emojis import E
 from bot.responses import (
     action_card,
+    bot_rights_error,
+    failed,
     field_by,
     field_extra,
     field_title,
     field_user,
-    plain_error,
     reply_card,
 )
 
@@ -94,12 +95,10 @@ async def promote_command(message: Message, bot: Bot, args: list):
         return
 
     if not await _can_promote(message, bot):
-        await reply_text(message, f"{E.ERROR} Only admins with add admins permission can promote admins.",
-            parse_mode=ParseMode.HTML)
         return
 
     if not await _is_bot_admin(message, bot):
-        await reply_text(message, f"{E.ERROR} I need admin rights to promote users.",
+        await reply_text(message, bot_rights_error("promote users", "Add Admins"),
             parse_mode=ParseMode.HTML)
         return
 
@@ -137,7 +136,7 @@ async def promote_command(message: Message, bot: Bot, args: list):
             user=target,
         )
     except Exception as e:
-        await reply_text(message, plain_error(f"Failed to promote: {e}"),
+        await reply_text(message, failed("promote that user", e, permission="Add Admins"),
             parse_mode=ParseMode.HTML)
 
 
@@ -149,8 +148,6 @@ async def demote_command(message: Message, bot: Bot, args: list):
         return
 
     if not await _is_owner(message, bot):
-        await reply_text(message, f"{E.ERROR} Only the group creator can demote admins.",
-            parse_mode=ParseMode.HTML)
         return
 
     target = await _get_target_user(message, bot, args)
@@ -187,7 +184,7 @@ async def demote_command(message: Message, bot: Bot, args: list):
             user=target,
         )
     except Exception as e:
-        await reply_text(message, plain_error(f"Failed to demote: {e}"),
+        await reply_text(message, failed("demote that user", e, permission="Add Admins"),
             parse_mode=ParseMode.HTML)
 
 
@@ -199,8 +196,6 @@ async def pin_command(message: Message, bot: Bot, args: list):
         return
 
     if not await _is_admin(message, bot):
-        await reply_text(message, f"{E.ERROR} You need admin rights to pin messages.",
-            parse_mode=ParseMode.HTML)
         return
 
     if not message.reply_to_message:
@@ -240,7 +235,7 @@ async def pin_command(message: Message, bot: Bot, args: list):
                 ),
             )
     except Exception as e:
-        await reply_text(message, plain_error(f"Failed to pin: {e}"),
+        await reply_text(message, failed("pin that message", e, permission="Pin Messages"),
             parse_mode=ParseMode.HTML)
 
 
@@ -252,8 +247,6 @@ async def unpin_command(message: Message, bot: Bot):
         return
 
     if not await _is_admin(message, bot):
-        await reply_text(message, f"{E.ERROR} You need admin rights to unpin messages.",
-            parse_mode=ParseMode.HTML)
         return
 
     try:
@@ -280,7 +273,7 @@ async def unpin_command(message: Message, bot: Bot):
             ),
         )
     except Exception as e:
-        await reply_text(message, plain_error(f"Failed to unpin: {e}"),
+        await reply_text(message, failed("unpin that message", e, permission="Pin Messages"),
             parse_mode=ParseMode.HTML)
 
 
@@ -334,7 +327,7 @@ async def adminlist_command(message: Message, bot: Bot):
 
         await reply_card(message, text)
     except Exception as e:
-        await reply_text(message, f"{E.ERROR} Failed to get admin list: {e}",
+        await reply_text(message, failed("load the admin list", e),
             parse_mode=ParseMode.HTML)
 
 
@@ -368,7 +361,7 @@ async def admin_count_command(message: Message, bot: Bot):
             ),
         )
     except Exception as e:
-        await reply_text(message, f"{E.ERROR} Failed to count admins: {e}",
+        await reply_text(message, failed("count admins", e),
             parse_mode=ParseMode.HTML)
 
 
@@ -380,8 +373,6 @@ async def setchatphoto_command(message: Message, bot: Bot):
         return
 
     if not await _is_admin(message, bot):
-        await reply_text(message, f"{E.ERROR} You need admin rights.",
-            parse_mode=ParseMode.HTML)
         return
 
     if not message.reply_to_message or not message.reply_to_message.photo:
@@ -404,7 +395,7 @@ async def setchatphoto_command(message: Message, bot: Bot):
             ),
         )
     except Exception as e:
-        await reply_text(message, plain_error(f"Failed to set photo: {e}"),
+        await reply_text(message, failed("set the group photo", e, permission="Change Group Info"),
             parse_mode=ParseMode.HTML)
 
 
@@ -416,8 +407,6 @@ async def setchatname_command(message: Message, bot: Bot, args: list):
         return
 
     if not await _is_admin(message, bot):
-        await reply_text(message, f"{E.ERROR} You need admin rights.",
-            parse_mode=ParseMode.HTML)
         return
 
     if not args:
@@ -439,7 +428,7 @@ async def setchatname_command(message: Message, bot: Bot, args: list):
             ),
         )
     except Exception as e:
-        await reply_text(message, plain_error(f"Failed to set name: {e}"),
+        await reply_text(message, failed("set the group name", e, permission="Change Group Info"),
             parse_mode=ParseMode.HTML)
 
 
@@ -451,8 +440,6 @@ async def setchatdescription_command(message: Message, bot: Bot, args: list):
         return
 
     if not await _is_admin(message, bot):
-        await reply_text(message, f"{E.ERROR} You need admin rights.",
-            parse_mode=ParseMode.HTML)
         return
 
     if not args:
@@ -474,7 +461,7 @@ async def setchatdescription_command(message: Message, bot: Bot, args: list):
             ),
         )
     except Exception as e:
-        await reply_text(message, plain_error(f"Failed to set description: {e}"),
+        await reply_text(message, failed("set the group description", e, permission="Change Group Info"),
             parse_mode=ParseMode.HTML)
 
 

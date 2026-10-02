@@ -106,7 +106,7 @@ class TestSudolist(unittest.IsolatedAsyncioTestCase):
     async def test_non_owner_denied(self):
         msg = _msg(123456789)
         await call(sudolist_command, msg, bot=_FakeBot())
-        self.assertIn("Only the bot owner", msg.sent_texts[-1])
+        self.assertEqual(msg.sent_texts, [])
 
     async def test_get_chat_failure_falls_back_to_code_id(self):
         db.add_sudo_user(333, added_by=OWNER_ID)

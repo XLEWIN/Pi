@@ -221,24 +221,21 @@ class TestBstatsCommand(unittest.IsolatedAsyncioTestCase):
         msg = _Msg(user_id=99)
         with _owner(), _fake_db():
             await call(bm.bstats_command, msg)
-        self.assertEqual(msg.last[0], "reply")
-        self.assertIn("Only the bot owner", msg.last[1])
-        self.assertIn("/bstats", msg.last[1])
-        self.assertNotIn("reply_markup", msg.last[2])
+        self.assertIsNone(msg.last)
 
     async def test_missing_user_denied(self):
         msg = _Msg()
         msg.from_user = None
         with _owner(), _fake_db():
             await call(bm.bstats_command, msg)
-        self.assertIn("Only the bot owner", msg.last[1])
+        self.assertIsNone(msg.last)
 
     async def test_unconfigured_owner_denies_everyone(self):
         msg = _Msg(user_id=0)
         with mock.patch.object(bm, "settings", SimpleNamespace(owner_id=0)), \
                 _fake_db():
             await call(bm.bstats_command, msg)
-        self.assertIn("Only the bot owner", msg.last[1])
+        self.assertIsNone(msg.last)
 
     async def test_owner_gets_card_with_counts_and_buttons(self):
         msg = _Msg()
@@ -265,12 +262,12 @@ class TestBstatsCommand(unittest.IsolatedAsyncioTestCase):
 # ═════════════════════════════════════════════════════════════════
 
 class TestBstatsCallback(unittest.IsolatedAsyncioTestCase):
-    async def test_non_owner_refresh_alerted_without_edit(self):
+    async def test_non_owner_refresh_acked_silently_without_edit(self):
         q = _query("bstats:refresh", user_id=99)
         with _owner(), _fake_db():
             await call(bm.stats_callback, q)
-        self.assertTrue(q.answers[0]["show_alert"])
-        self.assertIn("Only the bot owner", q.answers[0]["text"])
+        self.assertFalse(q.answers[0]["text"])
+        self.assertFalse(q.answers[0]["show_alert"])
         self.assertEqual(_edits(q.message), [])
 
     async def test_refresh_edits_fresh_card(self):

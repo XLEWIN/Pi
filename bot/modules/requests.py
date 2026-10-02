@@ -120,10 +120,6 @@ async def request_command(message: Message, bot: Bot, args: list) -> None:
         return
 
     if not await _is_admin(message, bot):
-        await reply_text(message, 
-            f"{E.ERROR} You need admin rights to change join request settings.",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     if not args or args[0].lower() not in ("on", "off"):
@@ -217,9 +213,7 @@ async def join_request_callback(callback_query: CallbackQuery, bot: Bot) -> None
     try:
         member = await bot.get_chat_member(chat_id, query.from_user.id)
         if member.status not in ("administrator", "creator"):
-            await query.answer(
-                "Only admins can process join requests.", show_alert=True
-            )
+            await query.answer()
             return
     except Exception:
         await query.answer(

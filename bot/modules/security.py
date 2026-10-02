@@ -301,10 +301,6 @@ async def shield_command(message: Message, bot: Bot, args: list):
         )
         return
     if not await _is_admin(message, bot):
-        await reply_text(
-            message,
-            f"{E.ERROR} Only admins can manage the shield.", parse_mode=ParseMode.HTML
-        )
         return
 
     chat_id = message.chat.id
@@ -351,10 +347,6 @@ async def shieldcfg_command(message: Message, bot: Bot, args: list):
         )
         return
     if not await _is_admin(message, bot):
-        await reply_text(
-            message,
-            f"{E.ERROR} Only admins can configure the shield.", parse_mode=ParseMode.HTML
-        )
         return
 
     usage = (
@@ -438,10 +430,6 @@ async def lockdown_command(message: Message, bot: Bot, args: list):
         )
         return
     if not await _is_admin(message, bot):
-        await reply_text(
-            message,
-            f"{E.ERROR} Only admins can use lockdown.", parse_mode=ParseMode.HTML
-        )
         return
 
     chat_id = message.chat.id
@@ -487,10 +475,6 @@ async def raidlog_command(message: Message, bot: Bot, args: list):
         )
         return
     if not await _is_admin(message, bot):
-        await reply_text(
-            message,
-            f"{E.ERROR} Only admins can view the raid log.", parse_mode=ParseMode.HTML
-        )
         return
 
     limit = 10

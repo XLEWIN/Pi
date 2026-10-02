@@ -270,8 +270,7 @@ class TestFreeCommand(unittest.IsolatedAsyncioTestCase):
     async def test_denied_for_non_sudo(self):
         msg = _msg("/free", user_id=USER_NOSUDO)
         await call(ap.free_command, msg, args=[str(USER_S)])
-        self.assertEqual(msg.last[0], "reply")
-        self.assertIn("Only sudo/owner users", msg.last[1])
+        self.assertIsNone(msg.last)
 
     async def test_reply_target_clears_everything(self):
         self._block()

@@ -44,8 +44,6 @@ async def watch_command(message: Message, bot: Bot, args: list):
             parse_mode=ParseMode.HTML)
         return
     if not await _is_admin(message, bot):
-        await reply_text(message, f"{E.ERROR} Only admins can manage watch words.",
-            parse_mode=ParseMode.HTML)
         return
     if not args:
         await reply_text(
@@ -84,8 +82,6 @@ async def unwatch_command(message: Message, bot: Bot, args: list):
             parse_mode=ParseMode.HTML)
         return
     if not await _is_admin(message, bot):
-        await reply_text(message, f"{E.ERROR} Only admins can manage watch words.",
-            parse_mode=ParseMode.HTML)
         return
     if not args:
         await reply_text(message, f"{E.INFO} Usage: /unwatch &lt;word or phrase&gt;", parse_mode=ParseMode.HTML)
@@ -133,8 +129,6 @@ async def watchmode_command(message: Message, bot: Bot, args: list):
             parse_mode=ParseMode.HTML)
         return
     if not await _is_admin(message, bot):
-        await reply_text(message, f"{E.ERROR} Only admins can change watch settings.",
-            parse_mode=ParseMode.HTML)
         return
     if not args or args[0].lower() not in ["copy", "forward"]:
         await reply_text(

@@ -168,8 +168,7 @@ class TestGates(_Base):
         bot = _FakeBot()
         with _owner(), _fake_db():
             await call(bm.broadcast_command, msg, bot=bot, args=[])
-        self.assertEqual(msg.last[0], "reply")
-        self.assertIn("Only the bot owner", msg.last[1])
+        self.assertIsNone(msg.last)
         self.assertEqual(bot.forwards, [])
 
     async def test_missing_reply_shows_usage(self):
@@ -191,7 +190,7 @@ class TestGates(_Base):
         with mock.patch.object(bm, "settings", SimpleNamespace(owner_id=0)), \
                 _fake_db():
             await call(bm.broadcast_command, msg, bot=_FakeBot(), args=[])
-        self.assertIn("Only the bot owner", msg.last[1])
+        self.assertIsNone(msg.last)
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -294,11 +293,11 @@ class TestRun(_Base):
 # ═════════════════════════════════════════════════════════════════
 
 class TestCancelCallback(_Base):
-    async def test_non_owner_gets_alert_and_flag_stays_false(self):
+    async def test_non_owner_gets_silent_ack_and_flag_stays_false(self):
         q = _query("broadcast:cancel", user_id=99)
         await call(bm.broadcast_callback, q)
-        self.assertTrue(q.answers[0]["show_alert"])
-        self.assertIn("Only the bot owner", q.answers[0]["text"])
+        self.assertFalse(q.answers[0]["text"])
+        self.assertFalse(q.answers[0]["show_alert"])
         self.assertFalse(bm._cancel)
 
     async def test_owner_sets_flag_and_edits(self):

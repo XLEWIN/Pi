@@ -92,11 +92,6 @@ async def bind_command(message: Message, bot: Bot, args: list, chat_data: dict) 
     user = message.from_user
 
     if not await is_group_admin(bot, chat_id, user.id):
-        await reply_text(
-            message,
-            f"{E.ERROR} Only group admins can bind a channel.",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     existing = await adb(bdb.get_settings(chat_id))
@@ -243,11 +238,6 @@ async def bindmenu_command(message: Message, bot: Bot, chat_data: dict) -> None:
     chat_data.pop("bind_wait", None)
 
     if not await is_group_admin(bot, chat_id, user.id):
-        await reply_text(
-            message,
-            f"{E.ERROR} Only group admins can open the bind menu.",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     settings = await adb(bdb.get_settings(chat_id))

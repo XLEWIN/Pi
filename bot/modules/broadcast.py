@@ -168,11 +168,6 @@ async def broadcast_command(message: Message,
     if msg is None:
         return
     if not _is_owner(message.from_user):
-        await reply_text(
-            msg,
-            f"{E.CROWN} Only the bot owner can broadcast.",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     reply = getattr(msg, "reply_to_message", None)
@@ -234,10 +229,7 @@ async def broadcast_callback(callback_query: CallbackQuery) -> None:
         return
     if not _is_owner(query.from_user):
         try:
-            await query.answer(
-                "Only the bot owner can cancel the broadcast.",
-                show_alert=True,
-            )
+            await query.answer()
         except Exception:
             pass
         return

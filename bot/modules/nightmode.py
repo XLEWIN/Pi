@@ -163,10 +163,6 @@ async def nightmode_command(message: Message, bot: Bot, args: list):
         )
         return
     if not await _is_admin(message, bot):
-        await reply_text(
-            message, f"{E.ERROR} Only admins can toggle nightmode.",
-            parse_mode=ParseMode.HTML,
-        )
         return
     enabled = await adb(db.is_nightmode(message.chat.id))
     await reply_text(
@@ -188,10 +184,7 @@ async def nightmode_callback(query: CallbackQuery, bot: Bot) -> None:
         not user
         or await _member_is_admin(bot, message.chat.id, user.id) is not True
     ):
-        await query.answer(
-            f"{E.ERROR} Only admins can toggle nightmode.",
-            show_alert=True,
-        )
+        await query.answer()
         return
     enable = data == "nm:on"
     await adb(db.set_nightmode(message.chat.id, enable))

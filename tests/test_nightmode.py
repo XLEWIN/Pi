@@ -177,7 +177,7 @@ class TestCommand(unittest.IsolatedAsyncioTestCase):
         with _patched(is_admin=False):
             await call(nm.nightmode_command, msg, args=[])
         text, _ = _last_reply(msg)
-        self.assertIn("Only admins", text)
+        self.assertIsNone(text)
 
     async def test_off_shows_enable_button(self):
         msg = _msg()
@@ -242,8 +242,8 @@ class TestCallback(unittest.IsolatedAsyncioTestCase):
             bot = _admin_bot(admin=False)
             await call(nm.nightmode_callback, cb, bot=bot)
         self.assertEqual(state["calls"], [])
-        self.assertTrue(cb.answers[0]["show_alert"])
-        self.assertIn("Only admins", cb.answers[0]["text"])
+        self.assertFalse(cb.answers[0]["text"])
+        self.assertFalse(cb.answers[0]["show_alert"])
         edits = [c for c in cb.message.calls if c[0] == "edit_text"]
         self.assertEqual(edits, [])
 

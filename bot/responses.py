@@ -12,11 +12,14 @@ All HTML uses bot.emojis.E / custom <tg-emoji> — never stock foreign emoji.
 
 from __future__ import annotations
 
+import logging
 from html import escape
 from typing import Any, Optional, Sequence, Tuple
 
 from bot.emojis import E
 from bot.reply import reply_text
+
+logger = logging.getLogger(__name__)
 
 # (emoji_html, LABEL, value_html) — value already HTML-safe
 Field = Tuple[str, str, str]
@@ -173,6 +176,65 @@ def plain_error(msg: str) -> str:
 
 def plain_ok(msg: str) -> str:
     return f"{E.CHECK} {msg}"
+
+
+# ── Permission / failure notices ────────────────────────────────
+# Never show the user a raw Telegram/Python exception: log it, reply with
+# something they can actually act on.
+
+_RIGHTS_MARKERS = (
+    "not enough rights",
+    "not enough permissions",
+    "not_enough_rights",
+    "bot_not_enough_rights",
+    "have no rights",
+    "not permitted",
+    "chat_admin_required",
+    "chat admin required",
+    "administrator privileges",
+    "need to be admin",
+    "bot was kicked",
+    "bot is not a member",
+    "forbidden",
+)
+
+
+def is_rights_error(exc: Optional[BaseException]) -> bool:
+    """True when Telegram refused because *the bot* lacks a chat permission."""
+    if exc is None:
+        return False
+    name = type(exc).__name__.lower()
+    if "forbidden" in name or "rights" in name:
+        return True
+    text = str(exc).lower()
+    return any(marker in text for marker in _RIGHTS_MARKERS)
+
+
+def bot_rights_error(action: str, permission: Optional[str] = None) -> str:
+    """Suitable, actionable notice for a bot-lacks-rights denial.
+
+    ``action`` is an infinitive phrase ("promote users"); ``permission`` is the
+    Telegram admin-right label ("Add Admins").
+    """
+    need = (
+        f"the <b>{escape(permission)}</b> permission"
+        if permission
+        else "the required permission"
+    )
+    return (
+        f"{E.WARNING} I can't {escape(action)} here.\n"
+        f"I need {need} \u2014 ask a group admin to grant it, then try again."
+    )
+
+
+def failed(action: str, exc: Optional[BaseException] = None,
+           *, permission: Optional[str] = None) -> str:
+    """User-facing failure line. Logs the raw exception; never shows it."""
+    if exc is not None:
+        logger.warning("%s failed: %s: %s", action, type(exc).__name__, exc)
+        if is_rights_error(exc):
+            return bot_rights_error(action, permission)
+    return plain_error(f"Couldn't {action} \u2014 please try again.")
 
 
 # ── Inline buttons under action cards ───────────────────────────

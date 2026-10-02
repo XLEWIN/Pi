@@ -20,6 +20,8 @@ from bot.pipeline import cmd, on
 from bot.reply import reply_text
 from bot.responses import (
     action_card,
+    bot_rights_error,
+    failed,
     field_by,
     field_count,
     field_duration,
@@ -461,17 +463,11 @@ async def mute_command(message: Message, bot: Bot, args: list):
         return
 
     if not await is_admin(message, bot):
-        await reply_text(message, 
-            f"{E.ERROR} You don't have permission to mute users.\n"
-            "Required permission: <b>Can Restrict Members</b>",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     if not await is_bot_admin(message, bot):
         await reply_text(message, 
-            f"{E.ERROR} I don't have permission to mute users.\n"
-            "Please make sure I have the <b>Can Restrict Members</b> permission.",
+            bot_rights_error("mute users", "Can Restrict Members"),
             parse_mode=ParseMode.HTML,
         )
         return
@@ -525,15 +521,11 @@ async def dmute_command(message: Message, bot: Bot, args: list):
         return
 
     if not await is_admin(message, bot):
-        await reply_text(message, 
-            f"{E.ERROR} You don't have permission to mute users.",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     if not await is_bot_admin(message, bot):
         await reply_text(message, 
-            f"{E.ERROR} I don't have permission to mute users.",
+            bot_rights_error("mute users", "Can Restrict Members"),
             parse_mode=ParseMode.HTML,
         )
         return
@@ -622,15 +614,11 @@ async def tmute_command(message: Message, bot: Bot, args: list):
         return
 
     if not await is_admin(message, bot):
-        await reply_text(message, 
-            f"{E.ERROR} You don't have permission to mute users.",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     if not await is_bot_admin(message, bot):
         await reply_text(message, 
-            f"{E.ERROR} I don't have permission to mute users.",
+            bot_rights_error("mute users", "Can Restrict Members"),
             parse_mode=ParseMode.HTML,
         )
         return
@@ -692,15 +680,11 @@ async def unmute_command(message: Message, bot: Bot, args: list):
         return
 
     if not await is_admin(message, bot):
-        await reply_text(message, 
-            f"{E.ERROR} You don't have permission to unmute users.",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     if not await is_bot_admin(message, bot):
         await reply_text(message, 
-            f"{E.ERROR} I don't have permission to unmute users.",
+            bot_rights_error("unmute users", "Can Restrict Members"),
             parse_mode=ParseMode.HTML,
         )
         return
@@ -748,7 +732,7 @@ async def unmute_command(message: Message, bot: Bot, args: list):
             user=target_user,
         )
     except Exception as e:
-        await reply_text(message, plain_error(f"Failed to unmute user: {str(e)}"))
+        await reply_text(message, failed("unmute that user", e, permission="Can Restrict Members"))
 
 
 # ============================================
@@ -763,17 +747,11 @@ async def ban_command(message: Message, bot: Bot, args: list):
         return
 
     if not await is_admin(message, bot):
-        await reply_text(message, 
-            f"{E.ERROR} You don't have permission to ban users.\n"
-            "Required permission: <b>Can Ban Members</b>",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     if not await is_bot_admin(message, bot):
         await reply_text(message, 
-            f"{E.ERROR} I don't have permission to ban users.\n"
-            "Please make sure I have the <b>Can Ban Members</b> permission.",
+            bot_rights_error("ban users", "Can Ban Members"),
             parse_mode=ParseMode.HTML,
         )
         return
@@ -841,15 +819,11 @@ async def dban_command(message: Message, bot: Bot, args: list):
         return
 
     if not await is_admin(message, bot):
-        await reply_text(message, 
-            f"{E.ERROR} You don't have permission to ban users.",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     if not await is_bot_admin(message, bot):
         await reply_text(message, 
-            f"{E.ERROR} I don't have permission to ban users.",
+            bot_rights_error("ban users", "Can Ban Members"),
             parse_mode=ParseMode.HTML,
         )
         return
@@ -938,15 +912,11 @@ async def tban_command(message: Message, bot: Bot, args: list):
         return
 
     if not await is_admin(message, bot):
-        await reply_text(message, 
-            f"{E.ERROR} You don't have permission to ban users.",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     if not await is_bot_admin(message, bot):
         await reply_text(message, 
-            f"{E.ERROR} I don't have permission to ban users.",
+            bot_rights_error("ban users", "Can Ban Members"),
             parse_mode=ParseMode.HTML,
         )
         return
@@ -1008,15 +978,11 @@ async def unban_command(message: Message, bot: Bot, args: list):
         return
 
     if not await is_admin(message, bot):
-        await reply_text(message, 
-            f"{E.ERROR} You don't have permission to unban users.",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     if not await is_bot_admin(message, bot):
         await reply_text(message, 
-            f"{E.ERROR} I don't have permission to unban users.",
+            bot_rights_error("unban users", "Can Ban Members"),
             parse_mode=ParseMode.HTML,
         )
         return
@@ -1046,7 +1012,7 @@ async def unban_command(message: Message, bot: Bot, args: list):
             user=target_user,
         )
     except Exception as e:
-        await reply_text(message, plain_error(f"Failed to unban user: {str(e)}"))
+        await reply_text(message, failed("unban that user", e, permission="Can Ban Members"))
 
 
 # ============================================
@@ -1061,17 +1027,11 @@ async def kick_command(message: Message, bot: Bot, args: list):
         return
 
     if not await is_admin(message, bot):
-        await reply_text(message, 
-            f"{E.ERROR} You don't have permission to kick users.\n"
-            "Required permission: <b>Can Ban Members</b>",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     if not await is_bot_admin(message, bot):
         await reply_text(message, 
-            f"{E.ERROR} I don't have permission to kick users.\n"
-            "Please make sure I have the <b>Can Ban Members</b> permission.",
+            bot_rights_error("kick users", "Can Ban Members"),
             parse_mode=ParseMode.HTML,
         )
         return
@@ -1139,15 +1099,11 @@ async def dkick_command(message: Message, bot: Bot, args: list):
         return
 
     if not await is_admin(message, bot):
-        await reply_text(message, 
-            f"{E.ERROR} You don't have permission to kick users.",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     if not await is_bot_admin(message, bot):
         await reply_text(message, 
-            f"{E.ERROR} I don't have permission to kick users.",
+            bot_rights_error("kick users", "Can Ban Members"),
             parse_mode=ParseMode.HTML,
         )
         return
@@ -1241,10 +1197,6 @@ async def warn_command(message: Message, bot: Bot, args: list):
         return
 
     if not await is_admin(message, bot):
-        await reply_text(message, 
-            f"{E.ERROR} You don't have permission to warn users.",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     target_user = await get_target_user(message, bot, args)
@@ -1315,10 +1267,6 @@ async def dwarn_command(message: Message, bot: Bot, args: list):
         return
 
     if not await is_admin(message, bot):
-        await reply_text(message, 
-            f"{E.ERROR} You don't have permission to warn users.",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     target_user = None
@@ -1499,10 +1447,6 @@ async def rmwarn_command(message: Message, bot: Bot, args: list):
         return
 
     if not await is_admin(message, bot):
-        await reply_text(message, 
-            f"{E.ERROR} You don't have permission to manage warnings.",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     target_user = await get_target_user(message, bot, args)
@@ -1552,10 +1496,6 @@ async def resetwarn_command(message: Message, bot: Bot, args: list):
         return
 
     if not await is_admin(message, bot):
-        await reply_text(message, 
-            f"{E.ERROR} You don't have permission to manage warnings.",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     target_user = await get_target_user(message, bot, args)
@@ -1605,10 +1545,6 @@ async def resetallwarns_command(message: Message, bot: Bot):
         return
 
     if not await is_admin(message, bot):
-        await reply_text(message, 
-            f"{E.ERROR} You don't have permission to reset all warnings.",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     chat_id = message.chat.id
@@ -1645,10 +1581,6 @@ async def warnlimit_command(message: Message, bot: Bot, args: list):
         return
 
     if not await is_admin(message, bot):
-        await reply_text(message, 
-            f"{E.ERROR} You don't have permission to change warning settings.",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     if not args:
@@ -1699,10 +1631,6 @@ async def warnmode_command(message: Message, bot: Bot, args: list):
         return
 
     if not await is_admin(message, bot):
-        await reply_text(message, 
-            f"{E.ERROR} You don't have permission to change warning settings.",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     if not args:
@@ -1770,10 +1698,6 @@ async def warntime_command(message: Message, bot: Bot, args: list):
         return
 
     if not await is_admin(message, bot):
-        await reply_text(message, 
-            f"{E.ERROR} You don't have permission to change warning settings.",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     if not args:
@@ -1861,10 +1785,6 @@ async def setrules_command(message: Message, bot: Bot, args: list):
         return
 
     if not await is_admin(message, bot):
-        await reply_text(message, 
-            f"{E.ERROR} You don't have permission to set rules.",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     if message.reply_to_message:
@@ -1905,10 +1825,6 @@ async def resetrules_command(message: Message, bot: Bot):
         return
 
     if not await is_admin(message, bot):
-        await reply_text(message, 
-            f"{E.ERROR} You don't have permission to reset rules.",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     chat_id = message.chat.id
@@ -1930,10 +1846,6 @@ async def privaterules_command(message: Message, bot: Bot, args: list):
         return
 
     if not await is_admin(message, bot):
-        await reply_text(message, 
-            f"{E.ERROR} You don't have permission to change this setting.",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     if not args or args[0].lower() not in ["on", "off"]:

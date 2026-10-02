@@ -167,10 +167,6 @@ async def free_command(message: Message, args: list) -> None:
         return
     sender = message.from_user
     if sender is None or not await asyncio.to_thread(is_sudo, sender.id):
-        await reply_text(msg,
-            f"{E.ERROR} Only sudo/owner users can use /free.",
-            parse_mode=ParseMode.HTML,
-        )
         return
     target = await asyncio.to_thread(_resolve_target, message, args)
     if target is None:
