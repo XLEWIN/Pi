@@ -2376,9 +2376,11 @@ class Database:
                     return doc
                 return {"chat_id": chat_id,
                         "welcome_text": "Hey {first}, welcome to {chatname}! 👋",
+                        "welcome_entities": None,
                         "welcome_buttons": None, "welcome_media": None,
                         "welcome_media_type": None,
                         "goodbye_text": "Sad to see you leaving {first}. Take Care! 👋",
+                        "goodbye_entities": None,
                         "goodbye_buttons": None, "goodbye_media": None,
                         "goodbye_media_type": None}
 
@@ -2389,7 +2391,13 @@ class Database:
             logger.error(f"Error getting welcome message: {e}")
             return {}
 
-    async def set_welcome_text(self, chat_id: int, text: str):
+    async def set_welcome_text(self, chat_id: int, text: str, entities=None):
+        """Store the welcome text.
+
+        ``entities`` is the source message's entity list (serialised dicts).
+        Keeping it lets the welcome be re-sent exactly like a forward —
+        premium/custom emoji included — instead of re-rendered HTML.
+        """
         try:
             msg = await self.get_welcome_message(chat_id)
             await self._mongo["welcome_messages"].replace_one(
@@ -2397,10 +2405,12 @@ class Database:
                 {
                     "chat_id": chat_id,
                     "welcome_text": text,
+                    "welcome_entities": entities,
                     "welcome_buttons": msg.get("welcome_buttons"),
                     "welcome_media": msg.get("welcome_media"),
                     "welcome_media_type": msg.get("welcome_media_type"),
                     "goodbye_text": msg.get("goodbye_text"),
+                    "goodbye_entities": msg.get("goodbye_entities"),
                     "goodbye_buttons": msg.get("goodbye_buttons"),
                     "goodbye_media": msg.get("goodbye_media"),
                     "goodbye_media_type": msg.get("goodbye_media_type"),
@@ -2410,7 +2420,7 @@ class Database:
         except Exception as e:
             logger.error(f"Error setting welcome text: {e}")
 
-    async def set_goodbye_text(self, chat_id: int, text: str):
+    async def set_goodbye_text(self, chat_id: int, text: str, entities=None):
         try:
             msg = await self.get_welcome_message(chat_id)
             await self._mongo["welcome_messages"].replace_one(
@@ -2418,10 +2428,12 @@ class Database:
                 {
                     "chat_id": chat_id,
                     "welcome_text": msg.get("welcome_text"),
+                    "welcome_entities": msg.get("welcome_entities"),
                     "welcome_buttons": msg.get("welcome_buttons"),
                     "welcome_media": msg.get("welcome_media"),
                     "welcome_media_type": msg.get("welcome_media_type"),
                     "goodbye_text": text,
+                    "goodbye_entities": entities,
                     "goodbye_buttons": msg.get("goodbye_buttons"),
                     "goodbye_media": msg.get("goodbye_media"),
                     "goodbye_media_type": msg.get("goodbye_media_type"),

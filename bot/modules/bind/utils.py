@@ -39,12 +39,18 @@ def parse_channel_ref(raw: str) -> Optional[Tuple[Optional[int], Optional[str], 
 
     # t.me link
     m = _TME_RE.search(text)
-    if m and m.group(2):
-        username = m.group(2)
-        if username.lower() in {"joinchat", "share", "addstickers", "addemoji"}:
-            return None
-        link = f"https://t.me/{username}"
-        return (None, username, link)
+    if m:
+        # Private-channel link: t.me/c/<internal id>/<msg id>.  Telegram
+        # drops the "-100" prefix in the URL, so put it back — without it
+        # getChat() answers "chat not found".
+        if m.group(1):
+            return (int("-100" + m.group(1)), None, None)
+        if m.group(2):
+            username = m.group(2)
+            if username.lower() in {"joinchat", "share", "addstickers", "addemoji"}:
+                return None
+            link = f"https://t.me/{username}"
+            return (None, username, link)
 
     # @username or bare username
     m = _USERNAME_RE.match(text)

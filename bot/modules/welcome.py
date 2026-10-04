@@ -4,7 +4,9 @@ Adapted from boa2 for Pi bot. Enabled by default.
 """
 
 import logging
+import re
 from html import escape
+from typing import Any, Dict, List, Optional, Tuple
 
 from aiogram import Bot, F
 from aiogram.enums import ParseMode
@@ -19,6 +21,45 @@ from bot.async_bridge import adb
 
 logger = logging.getLogger(__name__)
 
+# {name} tokens are substituted ONE AT A TIME.
+#
+# The old code ran ``str.format()`` over the whole template, which is
+# all-or-nothing: a single unknown/stray brace (decorated frames like
+# ``{──── SHADOW HUB ────}`` are common in welcome art) raised KeyError and
+# the ENTIRE message was shipped verbatim — that is how ``{username}``
+# ended up posted literally.  Regex substitution only fills the tokens we
+# know and leaves everything else byte-for-byte alone.
+_PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _utf16_len(text: str) -> int:
+    """Telegram entity offsets/lengths are counted in UTF-16 code units."""
+    return sum(2 if ord(ch) > 0xFFFF else 1 for ch in text)
+
+
+def _values(user, chat, *, html: bool) -> Dict[str, str]:
+    """Placeholder values, HTML-escaped (HTML send) or raw (entities send)."""
+    esc = escape if html else (lambda s: s)
+    first = esc(user.first_name or "User")
+    last = esc(user.last_name or user.first_name or "User")
+    fullname = esc(user.full_name or user.first_name or "User")
+    username = f"@{esc(user.username)}" if user.username else first
+    mention = (
+        f"<a href='tg://user?id={user.id}'>{first}</a>"
+        if html else (user.first_name or "User")
+    )
+    chatname = esc(chat.title or "") if chat.type != "private" else first
+    return {
+        "first": first,
+        "last": last,
+        "fullname": fullname,
+        "username": username,
+        "mention": mention,
+        "chatname": chatname,
+        "id": str(user.id),
+    }
+
+
 # ── Helpers ──────────────────────────────────────────────
 async def _is_admin(message: Message, bot: Bot) -> bool:
     user_id = message.from_user.id
@@ -31,31 +72,210 @@ async def _is_admin(message: Message, bot: Bot) -> bool:
 
 
 def format_welcome(text: str, user, chat) -> str:
-    """Format welcome/goodbye text with variables."""
+    """Fill placeholders with HTML-safe values (one token at a time)."""
     if not text:
         return text
+    values = _values(user, chat, html=True)
+    return _PLACEHOLDER_RE.sub(lambda m: values.get(m.group(1), m.group(0)), text)
 
-    first = escape(user.first_name or "User")
-    last = escape(user.last_name or user.first_name or "User")
-    fullname = escape(user.full_name or user.first_name or "User")
-    username = f"@{escape(user.username)}" if user.username else first
-    mention = f"<a href='tg://user?id={user.id}'>{first}</a>"
-    chatname = escape(chat.title) if chat.type != "private" else first
-    user_id = user.id
 
-    try:
-        formatted = text.format(
-            first=first,
-            last=last,
-            fullname=fullname,
-            username=username,
-            mention=mention,
-            chatname=chatname,
-            id=user_id,
-        )
-        return formatted
-    except (KeyError, IndexError):
-        return text
+# ── Entity (premium emoji) preserving render ─────────────
+#
+# A welcome written by an admin carries MessageEntityCustomEmoji entries
+# (the premium stickers Telegram renders as emoji).  ``message.text``
+# drops them, so re-sending through parse_mode=HTML degraded every one of
+# them to its fallback character.  Keeping the ORIGINAL entities and
+# re-sending with ``entities=`` reproduces the source message exactly —
+# same look as a forwarded copy — while still swapping in the joiner's
+# name.
+
+
+def _format_entities(
+    template: str,
+    values: Dict[str, str],
+    entities: List[Dict[str, Any]],
+    *,
+    mention_user=None,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """Substitute placeholders and remap entity offsets (UTF-16 safe)."""
+    parts: List[str] = []
+    # (orig_start, orig_end, new_start, new_end, is_replacement) — UTF-16 units
+    segments: List[Tuple[int, int, int, int, bool]] = []
+    injected: List[Dict[str, Any]] = []
+
+    orig_u16 = new_u16 = cursor = 0
+
+    for m in _PLACEHOLDER_RE.finditer(template):
+        start, end = m.span()
+        if start > cursor:
+            lit = template[cursor:start]
+            n = _utf16_len(lit)
+            parts.append(lit)
+            segments.append((orig_u16, orig_u16 + n, new_u16, new_u16 + n, False))
+            orig_u16 += n
+            new_u16 += n
+
+        raw = template[start:end]  # ASCII → Python len == UTF-16 len
+        repl = values.get(m.group(1))
+        if repl is None:
+            parts.append(raw)
+            segments.append((orig_u16, orig_u16 + len(raw), new_u16, new_u16 + len(raw), False))
+            orig_u16 += len(raw)
+            new_u16 += len(raw)
+        else:
+            r = _utf16_len(repl)
+            segments.append((orig_u16, orig_u16 + len(raw), new_u16, new_u16 + r, True))
+            parts.append(repl)
+            if m.group(1) == "mention" and mention_user is not None and r:
+                injected.append({
+                    "type": "text_mention",
+                    "offset": new_u16,
+                    "length": r,
+                    "user": {
+                        "id": mention_user.id,
+                        "is_bot": bool(getattr(mention_user, "is_bot", False)),
+                        "first_name": mention_user.first_name or "User",
+                        **({"username": mention_user.username} if mention_user.username else {}),
+                    },
+                })
+            orig_u16 += len(raw)
+            new_u16 += r
+        cursor = end
+
+    if cursor < len(template):
+        lit = template[cursor:]
+        n = _utf16_len(lit)
+        parts.append(lit)
+        segments.append((orig_u16, orig_u16 + n, new_u16, new_u16 + n, False))
+
+    new_text = "".join(parts)
+
+    def _map(pos: int, is_end: bool) -> int:
+        if pos <= 0:
+            return 0
+        for a, b, c, d, repl in segments:
+            if a <= pos <= b:
+                if not repl:
+                    return c + (pos - a)
+                if pos == a:
+                    return c
+                if pos == b:
+                    return d
+                # Position sits inside a substituted token: expand the
+                # entity over the whole replacement instead of clipping it.
+                return d if is_end else c
+        return new_u16
+
+    out: List[Dict[str, Any]] = []
+    for ent in entities or []:
+        if not isinstance(ent, dict):
+            ent = ent.model_dump(mode="json", exclude_none=True)
+        offset = int(ent.get("offset", 0))
+        length = int(ent.get("length", 0))
+        if length <= 0:
+            continue
+        new_offset = _map(offset, False)
+        new_end = _map(offset + length, True)
+        if new_end <= new_offset:
+            continue
+        shifted = dict(ent)
+        shifted["offset"] = new_offset
+        shifted["length"] = new_end - new_offset
+        out.append(shifted)
+
+    out.extend(injected)
+    out.sort(key=lambda e: (int(e["offset"]), int(e["length"])))
+    return new_text, out
+
+
+def _serialize_entities(entities) -> Optional[List[Dict[str, Any]]]:
+    """JSON-safe copy of a message's entities for storage (Mongo-safe)."""
+    if not entities:
+        return None
+    out: List[Dict[str, Any]] = []
+    for ent in entities:
+        try:
+            data = ent.model_dump(mode="json", exclude_none=True)
+        except Exception:
+            continue
+        if data.get("type") == "bot_command":
+            continue
+        out.append(data)
+    return out or None
+
+
+def _command_body(message: Message) -> Tuple[str, int]:
+    """(text after the command token, its UTF-16 offset in message.text)."""
+    full = message.text or ""
+    m = re.match(r"^\S+\s*", full)
+    if not m:
+        return "", 0
+    start = m.end()
+    body = full[start:]
+    lead = len(body) - len(body.lstrip())
+    body = body.strip()
+    return body, _utf16_len(full[: start + lead])
+
+
+def _slice_entities(entities, base: int, length: int) -> Optional[List[Dict[str, Any]]]:
+    """Serialized entities of the command message inside its argument body.
+
+    Offsets are re-based onto the body (they arrive relative to the full
+    ``/setwelcome …`` text) so they line up with the stored template.
+    """
+    if not entities or length <= 0:
+        return None
+    out: List[Dict[str, Any]] = []
+    for ent in entities:
+        offset = int(getattr(ent, "offset", -1))
+        ent_len = int(getattr(ent, "length", 0))
+        if offset < base or offset + ent_len > base + length:
+            continue
+        data = _serialize_entities([ent])
+        if not data:
+            continue
+        data[0]["offset"] = offset - base
+        out.append(data[0])
+    return out or None
+
+
+async def _send_template(
+    bot: Bot,
+    chat_id: int,
+    template: str,
+    entities: Optional[List[Dict[str, Any]]],
+    user,
+    chat,
+    *,
+    fallback: str,
+) -> Optional[int]:
+    """Send a welcome/goodbye, preserving custom-emoji entities when stored."""
+    if not template:
+        template = fallback
+
+    if entities:
+        try:
+            text, ents = _format_entities(
+                template, _values(user, chat, html=False), entities, mention_user=user
+            )
+            sent = await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                entities=ents,
+                disable_web_page_preview=True,
+            )
+            return sent.message_id
+        except Exception as e:
+            # Never lose the welcome: fall through to the HTML path.
+            logger.warning(f"entity welcome send failed, falling back to HTML: {e}")
+
+    sent = await bot.send_message(
+        chat_id=chat_id,
+        text=format_welcome(template, user, chat),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+    return sent.message_id
 
 
 # ── Command handlers ─────────────────────────────────────
@@ -89,16 +309,32 @@ async def setwelcome_command(message: Message, bot: Bot, args: list):
         return
 
     text = " ".join(args) if args else ""
+    entities: Optional[List[Dict[str, Any]]] = None
+
     if message.reply_to_message:
-        text = message.reply_to_message.text or message.reply_to_message.caption or text
+        source = message.reply_to_message
+        text = source.text or source.caption or text
+        entities = _serialize_entities(
+            source.entities if source.text else source.caption_entities
+        )
+    elif args:
+        # Typed/pasted argument — keep any formatting (incl. premium
+        # emoji) that travelled with it, shifted past the command token.
+        body, base = _command_body(message)
+        if body:
+            text = body
+            entities = _slice_entities(
+                message.entities, base, _utf16_len(body)
+            )
 
     if not text:
         await reply_text(message, "Please provide welcome text.")
         return
 
     chat_id = message.chat.id
-    await adb(db.set_welcome_text(chat_id, text))
-    await reply_text(message, f"{E.CHECK} Welcome message saved!",
+    await adb(db.set_welcome_text(chat_id, text, entities=entities))
+    saved = "with its original formatting (premium emojis kept)" if entities else "as plain HTML"
+    await reply_text(message, f"{E.CHECK} Welcome message saved {saved}!",
             parse_mode=ParseMode.HTML)
 
 
@@ -132,8 +368,21 @@ async def setgoodbye_command(message: Message, bot: Bot, args: list):
         return
 
     text = " ".join(args) if args else ""
+    entities: Optional[List[Dict[str, Any]]] = None
+
     if message.reply_to_message:
-        text = message.reply_to_message.text or message.reply_to_message.caption or text
+        source = message.reply_to_message
+        text = source.text or source.caption or text
+        entities = _serialize_entities(
+            source.entities if source.text else source.caption_entities
+        )
+    elif args:
+        body, base = _command_body(message)
+        if body:
+            text = body
+            entities = _slice_entities(
+                message.entities, base, _utf16_len(body)
+            )
 
     if not text:
         await reply_text(message, f"{E.ERROR} Please provide goodbye text.",
@@ -141,8 +390,9 @@ async def setgoodbye_command(message: Message, bot: Bot, args: list):
         return
 
     chat_id = message.chat.id
-    await adb(db.set_goodbye_text(chat_id, text))
-    await reply_text(message, f"{E.CHECK} Goodbye message saved!",
+    await adb(db.set_goodbye_text(chat_id, text, entities=entities))
+    saved = "with its original formatting (premium emojis kept)" if entities else "as plain HTML"
+    await reply_text(message, f"{E.CHECK} Goodbye message saved {saved}!",
             parse_mode=ParseMode.HTML)
 
 
@@ -340,7 +590,8 @@ async def new_member_handler(message: Message, bot: Bot):
         return
 
     msg_data = await adb(db.get_welcome_message(chat_id))
-    welcome_text = msg_data.get("welcome_text", f"{E.WAVE} Hey {{first}}, welcome to {{chatname}}!")
+    welcome_text = msg_data.get("welcome_text") or f"{E.WAVE} Hey {{first}}, welcome to {{chatname}}!"
+    welcome_entities = msg_data.get("welcome_entities")
 
     for user in message.new_chat_members:
         # Skip bots
@@ -358,17 +609,20 @@ async def new_member_handler(message: Message, bot: Bot):
             except Exception:
                 pass
 
-        # Format and send welcome
-        text = format_welcome(welcome_text, user, message.chat)
-
         try:
-            sent = await bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
+            # Sends as a faithful copy of the saved source (custom/premium
+            # emoji entities intact) with {placeholders} swapped in.
+            msg_id = await _send_template(
+                bot,
+                chat_id,
+                welcome_text,
+                welcome_entities,
+                user,
+                message.chat,
+                fallback=f"{E.WAVE} Hey {{first}}, welcome to {{chatname}}!",
             )
-            await adb(db.update_last_welcome_msg(chat_id, sent.message_id))
+            if msg_id:
+                await adb(db.update_last_welcome_msg(chat_id, msg_id))
         except Exception as e:
             logger.warning(f"Welcome message error: {e}")
 
@@ -389,7 +643,8 @@ async def left_member_handler(message: Message, bot: Bot):
         return
 
     msg_data = await adb(db.get_welcome_message(chat_id))
-    goodbye_text = msg_data.get("goodbye_text", f"{E.GOODBYE} Sad to see you leaving {{first}}. Take Care!")
+    goodbye_text = msg_data.get("goodbye_text") or f"{E.GOODBYE} Sad to see you leaving {{first}}. Take Care!"
+    goodbye_entities = msg_data.get("goodbye_entities")
 
     # Clean old goodbye message
     if settings.get("clean_goodbye") and settings.get("last_goodbye_msg_id"):
@@ -398,16 +653,18 @@ async def left_member_handler(message: Message, bot: Bot):
         except Exception:
             pass
 
-    text = format_welcome(goodbye_text, user, message.chat)
-
     try:
-        sent = await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
+        msg_id = await _send_template(
+            bot,
+            chat_id,
+            goodbye_text,
+            goodbye_entities,
+            user,
+            message.chat,
+            fallback=f"{E.GOODBYE} Sad to see you leaving {{first}}. Take Care!",
         )
-        await adb(db.update_last_goodbye_msg(chat_id, sent.message_id))
+        if msg_id:
+            await adb(db.update_last_goodbye_msg(chat_id, msg_id))
     except Exception as e:
         logger.warning(f"Goodbye message error: {e}")
 

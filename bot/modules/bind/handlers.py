@@ -10,6 +10,7 @@ here stalls the whole event loop and with it long-polling itself.
 import asyncio
 import logging
 import time
+from html import escape
 from typing import Any, Dict, Optional
 
 from aiogram import Bot
@@ -60,7 +61,23 @@ async def _resolve_channel(bot: Bot, ref: str):
     try:
         return await bot.get_chat(channel_id)
     except Exception as e:
-        raise ValueError(f"Chat {channel_id} not found or bot can't access it. ({e})") from e
+        # Telegram only accepts NEGATIVE ids for channels/supergroups
+        # (-100xxxxxxxxxx).  A lot of tools show the id without the sign
+        # (``1002807915293``), which getChat() rejects with
+        # "Bad Request: chat not found" even when the bot is an admin.
+        # Retry the sign-restored form before giving up.
+        signed = -abs(channel_id)
+        if signed != channel_id:
+            try:
+                return await bot.get_chat(signed)
+            except Exception:
+                pass
+        raise ValueError(
+            f"Chat {channel_id} not found or bot can't access it. "
+            f"({escape(str(e))}) — try <code>@username</code>, a <code>t.me/…</code> link, "
+            "or the full id including the <code>-100</code> prefix."
+        ) from e
+
 
 
 async def _bot_is_channel_admin(bot: Bot, chat) -> bool:
