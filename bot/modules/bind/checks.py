@@ -14,6 +14,22 @@ logger = logging.getLogger(__name__)
 # (channel_id, user_id) -> (is_member: bool, expires_at: float)
 _member_cache: Dict[Tuple[int, int], Tuple[bool, float]] = {}
 
+# Membership answers, so a gate decision and a button press cannot drift
+# apart or be spelled two different ways.
+MEMBERSHIP_MEMBER = "member"
+MEMBERSHIP_NOT_MEMBER = "not_member"
+#: Telegram could not be asked at all (no rights / chat not visible).
+#: Never treat this as "not a member" — that is how every message in a
+#: group ends up deleted because of a mis-configured channel.
+MEMBERSHIP_UNKNOWN = "unknown"
+
+# channel_id -> (bot may call getChatMember there, expires_at)
+_bot_verify_cache: Dict[int, Tuple[bool, float]] = {}
+# A working probe rarely changes; a failing one should recover quickly so
+# "I added the bot as channel admin" takes effect within a minute.
+BOT_VERIFY_OK_TTL = 300.0
+BOT_VERIFY_FAIL_TTL = 60.0
+
 
 def invalidate_cache(channel_id: int, user_id: int) -> None:
     _member_cache.pop((channel_id, user_id), None)
@@ -21,6 +37,7 @@ def invalidate_cache(channel_id: int, user_id: int) -> None:
 
 def clear_cache() -> None:
     _member_cache.clear()
+    _bot_verify_cache.clear()
 
 
 def _cache_put(channel_id: int, user_id: int, is_member: bool) -> None:
@@ -66,6 +83,33 @@ async def is_bot_admin(bot, group_id: int) -> bool:
         return False
 
 
+async def bot_can_verify(bot, channel_id: int) -> bool:
+    """True when Telegram will let *this* bot ask about ``channel_id``.
+
+    Asking about the bot's own membership is the cheapest probe with a
+    real answer: if it is refused, every per-user check would fail too,
+    and those failures must not be read as "the user isn't a member".
+    Probing once per channel (with a TTL) keeps this off the hot path.
+    """
+    now = time.monotonic()
+    hit = _bot_verify_cache.get(channel_id)
+    if hit is not None and now < hit[1]:
+        return hit[0]
+
+    try:
+        await bot.get_chat_member(channel_id, bot.id)
+        ok = True
+    except Exception as e:
+        ok = False
+        logger.warning(
+            f"bind: cannot verify membership in {channel_id} — "
+            f"add me to that chat with rights to see members ({e})"
+        )
+    ttl = BOT_VERIFY_OK_TTL if ok else BOT_VERIFY_FAIL_TTL
+    _bot_verify_cache[channel_id] = (ok, now + ttl)
+    return ok
+
+
 async def fetch_channel_member(bot, channel_id: int, user_id: int) -> Tuple[str, bool]:
     """Fetch raw status + pass/fail for a user in the bound channel."""
     try:
@@ -83,15 +127,29 @@ async def fetch_channel_member(bot, channel_id: int, user_id: int) -> Tuple[str,
         return "left", False
 
 
-async def is_channel_member(bot, channel_id: int, user_id: int, *, fresh: bool = False) -> bool:
-    """Membership check with 30–60s cache. fresh=True bypasses cache."""
+async def membership_state(bot, channel_id: int, user_id: int, *, fresh: bool = False) -> str:
+    """``member`` / ``not_member`` / ``unknown`` with a 30–60s cache.
+
+    ``fresh=True`` bypasses the per-user cache (the "I've Joined" button
+    must never trust it).  ``unknown`` short-circuits before any caching:
+    a failed probe says nothing about the user, so it must never poison
+    the cache either.
+    """
+    if not await bot_can_verify(bot, channel_id):
+        return MEMBERSHIP_UNKNOWN
     if not fresh:
         cached = _cache_get(channel_id, user_id)
         if cached is not None:
-            return cached
+            return MEMBERSHIP_MEMBER if cached else MEMBERSHIP_NOT_MEMBER
     _, ok = await fetch_channel_member(bot, channel_id, user_id)
     _cache_put(channel_id, user_id, ok)
-    return ok
+    return MEMBERSHIP_MEMBER if ok else MEMBERSHIP_NOT_MEMBER
+
+
+async def is_channel_member(bot, channel_id: int, user_id: int, *, fresh: bool = False) -> bool:
+    """Membership check with 30–60s cache. fresh=True bypasses cache."""
+    state = await membership_state(bot, channel_id, user_id, fresh=fresh)
+    return state == MEMBERSHIP_MEMBER
 
 
 def in_grace(join_ts: Optional[float], grace_minutes: int) -> bool:

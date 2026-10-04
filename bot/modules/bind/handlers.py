@@ -22,11 +22,14 @@ from bot.reply import reply_text
 
 from . import database as bdb
 from .checks import (
+    MEMBERSHIP_MEMBER,
+    MEMBERSHIP_UNKNOWN,
+    bot_can_verify,
     gate_enabled,
     in_grace,
     is_bot_admin,
-    is_channel_member,
     is_group_admin,
+    membership_state,
     message_gates,
     should_enforce,
 )
@@ -81,14 +84,14 @@ async def _resolve_channel(bot: Bot, ref: str):
 
 
 async def _bot_is_channel_admin(bot: Bot, chat) -> bool:
-    """Bot must be able to call getChatMember on the channel."""
-    try:
-        me = await bot.get_me()
-        member = await bot.get_chat_member(chat.id, me.id)
-        return member.status in ("administrator", "creator", "member")
-    except Exception:
-        # Some public channels allow member checks without admin — try anyway.
-        return True
+    """Can the bot call getChatMember on the chat we are about to bind?
+
+    Binding a chat the bot cannot check would arm a gate that can only
+    ever answer "not a member" — which is how a force-join ends up
+    deleting every message in the group.  Refuse up front instead, with
+    a fix the admin can act on.
+    """
+    return await bot_can_verify(bot, chat.id)
 
 
 def _channel_link(chat) -> Optional[str]:
@@ -153,10 +156,14 @@ async def bind_command(message: Message, bot: Bot, args: list, chat_data: dict) 
         return
 
     if not await _bot_is_channel_admin(bot, channel):
+        title = channel.title or (f"@{channel.username}" if channel.username else str(channel.id))
         await reply_text(
             message,
-            f"{E.ERROR} I can't check membership in that chat. "
-            "Add me as an admin of the channel (or make sure it's public).",
+            f"{E.ERROR} I can't read membership in <b>{escape(str(title))}</b>.\n\n"
+            "Add me to that chat as an <b>admin</b> (or make it public and add me), "
+            "then run <code>/bind</code> again. "
+            "I won't bind a chat I cannot check — a force-join that can't verify "
+            "members would have to guess, and guessing deletes messages.",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -373,8 +380,14 @@ async def gate_message_handler(message: Message, bot: Bot) -> None:
 
     # Membership check (cached unless we need a decision).
     channel_id = settings["channel_id"]
-    if await is_channel_member(bot, channel_id, user.id, fresh=False):
-        # Cache said member — allow. Also persist join for future grace math.
+    state = await membership_state(bot, channel_id, user.id, fresh=False)
+    if state == MEMBERSHIP_UNKNOWN:
+        # The bot cannot see the bound chat.  Deleting here would punish
+        # every member for a rights/config problem, so let the message
+        # through; bot_can_verify already logged the actionable warning.
+        return
+    if state == MEMBERSHIP_MEMBER:
+        # Allow, and persist the join for future grace math.
         await adb(bdb.record_join(chat_id, user.id))
         return
 

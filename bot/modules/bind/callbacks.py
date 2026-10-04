@@ -15,7 +15,13 @@ from aiogram.types import CallbackQuery, InlineKeyboardMarkup
 from bot.emojis import E
 
 from . import database as bdb
-from .checks import invalidate_cache, is_channel_member, is_group_admin
+from .checks import (
+    MEMBERSHIP_MEMBER,
+    MEMBERSHIP_UNKNOWN,
+    invalidate_cache,
+    is_group_admin,
+    membership_state,
+)
 from .config import (
     AUTO_DELETE_OPTIONS,
     GATE_LABELS,
@@ -48,8 +54,15 @@ logger = logging.getLogger(__name__)
 
 
 async def _safe_answer(query, text: str = "", alert: bool = False) -> None:
+    """Always answer — and never with an empty toast.
+
+    A callback left unanswered spins forever, and an empty toast looks
+    exactly like no answer at all.  Either way the button reads as dead,
+    which is the bug this replaced, so a blank ``text`` falls back to a
+    visible one rather than passing the blank straight through.
+    """
     try:
-        await query.answer(text, show_alert=alert)
+        await query.answer(text or "OK", show_alert=alert)
     except Exception:
         pass
 
@@ -69,11 +82,56 @@ async def _edit(query, text: str, reply_markup: Optional[InlineKeyboardMarkup]) 
 
 
 async def _deny_non_admin(query, bot, chat_id: int, user_id: int) -> bool:
-    """Return True (and silently answer) if the user is not a group admin."""
+    """Return True (and visibly answer) if the user is not a group admin.
+
+    The answer must never be empty: an unanswered callback looks exactly
+    like a dead button, which is the bug this replaced.
+    """
     if await is_group_admin(bot, chat_id, user_id):
         return False
-    await _safe_answer(query)
+    await _safe_answer(query, "Admins only.", alert=False)
     return True
+
+
+async def _handle_join(query, bot, chat_id: int, user_id: int) -> None:
+    """"I've Joined" — fresh membership check for an ordinary member.
+
+    Deliberately NOT an admin action: it runs before the admin gate so a
+    non-admin pressing it gets a real answer instead of a silent return.
+    """
+    settings = await adb(bdb.get_settings(chat_id))
+    if not settings or not settings.get("channel_id"):
+        await _safe_answer(query, "This group isn't bound to a channel yet.", alert=True)
+        return
+
+    channel_id = settings["channel_id"]
+    # Spec: force a fresh check, never trust the cache on this button.
+    invalidate_cache(channel_id, user_id)
+    state = await membership_state(bot, channel_id, user_id, fresh=True)
+
+    if state != MEMBERSHIP_MEMBER:
+        if state == MEMBERSHIP_UNKNOWN:
+            # The bot cannot see the bound channel — that is a rights
+            # problem for the admins to fix, not the presser's fault.
+            await _safe_answer(
+                query,
+                "I can't check that channel yet — ask an admin to add me to it.",
+                alert=True,
+            )
+        else:
+            await _safe_answer(query, "Still not a member of the channel.", alert=True)
+        return
+
+    # Persist join for grace bookkeeping going forward.
+    await adb(bdb.record_join(chat_id, user_id))
+    await _safe_answer(query, "Membership verified", alert=False)
+    try:
+        await query.message.edit_text(
+            f"{E.CHECK} You're a member — you can chat now.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
 
 
 def _menu_text(settings: Optional[Dict[str, Any]], group_title: str = "") -> str:
@@ -145,7 +203,15 @@ async def bind_callback(callback_query: CallbackQuery, bot: Bot, chat_data: dict
     action = parts[1] if len(parts) > 1 else "menu"
     payload = parts[2] if len(parts) > 2 else None
 
-    # Always re-verify admin membership for every callback.
+    # "I've Joined" is self-serve and runs BEFORE the admin gate: the
+    # person pressing it is exactly the ordinary member force-join exists
+    # for.  Behind the gate it used to get a silent no-op — a dead button
+    # — so record_join never ran and the gate kept deleting their messages.
+    if action == "join":
+        await _handle_join(query, bot, chat_id, user.id)
+        return
+
+    # Everything below reconfigures the group → group admins only.
     if await _deny_non_admin(query, bot, chat_id, user.id):
         return
 
@@ -163,7 +229,7 @@ async def bind_callback(callback_query: CallbackQuery, bot: Bot, chat_data: dict
 
     # ── Help / first-time ─────────────────────────────────
     if action == "help_bind":
-        await _safe_answer(query)
+        await _safe_answer(query, "Help")
         await _edit(query, help_bind_text(), bind_main_menu(settings, group_title=group_title))
         return
 
@@ -413,32 +479,8 @@ async def bind_callback(callback_query: CallbackQuery, bot: Bot, chat_data: dict
         await _edit(query, f"{E.CHECK} Group unbound. All gates disabled.", bind_main_menu(None, group_title=group_title))
         return
 
-    # ── I've Joined (fresh membership check) ──────────────
-    if action == "join":
-        settings = await adb(bdb.get_settings(chat_id))
-        if not settings or not settings.get("channel_id"):
-            await _safe_answer(query, "Not bound.", alert=True)
-            return
-
-        channel_id = settings["channel_id"]
-        # Spec: force fresh check, never trust cache on this button.
-        invalidate_cache(channel_id, user.id)
-        ok = await is_channel_member(bot, channel_id, user.id, fresh=True)
-
-        if ok:
-            # Persist join for grace bookkeeping going forward.
-            await adb(bdb.record_join(chat_id, user.id))
-            await _safe_answer(query, "Membership verified", alert=False)
-            try:
-                await query.message.edit_text(
-                    f"{E.CHECK} You're a member — you can chat now.",
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception:
-                pass
-        else:
-            await _safe_answer(query, "Still not a member of the channel.", alert=True)
-        return
+    # ── I've Joined ────────────────────────────────────────
+    # Handled above, before the admin gate.  Never reached here.
 
     # Unknown action
-    await _safe_answer(query)
+    await _safe_answer(query, "Unknown action.")

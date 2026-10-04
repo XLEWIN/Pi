@@ -134,6 +134,8 @@ HELP_MENU: list[dict] = [
                 "/unpin — Unpin messages",
                 "/adminlist — List all admins",
                 "/admincount — Count admins",
+                "/purge — Reply: delete up to that message (admin)",
+                "/spurge — Same as /purge but silent (admin)",
                 "/setchatphoto — Set chat photo (reply to a photo)",
                 "/setchatname — Set the chat title",
                 "/setchatdescription — Set the chat description",

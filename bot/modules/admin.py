@@ -4,11 +4,13 @@ Adapted from boa2's admin for Pi bot (python-telegram-bot).
 Success replies use bot.responses action cards (Pi emoji set).
 """
 
+import asyncio
 import logging
 from html import escape
 
 from aiogram import Bot
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters.logic import and_f
 from aiogram.types import Message
 
@@ -23,6 +25,8 @@ from bot.responses import (
     field_extra,
     field_title,
     field_user,
+    is_rights_error,
+    plain_error,
     reply_card,
 )
 
@@ -465,6 +469,182 @@ async def setchatdescription_command(message: Message, bot: Bot, args: list):
             parse_mode=ParseMode.HTML)
 
 
+# ============================================
+# PURGE / SPURGE  (from boa2, Pi-branded)
+# ============================================
+#
+# /purge   delete from the message you reply to, through the command,
+#          then post a card that removes itself (and the command) after
+#          _PURGE_CONFIRM_TTL seconds.
+# /spurge  identical range, but silent: nothing is announced, and the
+#          command message is deleted too.
+#
+# Both were carried over from boa2's admin module.  boa2 runs on
+# Pyrogram, where delete_messages() takes a list and ships it in one
+# round trip; the Bot API has no batch delete, so this walks the range
+# one id at a time and paces itself instead.
+
+#: Delete this many messages, then breathe — a burst of Bot API deletes
+#: trips flood control far sooner than Telegram's documented rate.
+_PURGE_CHUNK = 100
+_PURGE_PAUSE = 0.1
+#: Seconds the purge card stays before it removes itself and the command.
+_PURGE_CONFIRM_TTL = 10
+
+#: A refusal that applies to the WHOLE range (rights), not to one message
+#: (too old / already deleted).
+_FATAL_DELETE_MARKERS = (
+    "not enough rights",
+    "not enough permissions",
+    "have no rights",
+    "message can't be deleted",
+    "message cannot be deleted",
+    "chat admin required",
+    "bot is not a member",
+    "forbidden",
+)
+
+
+def _fatal_delete(exc: BaseException) -> bool:
+    """True when Telegram said 'you may not delete here at all'."""
+    if isinstance(exc, TelegramForbiddenError):
+        return True
+    if is_rights_error(exc):
+        return True
+    text = str(exc).lower()
+    return any(marker in text for marker in _FATAL_DELETE_MARKERS)
+
+
+async def _bot_can_delete(message: Message, bot: Bot) -> bool:
+    """True when the bot itself may delete messages in this chat."""
+    try:
+        member = await bot.get_chat_member(message.chat.id, bot.id)
+        if member.status not in ("administrator", "creator"):
+            return False
+        return bool(getattr(member, "can_delete_messages", True))
+    except Exception:
+        return False
+
+
+def _purge_ids(message: Message) -> list:
+    """Ids from the replied message up to (excluding) the command itself."""
+    start = message.reply_to_message.message_id
+    end = message.message_id
+    if start >= end:
+        # Replying to something at/after the command: purge that one only.
+        return [start]
+    return list(range(start, end))
+
+
+async def _delete_range(bot: Bot, chat_id: int, message_ids: list) -> tuple:
+    """Delete ``message_ids`` oldest-first; returns ``(deleted, fatal)``.
+
+    A single message that is too old or already gone is skipped so a
+    partial purge still reports honestly; a refusal that would apply to
+    the whole range stops the run so the caller can explain it instead
+    of claiming success.
+    """
+    deleted = 0
+    for index, mid in enumerate(message_ids, start=1):
+        try:
+            await bot.delete_message(chat_id, mid)
+            deleted += 1
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(getattr(e, "retry_after", 1) or 1)
+            try:
+                await bot.delete_message(chat_id, mid)
+                deleted += 1
+            except Exception as exc:
+                if _fatal_delete(exc):
+                    return deleted, exc
+        except Exception as exc:
+            if _fatal_delete(exc):
+                return deleted, exc
+        if index % _PURGE_CHUNK == 0:
+            await asyncio.sleep(_PURGE_PAUSE)
+    return deleted, None
+
+
+async def _run_purge(message: Message, bot: Bot, *, silent: bool) -> None:
+    usage = "spurge" if silent else "purge"
+
+    if not message or not message.chat or message.chat.type == "private":
+        if message:
+            await reply_text(message, f"{E.ERROR} This command only works in groups.",
+                parse_mode=ParseMode.HTML)
+        return
+
+    if message.chat.type != "supergroup":
+        await reply_text(message, plain_error("Cannot purge messages in a basic group."),
+            parse_mode=ParseMode.HTML)
+        return
+
+    if not await _is_admin(message, bot):
+        return
+
+    if not message.reply_to_message:
+        await reply_text(
+            message,
+            f"{E.ERROR} Reply to the message to start from.\n\n"
+            f"<b>Usage:</b> reply to a message with <code>/{usage}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if not await _bot_can_delete(message, bot):
+        await reply_text(message, bot_rights_error("delete messages", "Can Delete Messages"),
+            parse_mode=ParseMode.HTML)
+        return
+
+    deleted, fatal = await _delete_range(bot, message.chat.id, _purge_ids(message))
+    if fatal is not None:
+        logger.warning(f"purge aborted chat={message.chat.id} deleted={deleted}: {fatal}")
+        await reply_text(message, bot_rights_error("delete messages", "Can Delete Messages"),
+            parse_mode=ParseMode.HTML)
+        return
+
+    if silent:
+        # /spurge — the whole point is that nothing is left to read.
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        return
+
+    count = f"{deleted} message" if deleted == 1 else f"{deleted} messages"
+    sent = await reply_text(
+        message,
+        action_card(
+            "Purge Complete",
+            [
+                field_extra(E.CROSS, "Deleted", count),
+                field_by(message.from_user, "PURGED BY"),
+                field_extra(E.INFO, "Chat", escape(message.chat.title or "")),
+            ],
+            icon=E.CROSS,
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+
+    await asyncio.sleep(_PURGE_CONFIRM_TTL)
+    for target in (sent, message):
+        try:
+            if target is not None:
+                await target.delete()
+        except Exception:
+            pass
+
+
+async def purge_command(message: Message, bot: Bot) -> None:
+    """Handle /purge — delete from the replied message through this command."""
+    await _run_purge(message, bot, silent=False)
+
+
+async def spurge_command(message: Message, bot: Bot) -> None:
+    """Handle /spurge — silent purge: no confirmation, nothing left behind."""
+    await _run_purge(message, bot, silent=True)
+
+
 # ── Module setup ─────────────────────────────────────────
 def setup() -> list:
     """Register admin commands."""
@@ -478,5 +658,7 @@ def setup() -> list:
     on("message", setchatphoto_command, flt=and_f(cmd("setchatphoto"), GROUPS))
     on("message", setchatname_command, flt=and_f(cmd("setchatname"), GROUPS))
     on("message", setchatdescription_command, flt=and_f(cmd("setchatdescription"), GROUPS))
+    on("message", purge_command, flt=and_f(cmd("purge"), GROUPS))
+    on("message", spurge_command, flt=and_f(cmd("spurge"), GROUPS))
 
-    return ["promote", "demote", "pin", "unpin", "adminlist", "admins", "admincount", "setchatphoto", "setchatname", "setchatdescription"]
+    return ["promote", "demote", "pin", "unpin", "adminlist", "admins", "admincount", "setchatphoto", "setchatname", "setchatdescription", "purge", "spurge"]
