@@ -64,7 +64,10 @@ WAIT_CHANNEL = "bind_wait_channel"
 CB_PREFIX = "bind"
 
 # Indicator strings for menu rows.
-# Button labels are plain text — use only the owner's custom-emoji fallbacks
-# (✅ / ❌ from bot/emojis.py). Message HTML should use E.CHECK / E.ERROR instead.
-ON = "✅ ON"
-OFF = "❌ OFF"
+# Button labels are PLAIN TEXT: no emoji at all. The only emoji a bind
+# button may show is the owner's custom emoji, which Telegram renders
+# from the button's icon_custom_emoji_id — a Unicode emoji in the label
+# would be drawn from Telegram's stock set, not from the owner's pack.
+# Message HTML is different: use E.CHECK / E.ERROR / E.ANNOUNCE (<tg-emoji>).
+ON = "ON"
+OFF = "OFF"

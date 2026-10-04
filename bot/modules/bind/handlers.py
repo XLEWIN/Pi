@@ -267,12 +267,16 @@ async def bindmenu_command(message: Message, bot: Bot, chat_data: dict) -> None:
         )
         return
 
+    # Owner-brand emoji (<tg-emoji>) — never stock ✅/❌ in message HTML.
+    force_txt = f"{E.CHECK} ON" if settings.get("force_join") else f"{E.ERROR} OFF"
+    bypass_txt = f"{E.CHECK} ON" if settings.get("admin_bypass") else f"{E.ERROR} OFF"
+
     await reply_text(
         message,
         f"{E.SETTINGS} <b>Bind Menu</b>\n"
         f"{E.ANNOUNCE} {channel_display(settings)}\n"
-        f"Force Join <b>{'✅ ON' if settings.get('force_join') else '❌ OFF'}</b>\n"
-        f"Admin bypass <b>{'✅ ON' if settings.get('admin_bypass') else '❌ OFF'}</b>\n"
+        f"Force Join <b>{force_txt}</b>\n"
+        f"Admin bypass <b>{bypass_txt}</b>\n"
         f"Gates active: <b>{_active_gate_count(settings)}</b>\n"
         f"{E.CLOCK} Grace: <b>{format_grace(settings.get('grace_minutes') or 0)}</b> • "
         f"Auto-delete: <b>{settings.get('auto_delete_seconds') or 0}s</b>\n\n"

@@ -1,9 +1,10 @@
-"""Bind module keyboards — inline menus with owner brand emoji only.
+"""Bind module keyboards — inline menus with the owner's brand emoji only.
 
-Button labels are plain text, so they use only the fallback characters from
-the owner's custom set (bot/emojis.py). The visual brand icon comes from
-icon_emoji_id (EID.*). Message HTML must use E.* (<tg-emoji>), never stock
-Unicode outside that set.
+Button labels are PLAIN TEXT: they never carry a Unicode emoji.  A label
+emoji is drawn from Telegram's *stock* set, which is not the owner's pack,
+so every bind button shows the owner's custom emoji exclusively through
+``icon_emoji_id`` (EID.*).  Message HTML is the one place that can render
+the pack inline — use ``E.*`` (``<tg-emoji>``), never a bare stock emoji.
 """
 
 from typing import Any, Dict, List, Optional
@@ -34,7 +35,7 @@ def _back_close(extra_rows: Optional[List[List[InlineKeyboardButton]]] = None) -
     rows.append(
         [
             btn_primary("Back", f"{CB_PREFIX}:menu", icon_emoji_id=EID.INFO),
-            btn_danger("❌ Close", f"{CB_PREFIX}:close", icon_emoji_id=EID.CROSS),
+            btn_danger("Close", f"{CB_PREFIX}:close", icon_emoji_id=EID.CROSS),
         ]
     )
     return rows
@@ -42,7 +43,7 @@ def _back_close(extra_rows: Optional[List[List[InlineKeyboardButton]]] = None) -
 
 def _refresh_row() -> List[InlineKeyboardButton]:
     return [
-        btn_success("✔ Refresh", f"{CB_PREFIX}:refresh", icon_emoji_id=EID.CHECK),
+        btn_success("Refresh", f"{CB_PREFIX}:refresh", icon_emoji_id=EID.CHECK),
     ]
 
 
@@ -62,7 +63,7 @@ def bind_main_menu(settings: Optional[Dict[str, Any]], *, group_title: str = "")
             ],
             _refresh_row(),
             [
-                btn_danger("❌ Close", f"{CB_PREFIX}:close", icon_emoji_id=EID.CROSS),
+                btn_danger("Close", f"{CB_PREFIX}:close", icon_emoji_id=EID.CROSS),
             ],
         ]
         return build_keyboard(rows)
@@ -107,8 +108,8 @@ def bind_main_menu(settings: Optional[Dict[str, Any]], *, group_title: str = "")
         ],
         _refresh_row(),
         [
-            btn_danger("‼️ Unbind", f"{CB_PREFIX}:unbind", icon_emoji_id=EID.WARNING),
-            btn_danger("❌ Close", f"{CB_PREFIX}:close", icon_emoji_id=EID.CROSS),
+            btn_danger("Unbind", f"{CB_PREFIX}:unbind", icon_emoji_id=EID.WARNING),
+            btn_danger("Close", f"{CB_PREFIX}:close", icon_emoji_id=EID.CROSS),
         ],
     ]
     return build_keyboard(rows)
@@ -142,7 +143,7 @@ def grace_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
     for minutes in GRACE_OPTIONS:
         label = "OFF" if minutes == 0 else f"{minutes} min"
-        mark = " ✅" if minutes == current else ""
+        mark = " •" if minutes == current else ""
         icon = EID.CROSS if minutes == 0 else EID.CLOCK
         rows.append(
             [
@@ -162,7 +163,7 @@ def autodel_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
     for secs in AUTO_DELETE_OPTIONS:
         label = "OFF (keep)" if secs == 0 else f"{secs} sec"
-        mark = " ✅" if secs == current else ""
+        mark = " •" if secs == current else ""
         icon = EID.CROSS if secs == 0 else EID.TIME
         rows.append(
             [
@@ -201,11 +202,11 @@ def unbind_confirm_menu() -> InlineKeyboardMarkup:
     return build_keyboard(
         [
             [
-                btn_success("✅ Yes, Unbind", f"{CB_PREFIX}:unbind_yes", icon_emoji_id=EID.CHECK),
+                btn_success("Yes, Unbind", f"{CB_PREFIX}:unbind_yes", icon_emoji_id=EID.CHECK),
                 btn_primary("Keep Binding", f"{CB_PREFIX}:menu", icon_emoji_id=EID.INFO),
             ],
             [
-                btn_danger("❌ Cancel", f"{CB_PREFIX}:close", icon_emoji_id=EID.CROSS),
+                btn_danger("Cancel", f"{CB_PREFIX}:close", icon_emoji_id=EID.CROSS),
             ],
         ]
     )
@@ -215,7 +216,7 @@ def replace_confirm_menu() -> InlineKeyboardMarkup:
     return build_keyboard(
         [
             [
-                btn_success("✅ Replace", f"{CB_PREFIX}:replace_yes", icon_emoji_id=EID.CHECK),
+                btn_success("Replace", f"{CB_PREFIX}:replace_yes", icon_emoji_id=EID.CHECK),
                 btn_primary("Cancel", f"{CB_PREFIX}:menu", icon_emoji_id=EID.INFO),
             ]
         ]
@@ -229,7 +230,7 @@ def force_join_keyboard(channel_link: str, channel_title: str) -> InlineKeyboard
         rows.append(
             [
                 btn_url(
-                    "📣 Join Channel",
+                    "Join Channel",
                     channel_link,
                     icon_emoji_id=EID.ANNOUNCE,
                 )
@@ -238,7 +239,7 @@ def force_join_keyboard(channel_link: str, channel_title: str) -> InlineKeyboard
     rows.append(
         [
             btn_success(
-                "✅ I've Joined",
+                "I've Joined",
                 f"{CB_PREFIX}:join",
                 icon_emoji_id=EID.CHECK,
             )
