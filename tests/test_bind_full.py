@@ -506,6 +506,153 @@ class TestBindTimeVerification(_BoundBase):
         )
 
 
+def _expire_membership_cache() -> None:
+    """Age every cached membership answer out, keeping the history.
+
+    ``clear_cache()`` would also wipe ``_last_state``, which is exactly
+    what leave detection compares against — so age the entries instead
+    of dropping them, the way a real 15s TTL would.
+    """
+    import time as _time
+    for key, (is_member, _expires) in list(checks._member_cache.items()):
+        checks._member_cache[key] = (is_member, _time.monotonic() - 1)
+
+
+def _in_channel(bot: FakeBot, status: str) -> None:
+    bot.chat_members[(CHANNEL, USER)] = SimpleNamespace(
+        status=status, user=SimpleNamespace(id=USER)
+    )
+
+
+# ════════════════════════════════════════════════════════════════════
+# 5. Leaving the bound channel — the bot has to notice
+# ════════════════════════════════════════════════════════════════════
+
+class TestLeaveDetection(_BoundBase):
+    """Telegram never tells us someone left a channel, so the gate must.
+
+    The only observable moment is the next membership check the gate
+    makes.  From then on every message that user sends — text, photo,
+    sticker, anything — is deleted and they are asked to join again.
+    """
+
+    async def test_member_who_leaves_is_gated_on_their_next_message(self):
+        bot = _bot_can_delete(FakeBot())
+        _in_channel(bot, "member")
+
+        allowed = _gate_msg(message_id=5)
+        await call(gate_message_handler, allowed, bot=bot)
+        self.assertEqual(_msg_deleted(allowed), [], "a member must pass")
+        self.assertIsNotNone(bdb.get_join_time(CHAT, USER))
+
+        _in_channel(bot, "left")
+        _expire_membership_cache()
+
+        gated = _gate_msg(message_id=6)
+        await call(gate_message_handler, gated, bot=bot)
+
+        self.assertTrue(_msg_deleted(gated), "the leaver's message survived")
+        self.assertEqual(len(_warnings(bot)), 1, "they must be asked to join again")
+        self.assertIsNone(
+            bdb.get_join_time(CHAT, USER),
+            "the stale join stamp must be dropped or grace keeps letting them in",
+        )
+        self.assertFalse(
+            checks.pop_leave(CHANNEL, USER),
+            "the leave must be noticed exactly once, not on every message",
+        )
+
+    async def test_every_message_is_deleted_until_they_rejoin(self):
+        bot = _bot_can_delete(FakeBot())
+        _in_channel(bot, "left")
+
+        for i in range(3):
+            with self.subTest(attempt=i + 1):
+                msg = _gate_msg(message_id=10 + i)
+                await call(gate_message_handler, msg, bot=bot)
+                self.assertTrue(_msg_deleted(msg))
+
+        # …but only ONE prompt is ever on screen: each round replaces the
+        # previous card instead of stacking a new one per message.
+        self.assertEqual(len(_warnings(bot)), 3, "one send per gated message")
+        warn_ids = [i + 1 for i, e in enumerate(bot.sent) if "text" in e]
+        deletes = [e["delete"] for e in bot.sent if "delete" in e]
+        self.assertEqual(
+            deletes, [(CHAT, mid) for mid in warn_ids[:-1]],
+            "the previous prompts must be retired, not left to pile up",
+        )
+        self.assertEqual(
+            len(bdb.take_warnings(CHAT, USER)), 1,
+            "exactly one live force-join prompt",
+        )
+
+    async def test_media_and_stickers_are_gated_too(self):
+        """Any type of message or media — not just text."""
+        bot = _bot_can_delete(FakeBot())
+        _in_channel(bot, "left")
+
+        cases = (
+            {"text": None, "photo": object(), "caption": "a photo"},
+            {"text": None, "sticker": object(), "caption": None},
+            {"text": None, "voice": object(), "caption": None},
+            {"text": "/start", "photo": None, "caption": None},
+        )
+        for i, extra in enumerate(cases):
+            with self.subTest(kind=extra):
+                msg = _gate_msg(message_id=20 + i, **extra)
+                await call(gate_message_handler, msg, bot=bot)
+                self.assertTrue(_msg_deleted(msg), "non-text message survived")
+
+    async def test_rejoining_before_the_gate_notices_cancels_the_leave(self):
+        bot = FakeBot()
+        _in_channel(bot, "member")
+        self.assertEqual(await membership_state(bot, CHANNEL, USER), MEMBERSHIP_MEMBER)
+
+        _in_channel(bot, "left")
+        _expire_membership_cache()
+        self.assertEqual(await membership_state(bot, CHANNEL, USER), MEMBERSHIP_NOT_MEMBER)
+
+        _in_channel(bot, "member")
+        self.assertEqual(
+            await membership_state(bot, CHANNEL, USER, fresh=True),
+            MEMBERSHIP_MEMBER,
+        )
+        self.assertFalse(
+            checks.pop_leave(CHANNEL, USER),
+            "a user who rejoined must not be reported as having left",
+        )
+
+    async def test_a_lookup_we_cannot_complete_fails_open(self):
+        """A throttled/failed getChatMember is 'unknown', never 'left'."""
+        class _Throttled(FakeBot):
+            async def get_chat_member(self, chat_id, user_id):
+                if chat_id == CHANNEL and user_id != self.id:
+                    raise RuntimeError("Too Many Requests: retry after 0")
+                return await super().get_chat_member(chat_id, user_id)
+
+        bot = _bot_can_delete(_Throttled())
+        msg = _gate_msg()
+        await call(gate_message_handler, msg, bot=bot)
+
+        self.assertEqual(_msg_deleted(msg), [], "an unaskable check must not delete")
+        self.assertEqual(bot.sent, [], "and must not prompt either")
+
+    async def test_a_definitive_user_not_found_still_gates(self):
+        """'user not found' really does mean absent — the gate must fire."""
+        class _Absent(FakeBot):
+            async def get_chat_member(self, chat_id, user_id):
+                if chat_id == CHANNEL and user_id != self.id:
+                    raise RuntimeError("Bad Request: user not found")
+                return await super().get_chat_member(chat_id, user_id)
+
+        bot = _bot_can_delete(_Absent())
+        msg = _gate_msg()
+        await call(gate_message_handler, msg, bot=bot)
+
+        self.assertTrue(_msg_deleted(msg))
+        self.assertEqual(len(_warnings(bot)), 1)
+
+
 class TestShouldEnforce(unittest.TestCase):
     """Pure decision table — no I/O, no DB."""
 

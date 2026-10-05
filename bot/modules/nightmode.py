@@ -20,7 +20,7 @@ from aiogram.types import CallbackQuery, ChatPermissions, Message
 
 from bot.async_bridge import adb
 from bot.database import db
-from bot.emojis import E, EID
+from bot.emojis import E, EID, plain
 from bot.keyboards.colored import btn_danger, btn_success, build_keyboard
 from bot.logger import logger
 from bot.modules.security import _is_admin, _member_is_admin
@@ -177,7 +177,8 @@ async def nightmode_callback(query: CallbackQuery, bot: Bot) -> None:
     data = query.data or ""
     message = query.message
     if message is None or message.chat.type == "private":
-        await query.answer(f"{E.ERROR} Groups only.", show_alert=True)
+        # Toasts have no parse_mode — strip the <tg-emoji> markup first.
+        await query.answer(plain(f"{E.ERROR} Groups only."), show_alert=True)
         return
     user = query.from_user
     if (
@@ -189,7 +190,7 @@ async def nightmode_callback(query: CallbackQuery, bot: Bot) -> None:
     enable = data == "nm:on"
     await adb(db.set_nightmode(message.chat.id, enable))
     await query.answer(
-        f"{E.CHECK} Nightmode {'enabled' if enable else 'disabled'}."
+        plain(f"{E.CHECK} Nightmode {'enabled' if enable else 'disabled'}.")
     )
     try:
         await message.edit_text(

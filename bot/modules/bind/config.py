@@ -11,8 +11,18 @@ WAITING_TEXT_GROUP = 20
 # Separate group so join tracking never collides with welcome (group=10).
 JOIN_TRACKER_GROUP = 11
 
-# Membership cache TTL (spec: 30–60s; "I've Joined" bypasses cache).
-MEMBERSHIP_CACHE_TTL = 45
+# Membership cache TTL, in seconds.
+#
+# This is also the leave-detection window: Telegram never pushes a "user
+# left the channel" event, so the gate only finds out when it re-checks on
+# the next message.  Any message sent inside this window after leaving can
+# therefore still slip through — keep it short.  15s bounds the damage to
+# a single stray message while still collapsing bursts (two messages from
+# the same user in quick succession cost one getChatMember call).
+#
+# The "I've Joined" button always bypasses the cache, so rejoining is
+# honoured immediately regardless of this value.
+MEMBERSHIP_CACHE_TTL = 15
 
 # Grace period options in minutes (0 = OFF).
 GRACE_OPTIONS = (0, 1, 5, 10, 15, 30, 60)

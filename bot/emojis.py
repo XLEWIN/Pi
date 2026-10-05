@@ -41,6 +41,8 @@ Custom emoji IDs provided by owner:
 
 import random
 import logging
+import re
+from html import unescape
 from typing import Optional, List, Dict, Tuple
 
 logger = logging.getLogger("pi.emojis")
@@ -331,6 +333,37 @@ def custom_emoji(emoji_char: str, custom_emoji_id: str) -> str:
     if not custom_emoji_id:
         return emoji_char
     return f'<tg-emoji emoji-id="{custom_emoji_id}">{emoji_char}</tg-emoji>'
+
+
+# Markup Telegram can only render in an HTML-parsed message.  Everywhere
+# else — most importantly answerCallbackQuery, which accepts NO
+# parse_mode at all — it is shown character for character:
+#
+#     <tg-emoji emoji-id="5904248647972820334">💭</tg-emoji> You're ...
+#
+_TG_EMOJI_RE = re.compile(
+    r"<tg-emoji[^>]*>(.*?)</tg-emoji>", re.IGNORECASE | re.DOTALL
+)
+_A_LINK_RE = re.compile(r"<a[^>]*>(.*?)</a>", re.IGNORECASE | re.DOTALL)
+_TAG_RE = re.compile(
+    r"</?(?:b|i|u|s|code|pre|strong|em|mark|span|tg-spoiler|blockquote)>",
+    re.IGNORECASE,
+)
+
+
+def plain(value: str) -> str:
+    """The same text with every scrap of HTML markup removed.
+
+    Use it anywhere the payload has no ``parse_mode``: callback toasts
+    (``query.answer``), log lines, file names, console output.  The
+    owner's custom emoji degrades to its stock fallback character, which
+    is the best a toast can do — the alternative is leaking the raw tag.
+    """
+    text = _TG_EMOJI_RE.sub(r"\1", str(value))
+    text = _A_LINK_RE.sub(r"\1", text)
+    text = _TAG_RE.sub("", text)
+    return unescape(text)
+
 
 
 def get_emoji_from_category(category: str) -> Tuple[str, str]:

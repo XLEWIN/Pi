@@ -1792,9 +1792,14 @@ async def setrules_command(message: Message, bot: Bot, args: list):
         if replied_text:
             chat_id = message.chat.id
             rules_db[chat_id] = {"text": replied_text}
-            await reply_text(message, 
+            # Escaped *after* slicing so a cut entity can't leave the
+            # parser with an unbalanced tag.
+            preview = escape(replied_text[:500])
+            await reply_text(
+                message,
                 f"{E.CHECK} Rules copied from the replied message!\n\n"
-                f"<b>Preview:</b>\n{replied_text[:500]}{'...' if len(replied_text) > 500 else ''}"
+                f"<b>Preview:</b>\n{preview}{'...' if len(replied_text) > 500 else ''}",
+                parse_mode=ParseMode.HTML,
             )
             return
 
@@ -1811,9 +1816,12 @@ async def setrules_command(message: Message, bot: Bot, args: list):
     chat_id = message.chat.id
     rules_db[chat_id] = {"text": rules_text}
 
-    await reply_text(message, 
+    preview = escape(rules_text[:500])
+    await reply_text(
+        message,
         f"{E.CHECK} Rules updated successfully!\n\n"
-        f"<b>Preview:</b>\n{rules_text[:500]}{'...' if len(rules_text) > 500 else ''}"
+        f"<b>Preview:</b>\n{preview}{'...' if len(rules_text) > 500 else ''}",
+        parse_mode=ParseMode.HTML,
     )
 
 

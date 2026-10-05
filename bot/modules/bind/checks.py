@@ -2,7 +2,7 @@
 
 import logging
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 from aiogram.enums import ChatMemberStatus
 from aiogram.types import Message, User
@@ -30,6 +30,17 @@ _bot_verify_cache: Dict[int, Tuple[bool, float]] = {}
 BOT_VERIFY_OK_TTL = 300.0
 BOT_VERIFY_FAIL_TTL = 60.0
 
+# Leave detection.  Telegram sends no update when someone leaves a
+# channel, so the only place a leave can be noticed is the next
+# membership check the gate performs.  We therefore remember the last
+# non-unknown answer we gave about each (channel, user) and raise a
+# one-shot flag when it flips member -> not_member.
+_last_state: Dict[Tuple[int, int], str] = {}
+#: (channel_id, user_id) with a leave not yet consumed by the gate.
+_leave_pending: Set[Tuple[int, int]] = set()
+#: Match the size guard on _member_cache so neither grows without bound.
+_MAX_TRACKED = 5000
+
 
 def invalidate_cache(channel_id: int, user_id: int) -> None:
     _member_cache.pop((channel_id, user_id), None)
@@ -38,6 +49,48 @@ def invalidate_cache(channel_id: int, user_id: int) -> None:
 def clear_cache() -> None:
     _member_cache.clear()
     _bot_verify_cache.clear()
+    _last_state.clear()
+    _leave_pending.clear()
+
+
+def pop_leave(channel_id: int, user_id: int) -> bool:
+    """True exactly once after membership flipped member → not_member.
+
+    The gate calls this on every deletion decision: a freshly noticed
+    leave has to drop the stored join stamp (otherwise the grace window
+    computed from an old join keeps letting the leaver through) and is
+    worth a log line.  Consumed on read, so someone who sends ten
+    messages after leaving only trips it once.
+    """
+    key = (channel_id, user_id)
+    if key not in _leave_pending:
+        return False
+    _leave_pending.discard(key)
+    logger.info(
+        "bind: user %s left channel %s — gating their messages in the "
+        "group until they rejoin",
+        user_id, channel_id,
+    )
+    return True
+
+
+def _remember(channel_id: int, user_id: int, state: str) -> str:
+    """Record ``state`` and raise the leave flag on member → not_member."""
+    key = (channel_id, user_id)
+    if len(_last_state) > _MAX_TRACKED:
+        # A leave flag that can't be remembered is simply not noticed;
+        # losing history beats unbounded growth in the hottest handler.
+        _last_state.clear()
+        _leave_pending.clear()
+    previous = _last_state.get(key)
+    _last_state[key] = state
+    if state == MEMBERSHIP_NOT_MEMBER:
+        if previous == MEMBERSHIP_MEMBER:
+            _leave_pending.add(key)
+    else:
+        # Rejoined before the gate got around to noticing the leave.
+        _leave_pending.discard(key)
+    return state
 
 
 def _cache_put(channel_id: int, user_id: int, is_member: bool) -> None:
@@ -110,44 +163,83 @@ async def bot_can_verify(bot, channel_id: int) -> bool:
     return ok
 
 
+#: Error text that really does mean "this person is not in that chat".
+#: Everything else that makes the call fail means *we could not ask* —
+#: rate limits, network drops, lost rights — and must not be read as
+#: absence, or one throttled lookup deletes a whole group's messages.
+_ABSENT_MARKERS = (
+    "user not found",
+    "user_not_found",
+    "not a participant",
+    "user_not_participant",
+    "participant_id_invalid",
+)
+
+
 async def fetch_channel_member(bot, channel_id: int, user_id: int) -> Tuple[str, bool]:
-    """Fetch raw status + pass/fail for a user in the bound channel."""
+    """Fetch raw status + pass/fail for a user in the bound channel.
+
+    Returns ``(status, is_member)``.  ``status`` is Telegram's own value
+    for a real answer, or ``MEMBERSHIP_UNKNOWN`` when the question could
+    not be answered at all — see :data:`_ABSENT_MARKERS` for why the
+    distinction matters.
+    """
     try:
         member = await bot.get_chat_member(channel_id, user_id)
-        status = member.status
-        if status in PASS_STATUSES:
-            return status, True
-        if status in FAIL_STATUSES:
-            return status, False
-        # Unknown/new status — treat non-left/kicked as member only if listed.
-        return status, status in PASS_STATUSES
     except Exception as e:
-        # User not found / not a member / channel inaccessible.
-        logger.debug(f"channel member check failed ({channel_id}/{user_id}): {e}")
-        return "left", False
+        text = str(e).lower()
+        if any(marker in text for marker in _ABSENT_MARKERS):
+            logger.debug(f"channel member check ({channel_id}/{user_id}): {e}")
+            return "left", False
+        logger.warning(
+            f"bind: could not ask Telegram about {user_id} in {channel_id} — "
+            f"treating as unknown rather than absent ({e})"
+        )
+        return MEMBERSHIP_UNKNOWN, False
+    status = member.status
+    if status in PASS_STATUSES:
+        return status, True
+    if status in FAIL_STATUSES:
+        return status, False
+    # Unknown/new status — only a listed status counts as membership.
+    return status, False
 
 
 async def membership_state(bot, channel_id: int, user_id: int, *, fresh: bool = False) -> str:
-    """``member`` / ``not_member`` / ``unknown`` with a 30–60s cache.
+    """``member`` / ``not_member`` / ``unknown`` with a short cache.
 
     ``fresh=True`` bypasses the per-user cache (the "I've Joined" button
     must never trust it).  ``unknown`` short-circuits before any caching:
     a failed probe says nothing about the user, so it must never poison
     the cache either.
+
+    Every resolved answer is run through :func:`_remember`, which is what
+    turns "the next check says not a member" into a *noticed leave* —
+    see :func:`pop_leave`.
     """
     if not await bot_can_verify(bot, channel_id):
         return MEMBERSHIP_UNKNOWN
     if not fresh:
         cached = _cache_get(channel_id, user_id)
         if cached is not None:
-            return MEMBERSHIP_MEMBER if cached else MEMBERSHIP_NOT_MEMBER
-    _, ok = await fetch_channel_member(bot, channel_id, user_id)
+            return _remember(
+                channel_id, user_id,
+                MEMBERSHIP_MEMBER if cached else MEMBERSHIP_NOT_MEMBER,
+            )
+    status, ok = await fetch_channel_member(bot, channel_id, user_id)
+    if status == MEMBERSHIP_UNKNOWN:
+        # Could not ask.  Not cached (it says nothing about the user) and
+        # not remembered as a leave — the gate fails open for this message.
+        return MEMBERSHIP_UNKNOWN
     _cache_put(channel_id, user_id, ok)
-    return MEMBERSHIP_MEMBER if ok else MEMBERSHIP_NOT_MEMBER
+    return _remember(
+        channel_id, user_id,
+        MEMBERSHIP_MEMBER if ok else MEMBERSHIP_NOT_MEMBER,
+    )
 
 
 async def is_channel_member(bot, channel_id: int, user_id: int, *, fresh: bool = False) -> bool:
-    """Membership check with 30–60s cache. fresh=True bypasses cache."""
+    """Membership check with the short cache. fresh=True bypasses cache."""
     state = await membership_state(bot, channel_id, user_id, fresh=fresh)
     return state == MEMBERSHIP_MEMBER
 

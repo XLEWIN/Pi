@@ -31,6 +31,7 @@ from .checks import (
     is_group_admin,
     membership_state,
     message_gates,
+    pop_leave,
     should_enforce,
 )
 from .config import PLACEHOLDERS_HELP
@@ -312,14 +313,26 @@ def _gate_state(chat_id: int, user_id: int):
     return settings, bdb.get_join_time(chat_id, user_id)
 
 
-def _record_gate_fail(chat_id: int, user_id: int) -> None:
-    """Blocking counter bumps — MUST run in a worker thread."""
+def _record_gate_fail(chat_id: int, user_id: int) -> list:
+    """Blocking gate bookkeeping — MUST run in a worker thread.
+
+    Bumps the failure counters and returns the message ids of any
+    force-join prompt already on screen for this user, so the caller can
+    delete them first.  Without that sweep every message a non-member
+    sends stacks another "join the channel" card in the group.
+    """
     try:
         from bot.database import db as _pdb
         _pdb.bump_bind_fails(chat_id, 1)
         _pdb.record_reputation_event(user_id, "warning", 1)
     except Exception as e:
         logger.debug(f"bind fail counter: {e}")
+    try:
+        # Hybrid: resolves to a plain list inside a worker thread.
+        return bdb.take_warnings(chat_id, user_id) or []
+    except Exception as e:
+        logger.debug(f"bind warning sweep: {e}")
+        return []
 
 
 async def gate_message_handler(message: Message, bot: Bot) -> None:
@@ -391,8 +404,23 @@ async def gate_message_handler(message: Message, bot: Bot) -> None:
         await adb(bdb.record_join(chat_id, user.id))
         return
 
-    # Not a member → gate: delete + warn.
-    await asyncio.to_thread(_record_gate_fail, chat_id, user.id)
+    # Not a member → gate: delete + ask them to join again.
+    stale_warnings = await asyncio.to_thread(_record_gate_fail, chat_id, user.id)
+
+    # A freshly noticed channel leave must drop the stored join stamp.
+    # Grace is computed from that stamp, so a user who leaves while the
+    # window is still open would otherwise keep chatting until it closed;
+    # clearing it also means a later rejoin starts a fresh window.
+    if pop_leave(channel_id, user.id):
+        await adb(bdb.clear_join(chat_id, user.id))
+
+    # Replace last round's prompt rather than stacking a fresh card on
+    # every message someone sends while gated.
+    for mid in stale_warnings:
+        try:
+            await bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
 
     if not await is_bot_admin(bot, chat_id):
         # Can't delete; still try to warn once (best effort).
@@ -419,8 +447,8 @@ async def gate_message_handler(message: Message, bot: Bot) -> None:
         channel_link=channel_link or "the channel",
     )
 
-    # Avoid spamming: delete previous warning for this user if still tracked? Keep simple —
-    # send new warning; optional auto-delete below.
+    # The prompt is tracked so the next gated message can replace it
+    # (see _record_gate_fail) and so auto_delete can retire it.
     try:
         warning = await bot.send_message(
             chat_id=chat_id,

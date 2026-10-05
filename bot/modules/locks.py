@@ -23,7 +23,7 @@ from aiogram.types import CallbackQuery, Message
 
 from bot.async_bridge import adb
 from bot.database import db
-from bot.emojis import E
+from bot.emojis import E, plain
 from bot.keyboards.colored import btn_default, build_keyboard
 from bot.logger import logger
 from bot.modules.security import _is_admin
@@ -263,8 +263,10 @@ async def locktypes_command(message: Message, bot: Bot, args: list):
 async def locktype_callback(query: CallbackQuery) -> None:
     lock_type = (query.data or "").split(":", 1)[1]
     description = LOCKABLES.get(lock_type, "No description available.")
+    # answerCallbackQuery has no parse_mode — plain() drops the markup so
+    # the toast never shows "<tg-emoji emoji-id=…>" instead of the emoji.
     await query.answer(
-        text=f"{E.MUTE} {lock_type.capitalize()} Lock:\n{description}",
+        text=plain(f"{E.MUTE} {lock_type.capitalize()} Lock:\n{description}"),
         show_alert=True,
     )
 

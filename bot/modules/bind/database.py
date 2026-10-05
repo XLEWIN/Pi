@@ -430,3 +430,31 @@ async def _remove_warning(chat_id: int, message_id: int) -> None:
 def remove_warning(chat_id: int, message_id: int):
     """Hybrid: ``await adb(remove_warning(chat_id, message_id))`` on the bot loop."""
     return box(_remove_warning(chat_id, message_id))
+
+
+async def _take_warnings(chat_id: int, user_id: int) -> List[int]:
+    """Delete every tracked force-join warning for this user, return their ids.
+
+    The gate calls this before sending a new prompt: someone who keeps
+    talking after leaving the channel gets *one* live "join the channel"
+    card — replaced each time — rather than a fresh card per message.
+    """
+    try:
+        rows = await adb(_db._find(
+            "bind_warnings",
+            {"chat_id": chat_id, "user_id": user_id},
+        ))
+        ids = [int(r["message_id"]) for r in (rows or []) if r.get("message_id")]
+        if ids:
+            await adb(_db.collection("bind_warnings").delete_many(
+                {"chat_id": chat_id, "user_id": user_id}
+            ))
+        return ids
+    except Exception as e:
+        logger.error(f"bind take_warnings({chat_id},{user_id}): {e}")
+        return []
+
+
+def take_warnings(chat_id: int, user_id: int):
+    """Hybrid: ``await adb(take_warnings(chat_id, user_id))`` on the bot loop."""
+    return box(_take_warnings(chat_id, user_id))
