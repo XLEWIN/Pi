@@ -14,7 +14,7 @@ from aiogram.filters.logic import and_f
 from aiogram.types import Message
 
 from bot.database import db
-from bot.emojis import E
+from bot.emojis import E, plain
 from bot.pipeline import on, GROUPS, cmd
 from bot.reply import reply_text
 from bot.async_bridge import adb
@@ -188,6 +188,68 @@ def _format_entities(
     return new_text, out
 
 
+def _sanitize_entities(text: str, entities) -> List[Dict[str, Any]]:
+    """Drop entities Telegram would reject against THIS text.
+
+    Stored entities are only valid against the text they were saved
+    with.  A placeholder swap, a later ``/setwelcome``, or an entity that
+    merely points past the end of the stored template makes Telegram
+    answer ``ENTITY_TEXT_INVALID`` — and because the send is
+    all-or-nothing, one bad span took the whole welcome with it.
+
+    Apply it twice: once to ``(template, stored_entities)`` to discard
+    anything that no longer fits the stored text, then again to the
+    rendered result.  Out-of-bounds spans and entities missing the
+    payload they need are dropped; of two spans that only *partly*
+    overlap, the later one goes (nesting stays legal).  Losing a bold
+    run beats losing the welcome.
+    """
+    limit = _utf16_len(text)
+    kept: List[Dict[str, Any]] = []
+    for ent in entities or []:
+        if not isinstance(ent, dict):
+            try:
+                ent = ent.model_dump(mode="json", exclude_none=True)
+            except Exception:
+                continue
+        try:
+            offset = int(ent.get("offset", -1))
+            length = int(ent.get("length", 0))
+        except (TypeError, ValueError):
+            continue
+        if length <= 0 or offset < 0 or offset + length > limit:
+            continue
+        kind = ent.get("type")
+        if kind == "custom_emoji" and not ent.get("custom_emoji_id"):
+            continue
+        if kind == "text_mention" and not ent.get("user"):
+            continue
+        if kind == "expandable_blockquote" and (
+            offset != 0 or offset + length != limit
+        ):
+            # Telegram only accepts an expandable quote over the WHOLE
+            # message; any placeholder swap breaks that span.
+            continue
+        kept.append({**ent, "offset": offset, "length": length})
+
+    kept.sort(key=lambda e: (e["offset"], -e["length"]))
+    out: List[Dict[str, Any]] = []
+    for ent in kept:
+        start, end = ent["offset"], ent["offset"] + ent["length"]
+        clash = False
+        for other in out:
+            o_start, o_end = other["offset"], other["offset"] + other["length"]
+            if start < o_end and o_start < end:            # they overlap
+                inside = o_start <= start and end <= o_end
+                covers = start <= o_start and o_end <= end
+                if not (inside or covers):                 # partial only
+                    clash = True
+                    break
+        if not clash:
+            out.append(ent)
+    return out
+
+
 def _serialize_entities(entities) -> Optional[List[Dict[str, Any]]]:
     """JSON-safe copy of a message's entities for storage (Mongo-safe)."""
     if not entities:
@@ -249,33 +311,72 @@ async def _send_template(
     *,
     fallback: str,
 ) -> Optional[int]:
-    """Send a welcome/goodbye, preserving custom-emoji entities when stored."""
+    """Send a welcome/goodbye, preserving custom-emoji entities when stored.
+
+    Three tiers, each one guaranteed to be able to send:
+
+    1. an exact replay of the saved source (premium emoji intact) —
+       its entities are validated first so one stale span cannot take
+       the whole message down with ``ENTITY_TEXT_INVALID``;
+    2. HTML, which is what the admin saw in ``/welcome``;
+    3. plain text, which Telegram accepts whatever the template holds.
+
+    A welcome must never be *lost*: every tier that can fail does fail
+    loudly, and the last one cannot.
+    """
     if not template:
         template = fallback
+
+    # Pass 1: the stored spans must fit the stored template.  A span that
+    # used to be in range and no longer is is stale data — `_format_entities`
+    # would silently stretch it over the whole result, which is exactly the
+    # kind of span Telegram rejects with ENTITY_TEXT_INVALID.
+    if entities:
+        entities = _sanitize_entities(template, entities)
 
     if entities:
         try:
             text, ents = _format_entities(
                 template, _values(user, chat, html=False), entities, mention_user=user
             )
-            sent = await bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                entities=ents,
-                disable_web_page_preview=True,
-            )
-            return sent.message_id
+            # Pass 2: the remapped spans must fit the rendered message.
+            ents = _sanitize_entities(text, ents)
+            if ents:
+                sent = await bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    entities=ents,
+                    disable_web_page_preview=True,
+                )
+                return sent.message_id
         except Exception as e:
             # Never lose the welcome: fall through to the HTML path.
             logger.warning(f"entity welcome send failed, falling back to HTML: {e}")
 
-    sent = await bot.send_message(
-        chat_id=chat_id,
-        text=format_welcome(template, user, chat),
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-    )
-    return sent.message_id
+    html_text = format_welcome(template, user, chat)
+    try:
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            text=html_text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        return sent.message_id
+    except Exception as e:
+        # Unbalanced/unknown tags in an admin-written template are the
+        # usual cause; plain text can always be delivered.
+        logger.warning(f"HTML welcome send failed, falling back to plain: {e}")
+
+    try:
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            text=plain(html_text),
+            disable_web_page_preview=True,
+        )
+        return sent.message_id
+    except Exception as e:
+        logger.error(f"welcome send failed entirely: {e}")
+    return None
 
 
 # ── Command handlers ─────────────────────────────────────

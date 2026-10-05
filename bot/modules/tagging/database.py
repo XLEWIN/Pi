@@ -159,20 +159,28 @@ def upsert_member(
         {"first_seen": 1, "left_at": 1, "_id": 0},
     )
     if row is None:
-        coll.insert_one(
-            {
-                "chat_id": chat_id,
-                "user_id": user_id,
-                "username": username,
-                "display_name": display_name,
-                "is_bot": int(is_bot),
-                "first_seen": ts,
-                "last_seen": ts,
-                "last_active_at": active_at,
-                "left_at": None,
-            }
-        )
-        return
+        try:
+            coll.insert_one(
+                {
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "username": username,
+                    "display_name": display_name,
+                    "is_bot": int(is_bot),
+                    "first_seen": ts,
+                    "last_seen": ts,
+                    "last_active_at": active_at,
+                    "left_at": None,
+                }
+            )
+            return
+        except Exception as e:
+            if "E11000" not in str(e) and "duplicate" not in str(e).lower():
+                raise
+            # A racing writer won the find_one → insert_one window (two
+            # joins in one service message, or the activity batch).  The
+            # unique index did its job; fall through to the update path.
+            row = {"left_at": None}
     sets: Dict[str, Any] = {"last_seen": ts}
     if username is not None:
         sets["username"] = username

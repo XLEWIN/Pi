@@ -16,6 +16,11 @@ Two bugs fixed together because they share the same root cause class —
    only accepts the signed ``-100xxxxxxxxxx`` form.  The sign is restored
    before giving up (and ``t.me/c/…`` links are parsed properly).
 
+4. ``Bad Request: ENTITY_TEXT_INVALID`` — a stored entity pointing past
+   the text it is replayed against rejected the whole send, so the
+   welcome silently vanished.  Entities are validated first, and the
+   send degrades entity → HTML → plain text so a welcome is never lost.
+
 Environment isolation (BEFORE any bot import):
     * BOT_TOKEN is forced — bot.config exits without one.
     * unittest is already imported -> bot.database always selects
@@ -50,6 +55,7 @@ from bot.modules.bind.utils import parse_channel_ref  # noqa: E402
 from bot.modules.welcome import (  # noqa: E402
     _command_body,
     _format_entities,
+    _sanitize_entities,
     _send_template,
     _slice_entities,
     _utf16_len,
@@ -188,6 +194,116 @@ class SendTemplateTest(unittest.TestCase):
         asyncio.run(_send_template(bot, 1, "", None, _User(), _Chat(),
                                    fallback="Hey {first}"))
         self.assertIn("Hey FakeD3v", bot.calls[0]["text"])
+
+
+class SanitizeEntitiesTest(unittest.TestCase):
+    """One stale span must not be able to reject the whole send.
+
+    ``Bad Request: ENTITY_TEXT_INVALID`` is all-or-nothing: a stored
+    entity pointing past the end of the text it is replayed against
+    killed the welcome entirely.
+    """
+
+    def test_in_bounds_span_survives(self):
+        text = "Hello there"
+        ents = _sanitize_entities(text, [{"type": "bold", "offset": 0, "length": 5}])
+        self.assertEqual(ents, [{"type": "bold", "offset": 0, "length": 5}])
+
+    def test_span_past_the_end_is_dropped(self):
+        ents = _sanitize_entities("hi", [{"type": "bold", "offset": 0, "length": 50}])
+        self.assertEqual(ents, [])
+
+    def test_negative_offset_and_empty_span_are_dropped(self):
+        ents = _sanitize_entities("hello", [
+            {"type": "bold", "offset": -3, "length": 2},
+            {"type": "italic", "offset": 2, "length": 0},
+        ])
+        self.assertEqual(ents, [])
+
+    def test_counting_is_in_utf16_units(self):
+        # astral char = 2 UTF-16 units, so offset 0 length 4 is in bounds
+        text = "\U0001F600ab"
+        ents = _sanitize_entities(text, [{"type": "bold", "offset": 0, "length": 4}])
+        self.assertEqual(len(ents), 1)
+        # …but one unit further is not
+        ents = _sanitize_entities(text, [{"type": "bold", "offset": 0, "length": 5}])
+        self.assertEqual(ents, [])
+
+    def test_partial_overlap_drops_the_later_span(self):
+        ents = _sanitize_entities("abcdefghij", [
+            {"type": "bold", "offset": 0, "length": 6},
+            {"type": "italic", "offset": 4, "length": 4},   # straddles the end
+        ])
+        self.assertEqual([e["type"] for e in ents], ["bold"])
+
+    def test_full_nesting_is_kept(self):
+        ents = _sanitize_entities("abcdefghij", [
+            {"type": "bold", "offset": 0, "length": 10},
+            {"type": "italic", "offset": 2, "length": 4},
+        ])
+        self.assertEqual(len(ents), 2)
+
+    def test_custom_emoji_without_an_id_is_dropped(self):
+        ents = _sanitize_entities("ab", [
+            {"type": "custom_emoji", "offset": 0, "length": 1},
+        ])
+        self.assertEqual(ents, [])
+
+    def test_expandable_blockquote_must_cover_the_whole_message(self):
+        ents = _sanitize_entities("hello world", [
+            {"type": "expandable_blockquote", "offset": 0, "length": 5},
+        ])
+        self.assertEqual(ents, [])
+        ents = _sanitize_entities("hello world", [
+            {"type": "expandable_blockquote", "offset": 0, "length": 11},
+        ])
+        self.assertEqual(len(ents), 1)
+
+
+class _PlainOnlyBot:
+    """Accepts only a payload with neither entities nor parse_mode."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def send_message(self, **kwargs):
+        if kwargs.get("entities"):
+            raise RuntimeError("Bad Request: ENTITY_TEXT_INVALID")
+        if kwargs.get("parse_mode"):
+            raise RuntimeError("Bad Request: Can't parse entities")
+        self.calls.append(kwargs)
+        return SimpleNamespace(message_id=7)
+
+
+class SendNeverLosesTheWelcomeTest(unittest.TestCase):
+    def test_out_of_bounds_entities_go_straight_to_html(self):
+        bot = _SendBot()
+        msg_id = asyncio.run(_send_template(
+            bot, 1, "hey {username}",
+            [{"type": "bold", "offset": 0, "length": 99}],
+            _User(), _Chat(), fallback="bye"))
+        self.assertEqual(msg_id, 99)
+        # no entity attempt at all: the first (and only) send is HTML
+        self.assertNotIn("entities", bot.calls[0])
+        self.assertEqual(bot.calls[0]["parse_mode"], "HTML")
+
+    def test_plain_tier_delivers_when_everything_else_is_rejected(self):
+        """The tier that cannot fail — a welcome is never lost."""
+        bot = _PlainOnlyBot()
+        msg_id = asyncio.run(_send_template(
+            bot, 1, "hey {username}", None, _User(), _Chat(), fallback="bye"))
+        self.assertEqual(msg_id, 7)
+        self.assertEqual(len(bot.calls), 1)
+        sent = bot.calls[0]
+        self.assertNotIn("parse_mode", sent)
+        self.assertNotIn("entities", sent)
+        self.assertEqual(sent["text"], "hey @FakeD3v")
+
+    def test_plain_tier_strips_html_from_the_template(self):
+        bot = _PlainOnlyBot()
+        asyncio.run(_send_template(
+            bot, 1, "<b>Hi</b> {first}", None, _User(), _Chat(), fallback="bye"))
+        self.assertEqual(bot.calls[0]["text"], "Hi FakeD3v")
 
 
 class _FakeBot:
