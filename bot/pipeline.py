@@ -7,13 +7,19 @@ This module bridges the two:
 * ``on(event, fn, group=..., flt=...)`` queues a registration exactly like
   ``Application.add_handler`` did (same ordering rules).
 * ``install(dp)`` registers everything on a Dispatcher, sorted by
-  (first-seen group rank, registration order).
+  **numeric group** (PTB stores handlers in ``{group: [...]}`` and walks
+  ``sorted(...)``) and then registration order inside the group.
 * Every callback is wrapped so that it raises ``SkipHandler`` after a
   successful run: the observer then continues with the next matching
   handler â€” reproducing "all groups run".  Handler exceptions are
   logged/persisted and the chain continues (PTB ``process_error`` parity).
+* A handler that must stop *every* later handler for this update raises
+  :class:`StopChain`; ``_wrap`` then returns normally, which is aiogram's
+  own "first match wins" signal.  The force-join gate uses it so a
+  blocked message can never reach a command handler, an XP tracker or a
+  message counter.
  * A data filter injects ``bot_data`` (process-global) and ``chat_data``
-   (per-chat) into the handler kwargs of handlers that declare them.
+  (per-chat) into the handler kwargs of handlers that declare them.
 """
 
 from __future__ import annotations
@@ -30,7 +36,7 @@ from aiogram.filters import Filter
 from bot.command_handler import COMMAND, CommandFilter, MultiPrefixCommand, cmd, parse_command
 
 __all__ = [
-    "on", "install", "clear", "snapshot", "entries",
+    "on", "install", "clear", "snapshot", "entries", "StopChain",
     "cmd", "COMMAND", "CommandFilter", "MultiPrefixCommand", "parse_command",
     "GROUPS", "PRIVATE", "SERVICE", "BOT_DATA", "chat_data_for",
 ]
@@ -74,6 +80,24 @@ def chat_data_for(event: Any) -> Dict[str, Any]:
     return _CHAT_DATA.setdefault(key, {})
 
 
+class StopChain(Exception):
+    """Raise from a handler to stop *every* later handler for this update.
+
+    aiogram's observer stops at the first handler that returns normally
+    and only continues when the handler raises ``SkipHandler``.  ``_wrap``
+    converts a normal run into ``SkipHandler`` (PTB "all groups run"), so
+    a plain ``return`` from a handler can never stop the chain - but a
+    handler that must make the update vanish completely raises this
+    instead.  ``_wrap`` then returns normally, which is aiogram's own stop
+    signal.
+
+    The force-join gate is the motivating case: a message from someone who
+    has not joined the bound channel must be deleted *and* must never
+    reach a command handler (which would answer it), a counter (which
+    would count it) or an XP tracker.
+    """
+
+
 class _DataFilter(Filter):
     """Injects bot_data + chat_data into every handler call."""
 
@@ -97,7 +121,6 @@ class Entry:
 
 
 _QUEUE: List[Entry] = []
-_GROUP_RANK: Dict[int, int] = {}
 _SEQ = 0
 
 
@@ -109,8 +132,6 @@ def on(event: str, fn: Callable[..., Any], *, group: int = 0, flt: Any = None) -
         "my_chat_member", "chat_join_request",
     ):
         raise ValueError(f"unsupported pipeline event: {event!r}")
-    if group not in _GROUP_RANK:
-        _GROUP_RANK[group] = len(_GROUP_RANK)
     _QUEUE.append(Entry(event=event, fn=fn, group=group, flt=flt,
                         seq=_SEQ, module=fn.__module__))
     _SEQ += 1
@@ -121,13 +142,21 @@ def clear() -> None:
     """Drop the queue (tests / load_modules)."""
     global _SEQ
     _QUEUE.clear()
-    _GROUP_RANK.clear()
     _SEQ = 0
 
 
 def snapshot() -> List[Entry]:
-    """Dispatch order: PTB first-seen group rank, then registration order."""
-    return sorted(_QUEUE, key=lambda e: (_GROUP_RANK[e.group], e.seq))
+    """Dispatch order: PTB walks ``sorted(handlers)`` — numeric group,
+    then registration order inside the group.
+
+    This must be the *number*, not first-registration order: every module
+    in this codebase documents its position by number ("filters=1,
+    blocklist=2, watchwords=3 -> bind=4", "Group 4 (leveling is 5)"), and
+    those comments are only true when the sort is numeric.  It also lets a
+    pipeline place itself *before* group 0 with a negative number, which
+    is how the force-join gate runs ahead of every command.
+    """
+    return sorted(_QUEUE, key=lambda e: (e.group, e.seq))
 
 
 def entries() -> List[Entry]:
@@ -145,6 +174,13 @@ def _wrap(fn: Callable) -> Callable:
             await fn(*args, **kwargs)
         except SkipHandler:
             raise
+        except StopChain:
+            # A normal return is aiogram's own "stop, first match wins".
+            # Returning here makes observer.trigger() hand back None
+            # instead of UNHANDLED, so no later group ever sees this
+            # update.  Must be caught before the blanket Exception below,
+            # or StopChain would be reported as a handler error.
+            return None
         except Exception as err:  # noqa: BLE001 — PTB process_error parity
             from bot.errors import report_handler_error
             report_handler_error(args[0] if args else None, err)

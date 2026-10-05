@@ -688,6 +688,12 @@ async def new_member_handler(message: Message, bot: Bot):
     settings = await adb(db.get_welcome_settings(chat_id))
 
     if not settings.get("welcome_enabled", True):
+        # Loud enough to answer "why isn't it welcoming?" from the log
+        # alone - the toggle lives in /welcome and is easy to forget.
+        logger.info(
+            "welcome: skipped for chat %s - welcome_enabled is OFF (/welcome on)",
+            chat_id,
+        )
         return
 
     msg_data = await adb(db.get_welcome_message(chat_id))
@@ -724,6 +730,16 @@ async def new_member_handler(message: Message, bot: Bot):
             )
             if msg_id:
                 await adb(db.update_last_welcome_msg(chat_id, msg_id))
+                logger.info(
+                    "welcome: sent to chat %s for user %s (message %s)",
+                    chat_id, user.id, msg_id,
+                )
+            else:
+                logger.error(
+                    "welcome: no tier delivered for chat %s user %s - "
+                    "check send rights in the group",
+                    chat_id, user.id,
+                )
         except Exception as e:
             logger.warning(f"Welcome message error: {e}")
 

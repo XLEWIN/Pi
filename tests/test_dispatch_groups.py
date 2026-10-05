@@ -16,10 +16,14 @@ counters entirely.
 The bot now runs on aiogram through bot.pipeline: registrations are
 queued with PTB's group numbers and dispatch order, and every handler
 wrapper raises SkipHandler so the chain continues to the next matching
-handler — reproducing "all groups run".  This test loads the real
-modules through bot.loader (production order) and replays dispatch over
-fake messages.  If anyone puts two message pipelines back into the same
-group, or breaks the chain semantics, it fails.
+handler — reproducing "all groups run".  A handler may raise
+``pipeline.StopChain`` instead, which _wrap converts into a normal
+return so the update ends right there (used by the force-join gate, which
+must run before group 0).  Groups are dispatched in NUMERIC order, never
+in registration order.  This test loads the real modules through
+bot.loader (production order) and replays dispatch over fake messages.
+If anyone puts two message pipelines back into the same group, or breaks
+the chain semantics, it fails.
 
 Environment isolation (BEFORE any bot import):
     * BOT_TOKEN is forced — importing `bot` pulls bot.config, which
@@ -181,14 +185,19 @@ def asyncio_run(coro):
 
 # ── _wrap contract + real-Dispatcher chain ─────────────────────────
 class TestWrapChain(unittest.TestCase):
-    """_wrap must ALWAYS raise SkipHandler.
+    """_wrap raises SkipHandler, except when the handler says STOP.
 
     aiogram's observer stops at the first handler that returns normally
     and only continues on SkipHandler. If _wrap returned after a
     successful run, the first matching observer (a no-filter hook like
     adminbox_message) would starve every later group — counting, flood
-    watch, trackers — while commands kept working. Both success and
-    error paths must therefore skip, PTB "all groups run" style.
+    watch, trackers — while commands kept working. Success and error
+    paths therefore skip, PTB "all groups run" style.
+
+    The one deliberate exception is ``pipeline.StopChain``: a handler
+    that raises it must come back as a normal return so the observer
+    ends the update for good. That is what lets the force-join gate
+    (group -1) refuse a non-member before group 0 commands ever run.
     """
 
     def test_wrap_success_still_skips(self):
@@ -205,6 +214,31 @@ class TestWrapChain(unittest.TestCase):
         with self.assertRaises(SkipHandler):
             asyncio_run(w())
         self.assertEqual(ran, ["ran"], "handler body must execute first")
+
+    def test_wrap_stop_chain_returns_normally(self):
+        """StopChain must become a plain return, NOT a SkipHandler."""
+        from aiogram.dispatcher.event.bases import SkipHandler
+
+        from bot.pipeline import StopChain, _wrap
+
+        ran = []
+
+        async def gate_handler():
+            ran.append("gate")
+            raise StopChain
+
+        w = _wrap(gate_handler)
+        try:
+            result = asyncio_run(w())
+        except SkipHandler:                      # pragma: no cover
+            self.fail(
+                "StopChain was turned back into SkipHandler - the update "
+                "would keep running through every later group",
+            )
+        self.assertEqual(ran, ["gate"], "handler body must execute first")
+        self.assertIsNone(
+            result, "_wrap must swallow StopChain and return None",
+        )
 
     def test_wrap_error_reports_and_skips(self):
         from aiogram.dispatcher.event.bases import SkipHandler

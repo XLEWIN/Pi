@@ -18,6 +18,7 @@ from aiogram.enums import ParseMode
 from aiogram.types import Message
 
 from bot.emojis import E
+from bot.pipeline import StopChain
 from bot.reply import reply_text
 
 from . import database as bdb
@@ -422,14 +423,20 @@ async def gate_message_handler(message: Message, bot: Bot) -> None:
         except Exception:
             pass
 
-    if not await is_bot_admin(bot, chat_id):
-        # Can't delete; still try to warn once (best effort).
-        pass
-    else:
+    if await is_bot_admin(bot, chat_id):
         try:
             await message.delete()
         except Exception as e:
             logger.debug(f"bind delete failed: {e}")
+    else:
+        # Not fatal - the prompt still goes out and the chain is still
+        # stopped - but this is the one misconfiguration that makes
+        # force-join look "off" while it is on, so make it loud.
+        logger.warning(
+            "bind: could not delete message %s in %s - I need to be a "
+            "group admin with 'Delete messages' to enforce force-join",
+            message.message_id, chat_id,
+        )
 
     channel_title = settings.get("channel_title") or (
         f"@{settings['channel_username']}" if settings.get("channel_username") else str(channel_id)
@@ -464,6 +471,12 @@ async def gate_message_handler(message: Message, bot: Bot) -> None:
             spawn(_auto_delete(bot, chat_id, warning.message_id, delay))
     except Exception as e:
         logger.warning(f"bind warning send failed: {e}")
+
+    # End the dispatch chain for this update.  The message is gated: no
+    # command handler may answer it, no counter may count it, no tracker
+    # may award XP for it.  Returning normally would let every later group
+    # run as if the message were allowed.
+    raise StopChain
 
 
 async def _auto_delete(bot: Bot, chat_id: int, message_id: int, delay: int) -> None:

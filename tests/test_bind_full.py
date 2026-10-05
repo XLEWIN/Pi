@@ -66,6 +66,7 @@ from bot.modules.bind.checks import (  # noqa: E402
 )
 from bot.modules.bind.config import AUTO_DELETE_OPTIONS, GRACE_OPTIONS  # noqa: E402
 from bot.modules.bind.handlers import bind_command, gate_message_handler  # noqa: E402
+from bot.pipeline import StopChain  # noqa: E402
 
 # Unique ids so parallel bind tests never collide on CHANNEL_TAKEN.
 CHAT = -1007711011
@@ -152,6 +153,22 @@ def _msg_deleted(msg) -> list:
 
 def _warnings(bot) -> list:
     return [e for e in bot.sent if "text" in e]
+
+
+async def call_gate(msg, bot):
+    """Run the gate the way production runs it: a block ends the chain.
+
+    ``gate_message_handler`` raises ``pipeline.StopChain`` when it
+    refuses a message, and ``pipeline._wrap`` converts that into a plain
+    return so the observer stops dispatching the update.  These tests
+    call the handler directly, so swallow it here - the assertions are
+    all about the observable side effects (deleted / prompted / passed).
+    """
+    try:
+        await gate_message_handler(msg, bot=bot)
+    except StopChain:
+        return "stopped"
+    return "allowed"
 
 
 class _BoundBase(unittest.IsolatedAsyncioTestCase):
@@ -394,7 +411,7 @@ class TestGateHandler(_BoundBase):
             status="member", user=SimpleNamespace(id=USER)
         )
         msg = _gate_msg()
-        await call(gate_message_handler, msg, bot=bot)
+        await call_gate(msg, bot=bot)
 
         self.assertEqual(_msg_deleted(msg), [])
         self.assertEqual(bot.sent, [])
@@ -404,7 +421,7 @@ class TestGateHandler(_BoundBase):
         """No rights to check → no deletions. The original complaint."""
         bot = _bot_can_delete(_BlindBot())
         msg = _gate_msg()
-        await call(gate_message_handler, msg, bot=bot)
+        await call_gate(msg, bot=bot)
 
         self.assertEqual(_msg_deleted(msg), [], "a blind bot must not delete messages")
         self.assertEqual(bot.sent, [], "no warning either — nothing is provable")
@@ -415,7 +432,7 @@ class TestGateHandler(_BoundBase):
             status="left", user=SimpleNamespace(id=USER)
         )
         msg = _gate_msg()
-        await call(gate_message_handler, msg, bot=bot)
+        await call_gate(msg, bot=bot)
 
         self.assertTrue(_msg_deleted(msg), "the non-member message survived")
         warns = _warnings(bot)
@@ -428,7 +445,7 @@ class TestGateHandler(_BoundBase):
             status="left", user=SimpleNamespace(id=USER)
         )
         msg = _gate_msg()
-        await call(gate_message_handler, msg, bot=bot)
+        await call_gate(msg, bot=bot)
 
         self.assertEqual(_msg_deleted(msg), [], "no delete rights → do not try")
         self.assertEqual(len(_warnings(bot)), 1)
@@ -437,7 +454,7 @@ class TestGateHandler(_BoundBase):
         bdb.remove_binding(CHAT)
         bot = _bot_can_delete(FakeBot())
         msg = _gate_msg()
-        await call(gate_message_handler, msg, bot=bot)
+        await call_gate(msg, bot=bot)
         self.assertEqual(_msg_deleted(msg), [])
         self.assertEqual(bot.sent, [])
 
@@ -448,7 +465,7 @@ class TestGateHandler(_BoundBase):
             status="left", user=SimpleNamespace(id=USER)
         )
         msg = _gate_msg()
-        await call(gate_message_handler, msg, bot=bot)
+        await call_gate(msg, bot=bot)
 
         self.assertEqual(_msg_deleted(msg), [])
         self.assertEqual(bot.sent, [])
@@ -459,7 +476,7 @@ class TestGateHandler(_BoundBase):
             status="left", user=SimpleNamespace(id=777)
         )
         msg = _gate_msg(user_id=777, is_bot=True)
-        await call(gate_message_handler, msg, bot=bot)
+        await call_gate(msg, bot=bot)
         self.assertEqual(_msg_deleted(msg), [])
         self.assertEqual(bot.sent, [])
 
@@ -541,7 +558,7 @@ class TestLeaveDetection(_BoundBase):
         _in_channel(bot, "member")
 
         allowed = _gate_msg(message_id=5)
-        await call(gate_message_handler, allowed, bot=bot)
+        await call_gate(allowed, bot=bot)
         self.assertEqual(_msg_deleted(allowed), [], "a member must pass")
         self.assertIsNotNone(bdb.get_join_time(CHAT, USER))
 
@@ -549,7 +566,7 @@ class TestLeaveDetection(_BoundBase):
         _expire_membership_cache()
 
         gated = _gate_msg(message_id=6)
-        await call(gate_message_handler, gated, bot=bot)
+        await call_gate(gated, bot=bot)
 
         self.assertTrue(_msg_deleted(gated), "the leaver's message survived")
         self.assertEqual(len(_warnings(bot)), 1, "they must be asked to join again")
@@ -569,7 +586,7 @@ class TestLeaveDetection(_BoundBase):
         for i in range(3):
             with self.subTest(attempt=i + 1):
                 msg = _gate_msg(message_id=10 + i)
-                await call(gate_message_handler, msg, bot=bot)
+                await call_gate(msg, bot=bot)
                 self.assertTrue(_msg_deleted(msg))
 
         # …but only ONE prompt is ever on screen: each round replaces the
@@ -600,7 +617,7 @@ class TestLeaveDetection(_BoundBase):
         for i, extra in enumerate(cases):
             with self.subTest(kind=extra):
                 msg = _gate_msg(message_id=20 + i, **extra)
-                await call(gate_message_handler, msg, bot=bot)
+                await call_gate(msg, bot=bot)
                 self.assertTrue(_msg_deleted(msg), "non-text message survived")
 
     async def test_rejoining_before_the_gate_notices_cancels_the_leave(self):
@@ -632,7 +649,7 @@ class TestLeaveDetection(_BoundBase):
 
         bot = _bot_can_delete(_Throttled())
         msg = _gate_msg()
-        await call(gate_message_handler, msg, bot=bot)
+        await call_gate(msg, bot=bot)
 
         self.assertEqual(_msg_deleted(msg), [], "an unaskable check must not delete")
         self.assertEqual(bot.sent, [], "and must not prompt either")
@@ -647,7 +664,7 @@ class TestLeaveDetection(_BoundBase):
 
         bot = _bot_can_delete(_Absent())
         msg = _gate_msg()
-        await call(gate_message_handler, msg, bot=bot)
+        await call_gate(msg, bot=bot)
 
         self.assertTrue(_msg_deleted(msg))
         self.assertEqual(len(_warnings(bot)), 1)

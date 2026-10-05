@@ -39,18 +39,19 @@ def setup() -> list[str]:
     # Callbacks.
     on("callback_query", bind_callback, flt=F.data.regexp(re.compile(rf"^{CB_PREFIX}:")))
 
-    # Force-join / message gates — own group so we never collide with
-    # filters(1)/blocklist(2)/watchwords(3). Do NOT exclude commands: when
-    # force_join is on, non-member commands should be gated too (start.py
-    # already ran in group 0 if it matched; we still delete the message).
-    # StatusUpdate is a factory class — negate its ALL member, not the type.
+    # Force-join / message gates.  Group -1: the gate must dispatch
+    # BEFORE group 0 so a blocked message never reaches a command handler
+    # (a non-member's /help would otherwise answer them), a counter or an
+    # XP tracker.  On a block it raises pipeline.StopChain, which ends the
+    # whole chain for that update.  Do NOT exclude commands: when
+    # force_join is on, non-member commands are gated too.  StatusUpdate
+    # is a factory class - negate its ALL member, not the type.
     on("message", gate_message_handler, group=HANDLER_GROUP, flt=GROUPS & ~SERVICE)
 
-    # Waiting-for-input text (custom message / change channel) — own
-    # group (20, NOT HANDLER_GROUP+1=5: that collides with leveling's
-    # XP tracker and one-handler-per-group means the first registered
-    # wins). Still created right after the gates (group 4), so it runs
-    # after they've deleted non-member messages; admins only anyway.
+    # Waiting-for-input text (custom message / change channel) - own
+    # group 20 (not 0: that would race every command; not a low number:
+    # the waiting admin's text must only be consumed once the gate has
+    # decided it is allowed through).  Admins only anyway.
     on("message", waiting_text_handler, group=WAITING_TEXT_GROUP, flt=and_f(GROUPS, F.text, ~COMMAND))
 
     # Join timestamps for grace period (welcome uses group=10).

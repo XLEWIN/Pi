@@ -1,12 +1,18 @@
 """Bind module configuration — constants, gate labels, defaults."""
 
-# MessageHandler group: filters=1, blocklist=2, watchwords=3 → bind=4
-HANDLER_GROUP = 4
+# Force-join / message-gate enforcement.
+#
+# NEGATIVE, so it dispatches before group 0 and therefore before every
+# command handler, every counter and every XP tracker.  The gate does two
+# things when it blocks: it deletes the message, and it raises
+# bot.pipeline.StopChain so nothing later in the chain (help menus,
+# leaderboards, flood state, message counts) ever sees the update.  It
+# still sits clear of filters(1)/blocklist(2)/watchwords(3), which run
+# after it and simply never fire for a gated message.
+HANDLER_GROUP = -1
 # Waiting-text input. Was HANDLER_GROUP + 1 = 5, which collided with
-# leveling's XP tracker (group 5) — PTB runs ONE handler per group and
-# bind loads before leveling, so XP never ran in groups. 20 is free
-# (tagging tops out at 17); created right after group 4, so it still
-# runs after the gates.
+# leveling's XP tracker (group 5).  20 is free (tagging tops out at 17);
+# comfortably after the gate, so non-member text never reaches it.
 WAITING_TEXT_GROUP = 20
 # Separate group so join tracking never collides with welcome (group=10).
 JOIN_TRACKER_GROUP = 11
