@@ -37,6 +37,7 @@ from bot.command_handler import COMMAND, CommandFilter, MultiPrefixCommand, cmd,
 
 __all__ = [
     "on", "install", "clear", "snapshot", "entries", "StopChain",
+    "is_service_update",
     "cmd", "COMMAND", "CommandFilter", "MultiPrefixCommand", "parse_command",
     "GROUPS", "PRIVATE", "SERVICE", "BOT_DATA", "chat_data_for",
 ]
@@ -61,9 +62,21 @@ _SERVICE_FIELDS = (
     "video_chat_started", "video_chat_ended", "video_chat_participants_invited",
     "write_access_allowed", "story", "passport_data",
 )
-SERVICE = F.func(
-    lambda m: any(getattr(m, f, None) for f in _SERVICE_FIELDS)
-)
+
+
+def is_service_update(message: Any) -> bool:
+    """True when *message* is a Telegram StatusUpdate (join/leave/pin/...).
+
+    Reusable as a plain predicate so handlers can guard themselves even if
+    their registration filter is ever widened — a status update is not chat
+    activity, and running a "block this message" pipeline over one would
+    delete the notice itself and starve every handler that needs it
+    (welcome/goodbye both read the join message).
+    """
+    return any(getattr(message, f, None) for f in _SERVICE_FIELDS)
+
+
+SERVICE = F.func(is_service_update)
 
 # â”€â”€ chat_data / bot_data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #: Process-global bot_data (PTB application.bot_data).

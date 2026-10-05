@@ -13,6 +13,24 @@ Structure follows Forge's /data command pattern:
 * ``_safe_edit`` mirrors Forge's ``_safe_edit_message``: brand first,
   plain (emoji-stripped) fallback, "message is not modified" ignored.
 
+Renderers
+---------
+There are TWO renderers for the same content:
+
+* **Rich** (default, ``HELP_RICH``) — Bot API 10.1+ Rich Messages via
+  ``bot/rich.py``: H1/H2/H3 headings, a real ``RichBlockTable`` for the
+  command grid (no NBSP column padding), dividers, footers and the
+  module grid as in-message ``RichBlockButtons``.
+* **HTML** — the original renderer, kept as the automatic fallback and
+  reachable by setting ``HELP_RICH = False``.
+
+Both share ONE paginator (``_module_chunks`` yields
+``(header, rendered, raw, kind)``), so ``sub`` in the callback data
+indexes the same page on either path — a rich→HTML fallback can never
+show a different page than it started on, and the HTML fallback is
+handed the FULL module keyboard (on the rich path that grid lives in
+the body instead).
+
 Page note: module sections are greedily packed into sub-pages
 (``_module_chunks``) so every page stays comfortably short to read
 (1024 visible characters), and the module keyboard shows < / > when a
@@ -43,6 +61,7 @@ from bot.constants import BOT_DESCRIPTION, HELP_MENU, START_TEXT
 from bot.pipeline import cmd, on
 from bot.reply import reply_text
 from bot.emojis import E, EID
+from bot import rich as R
 from bot.keyboards.colored import (
     btn_danger,
     btn_default,
@@ -51,6 +70,12 @@ from bot.keyboards.colored import (
     build_keyboard,
 )
 from bot.logger import logger
+
+#: Render the menu with Bot API 10.1+ Rich Messages (structured blocks,
+#: real headings, a real table grid, in-message buttons).  Set to False
+#: to force the legacy HTML renderer — every page still works either way
+#: because a rich failure falls back to HTML automatically.
+HELP_RICH = True
 
 _TG_EMOJI_RE = re.compile(r'<tg-emoji emoji-id="\d+">.*?</tg-emoji>')
 _EMOJI_ID_RE = re.compile(r'emoji-id="(\d+)"')
@@ -202,13 +227,22 @@ def _module_header(mod: dict, sub: int, total: int) -> list[str]:
     ]
 
 
-def _module_chunks(mod: dict) -> list[list[tuple[str | None, list[str]]]]:
+def _module_chunks(
+    mod: dict,
+) -> list[list[tuple[str | None, list[str], list[str], str]]]:
     """Greedily pack sections (+ notes) so each page fits one caption.
 
     Budget uses the widest possible header (worst-case page indicator +
     the grid column-header row), and command bodies are measured in
     their RENDERED grid form, so no rendered page can exceed
     CAPTION_LIMIT visible characters.
+
+    Each entry is ``(header, rendered_rows, raw_lines, kind)`` where
+    ``kind`` is ``"section"`` or ``"notes"``.  The rendered rows drive
+    the HTML message, the raw lines drive the Rich Message table — both
+    come out of ONE packer so ``sub`` in the callback data means the
+    same page on either path, and a rich→HTML fallback can never show a
+    different page than it started on.
     """
     width = _module_width(mod)
     worst_header = "\n".join(_module_header(mod, 99, 99))
@@ -216,23 +250,29 @@ def _module_chunks(mod: dict) -> list[list[tuple[str | None, list[str]]]]:
         worst_header += "\n" + _col_header(width)
     budget = CAPTION_LIMIT - _visible_len(worst_header) - _CAPTION_SLACK
 
-    pages: list[list[tuple[str | None, list[str]]]] = [[]]
+    pages: list[list[tuple[str | None, list[str], list[str], str]]] = [[]]
     used = 0
 
-    def push(header: str | None, body: list[str]) -> None:
+    def push(header: str | None, raw: list[str], kind: str) -> None:
         nonlocal used
+        # Notes are prose and go in as-is; only command rows get the
+        # <code>|description grid treatment (matches pre-rich output).
+        body = (
+            list(raw)
+            if kind == "notes"
+            else [_grid_row(*_split_row(line), width) for line in raw]
+        )
         size = _visible_len("\n".join(([header] if header else []) + body)) + 1
         if pages[-1] and used + size > budget:
             pages.append([])
             used = 0
-        pages[-1].append((header, body))
+        pages[-1].append((header, body, raw, kind))
         used += size
 
     for header, cmds in mod["sections"]:
-        # Render now so budget == rendered size (NBSP padding counts).
-        push(header, [_grid_row(*_split_row(line), width) for line in cmds])
+        push(header, list(cmds), "section")
     if mod["notes"]:
-        push(None, list(mod["notes"]))
+        push(None, list(mod["notes"]), "notes")
     return pages
 
 
@@ -248,7 +288,7 @@ def _build_module_message(mod: dict, sub: int) -> str:
     width = _module_width(mod)
     lines = _module_header(mod, sub + 1, total)
     wrote_col_header = False
-    for header, body in pages[sub]:
+    for header, body, _raw, _kind in pages[sub]:
         lines.append("")
         if header:
             lines.append(f"<b>{escape(header)}</b>")
@@ -267,6 +307,128 @@ def _build_start_message(username: str) -> str:
         description=BOT_DESCRIPTION,
         arrow=E.ARROW,
     )
+
+
+# ── Rich Message builders (Bot API 10.1+) ───────────────────────
+#
+# Rich Messages are NOT HTML: no parse_mode, no <b>/<code>.  Every line
+# from HELP_MENU (authored as HTML) goes through R.html_to_rich, which
+# unwraps tags, unescapes entities and converts <tg-emoji> into a real
+# custom-emoji node.  The command grid becomes a RichBlockTable with a
+# real header row — no NBSP padding, the table aligns the columns.
+
+def _rich_title(icon_html: str, title: str, size: int) -> dict:
+    """Heading block carrying the module's custom-emoji icon + title."""
+    return R.heading(R.html_to_rich(f"{icon_html} {escape(title)}"), size)
+
+
+def _rich_grid(raw: list[str]) -> dict:
+    """``/cmd args — Description`` lines → one RichBlockTable."""
+    rows: list[list[dict]] = [
+        [R.cell("Command", header=True), R.cell("Description", header=True)]
+    ]
+    for line in raw:
+        left, right = _split_row(line)
+        rows.append([
+            R.cell(R.code(R.strip_html(left))),
+            R.cell(R.html_to_rich(right) if right else " "),
+        ])
+    return R.table(rows)
+
+
+def _rich_main_blocks(page: int) -> list[dict]:
+    """Main menu: H1 title, metadata paragraphs, 3-wide module grid, footer."""
+    page = _clamp_page(page)
+    mods = HELP_MENU[page * PAGE_SIZE : (page + 1) * PAGE_SIZE]
+    footer_text = (
+        f"Page {page + 1}/{_page_count()} · tap CLOSE to dismiss"
+        if _page_count() > 1
+        else "tap CLOSE to dismiss"
+    )
+    blocks: list[dict] = [
+        _rich_title(E.INFO, "Help Menu", 1),
+        R.paragraph(R.html_to_rich(
+            f"{E.FOLDER} Modules: {len(HELP_MENU)} · "
+            f"Page {page + 1}/{_page_count()}"
+        )),
+        R.paragraph(R.html_to_rich(
+            f"{E.SPARKLE} Prefixes: / ! . # $ % &amp; ? — e.g. !help"
+        )),
+        R.divider(),
+        R.paragraph(R.html_to_rich(
+            f"{E.ARROW} Pick a module to browse its commands"
+        )),
+        R.heading(R.html_to_rich(f"{E.FOLDER} Modules"), 2),
+    ]
+    for i in range(0, len(mods), COLS):
+        blocks.append(
+            R.buttons_block(
+                [
+                    R.button(
+                        mod["title"],
+                        callback_data=f"{_CB}:open:{mod['key']}:{page}:0",
+                        style="primary",
+                    )
+                    for mod in mods[i : i + COLS]
+                ],
+                align="left",
+            )
+        )
+    blocks.append(R.divider())
+    blocks.append(R.footer(R.html_to_rich(footer_text)))
+    return blocks
+
+
+def _rich_module_blocks(mod: dict, sub: int) -> list[dict]:
+    """Module page: H1 title, metadata, H3 section headings + table grid."""
+    pages = _module_chunks(mod)
+    total = len(pages)
+    sub = max(0, min(sub, total - 1))
+    count = sum(len(cmds) for _, cmds in mod["sections"])
+    first_cmd = (mod["sections"][0][1][0] or "/help").split()[0].lstrip("/")
+
+    blocks: list[dict] = [
+        _rich_title(mod["icon"], mod["title"], 1),
+        R.paragraph(R.html_to_rich(f"{E.FOLDER} Commands: {count}")),
+        R.paragraph(R.html_to_rich(
+            f"{E.SPARKLE} Prefixes: / ! . # $ % &amp; ? — e.g. !{first_cmd}"
+        )),
+        R.divider(),
+    ]
+    for header, _body, raw, kind in pages[sub]:
+        if kind == "notes":
+            for note in raw:
+                blocks.append(R.paragraph(R.html_to_rich(note)))
+            continue
+        if header:
+            blocks.append(R.heading(R.html_to_rich(escape(header)), 3))
+        if raw:
+            blocks.append(_rich_grid(raw))
+
+    footer_text = (
+        f"Page {sub + 1}/{total} · tap BACK for the menu"
+        if total > 1
+        else "tap BACK to return to the menu"
+    )
+    blocks.append(R.divider())
+    blocks.append(R.footer(R.html_to_rich(footer_text)))
+    return blocks
+
+
+def _rich_group_blocks(username: str) -> list[dict]:
+    """The group stub: one heading, one line, one deep-link button."""
+    return [
+        _rich_title(E.INFO, "Help Menu", 1),
+        R.paragraph(R.html_to_rich(
+            f"{E.USER} Detail: Browse every command in the bot's DM"
+        )),
+        R.paragraph(R.html_to_rich(f"{E.ARROW} Tap the button below to continue")),
+        R.divider(),
+        R.buttons_block(
+            [R.button("Open in DM", url=f"https://t.me/{username}?start=help")],
+            align="center",
+        ),
+    ]
 
 
 # ── Keyboards (colored, Bot API 9.4+ styling) ────────────────────
@@ -301,6 +463,34 @@ def main_menu_keyboard(page: int, *, icons: bool = True):
     if nav:
         rows.append(nav)
 
+    rows.append(
+        [
+            btn_danger(
+                "CLOSE", f"{_CB}:close",
+                icon_emoji_id=EID.CROSS if icons else None,
+            )
+        ]
+    )
+    return build_keyboard(rows)
+
+
+def main_menu_nav_keyboard(page: int, *, icons: bool = True):
+    """Nav + CLOSE only — used when the module grid lives in the rich body.
+
+    On the rich path the 3-wide module grid is rendered as in-message
+    ``RichBlockButtons`` (Bot API 10.3), so the attached keyboard keeps
+    just paging and dismissal.  Those two survive on every client, so a
+    client that cannot render rich buttons can still page and close.
+    """
+    page = _clamp_page(page)
+    rows = []
+    nav = []
+    if page > 0:
+        nav.append(btn_default("<", f"{_CB}:main:{page - 1}"))
+    if page < _page_count() - 1:
+        nav.append(btn_default(">", f"{_CB}:main:{page + 1}"))
+    if nav:
+        rows.append(nav)
     rows.append(
         [
             btn_danger(
@@ -379,10 +569,13 @@ async def _send_text(target, text: str, markup, plain_markup) -> bool:
     return False
 
 
-async def _send_menu(target) -> bool:
+async def _send_menu(target, bot=None) -> bool:
     """Open the main menu as the single menu message."""
-    return await _send_text(
+    return await _send_rich(
+        bot,
         target,
+        _blocks(_rich_main_blocks, 0),
+        main_menu_nav_keyboard(0),
         _build_main_message(0),
         main_menu_keyboard(0),
         main_menu_keyboard(0, icons=False),
@@ -424,6 +617,88 @@ async def _safe_edit(query, text: str, markup, plain_markup) -> None:
     logger.warning(f"Help edit failed: {last}")
 
 
+def _network_error(e: Exception) -> bool:
+    """A transport failure — retrying inside the same handler only doubles
+    the wait, so callers bail instead of falling back."""
+    return type(e).__name__ in {"TimedOut", "NetworkError"}
+
+
+def _blocks(fn, *args):
+    """Build + validate rich blocks.  ``None`` means "skip the rich attempt".
+
+    Both block builders are pure, but they walk HELP_MENU data — so a
+    malformed entry must degrade to the HTML renderer rather than abort
+    the command.
+    """
+    if not HELP_RICH:
+        return None
+    try:
+        built = fn(*args)
+        R.validate(built)
+        return built
+    except Exception as e:
+        logger.debug(f"help: rich blocks unavailable ({fn.__name__}): {e}")
+        return None
+
+
+async def _send_rich(bot, target, blocks, rich_markup,
+                     html_text, html_markup, html_plain_markup) -> bool:
+    """Open the menu as a Rich Message, falling back to the HTML one.
+
+    The two paths carry DIFFERENT keyboards on purpose: on the rich path
+    the module grid lives in the message body as ``RichBlockButtons``,
+    so the attached keyboard only pages and closes.  Handing the HTML
+    fallback that same keyboard would leave it with no way to reach a
+    module, hence the separate markup arguments.
+    """
+    if blocks is not None and bot is not None:
+        attempts = [blocks]
+        if R.has_styled_buttons(blocks):
+            attempts.append(R.unstyle(blocks))
+        for i, blk in enumerate(attempts):
+            try:
+                await R.send_rich(bot, target.chat.id, blk, reply_markup=rich_markup)
+                return True
+            except Exception as e:
+                if _network_error(e):
+                    logger.warning(f"Help rich send network issue: {e}")
+                    return False
+                logger.debug(
+                    f"Help rich send attempt {i + 1}/{len(attempts)} failed, "
+                    f"{'using HTML' if i == len(attempts) - 1 else 'retrying'}: {e}"
+                )
+    return await _send_text(target, html_text, html_markup, html_plain_markup)
+
+
+async def _safe_edit_rich(bot, query, blocks, rich_markup,
+                          html_text, html_markup, html_plain_markup) -> None:
+    """Rewrite the menu message in place — rich first, HTML fallback."""
+    msg = query.message
+    if blocks is not None and bot is not None and msg is not None and not bool(
+        getattr(msg, "photo", None)
+    ):
+        attempts = [blocks]
+        if R.has_styled_buttons(blocks):
+            attempts.append(R.unstyle(blocks))
+        for i, blk in enumerate(attempts):
+            try:
+                await R.edit_rich(
+                    bot, msg.chat.id, msg.message_id, blk, reply_markup=rich_markup
+                )
+                return
+            except Exception as e:
+                if "message is not modified" in str(e):
+                    return
+                if _network_error(e):
+                    logger.warning(f"Help rich edit network issue: {e}")
+                    return
+                logger.debug(
+                    f"Help rich edit attempt {i + 1}/{len(attempts)} failed, "
+                    f"{'using HTML' if i == len(attempts) - 1 else 'retrying'}: {e}"
+                )
+    await _safe_edit(query, html_text, html_markup, html_plain_markup)
+
+
 async def _answer(query, text: str | None = None, *, alert: bool = False) -> None:
     try:
         if text:
@@ -460,15 +735,18 @@ async def help_command(message: Message, bot: Bot, bot_data: dict) -> None:
             f"├ {E.USER} Detail: Browse every command in the bot's DM\n"
             f"└ {E.ARROW} Tap the button below to continue"
         )
-        await _send_text(
+        await _send_rich(
+            bot,
             message,
+            _blocks(_rich_group_blocks, username),
+            None,  # rich body carries the deep-link button itself
             text,
             _dm_keyboard(username),
             _dm_keyboard(username, icons=False),
         )
         return
 
-    await _send_menu(message)
+    await _send_menu(message, bot)
 
 
 async def show_main_menu(callback_query: CallbackQuery) -> None:
@@ -478,7 +756,7 @@ async def show_main_menu(callback_query: CallbackQuery) -> None:
     target = query.message
     if target is None:
         return
-    if await _send_menu(target):
+    if await _send_menu(target, getattr(query, "bot", None)):
         try:
             await target.delete()
         except Exception as e:
@@ -504,8 +782,11 @@ async def help_callback(callback_query: CallbackQuery, bot: Bot, bot_data: dict)
     if action == "main":
         await _answer(query)
         page = _clamp_page(_int_at(parts, 2))
-        await _safe_edit(
+        await _safe_edit_rich(
+            bot,
             query,
+            _blocks(_rich_main_blocks, page),
+            main_menu_nav_keyboard(page),
             _build_main_message(page),
             main_menu_keyboard(page),
             main_menu_keyboard(page, icons=False),
@@ -523,8 +804,13 @@ async def help_callback(callback_query: CallbackQuery, bot: Bot, bot_data: dict)
         menu_page = _clamp_page(_int_at(parts, 3))
         total = _module_page_count(mod)
         sub = max(0, min(_int_at(parts, 4), total - 1))
-        await _safe_edit(
+        # Same keyboard on both paths: the module grid lives in the rich
+        # body, so the attached keyboard is identical to the HTML one.
+        await _safe_edit_rich(
+            bot,
             query,
+            _blocks(_rich_module_blocks, mod, sub),
+            module_keyboard(key, menu_page, sub),
             _build_module_message(mod, sub),
             module_keyboard(key, menu_page, sub),
             module_keyboard(key, menu_page, sub, icons=False),

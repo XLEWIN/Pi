@@ -685,6 +685,13 @@ async def new_member_handler(message: Message, bot: Bot):
         return
 
     chat_id = message.chat.id
+    # Answers "did the handler even run?" — if this line is missing from
+    # the log, the join update never reached group 10 at all.
+    logger.info(
+        "welcome: join event chat=%s users=%s",
+        chat_id,
+        [u.id for u in (message.new_chat_members or [])],
+    )
     settings = await adb(db.get_welcome_settings(chat_id))
 
     if not settings.get("welcome_enabled", True):

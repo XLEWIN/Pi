@@ -308,7 +308,7 @@ class TestModulePagination(unittest.TestCase):
     def test_pages_split_all_sections(self):
         mod = help_mod._module("moderation")
         pages = help_mod._module_chunks(mod)
-        flat = [header for page in pages for header, _ in page if header]
+        flat = [header for page in pages for header, _b, _r, _k in page if header]
         all_headers = [h for h, _ in mod["sections"] if h]
         self.assertEqual(sorted(flat), sorted(all_headers))
 

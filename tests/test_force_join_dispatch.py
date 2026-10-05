@@ -497,6 +497,64 @@ class TestWelcomeThroughTheRealDispatcher(_Base):
             f"no goodbye was sent; bot sent {texts!r}",
         )
 
+    async def test_join_with_force_join_binding_still_welcomes(self):
+        """The reported bug: join -> bind prompt, no welcome.
+
+        force_join=1, channel bound, and the joiner has NOT joined the
+        channel yet.  The join service message must still reach
+        ``new_member_handler`` (group 10): it is a StatusUpdate, so the
+        gate must neither fire nor StopChain on it, and nothing must be
+        prompted until that user actually says something.
+        """
+        from bot import database as D
+
+        bdb.upsert_binding(
+            CHAT, CHANNEL,
+            channel_title="Gate Channel",
+            channel_username=None,
+            channel_link=None,
+            bound_by=1,
+        )
+        bdb.update_field(CHAT, "force_join", 1)
+        self.addCleanup(bdb.remove_binding, CHAT)
+
+        uid = self.next_user()
+        bot = self.bot(member=False, uid=uid)   # never joined the channel
+        await self.feed(bot, self._join(5023, uid), 6023)
+
+        texts = [str(s.get("text", "")) for s in bot.sent]
+        self.assertTrue(
+            any("welcome" in t.lower() for t in texts),
+            f"join produced no welcome while force_join was on: {texts!r}",
+        )
+        self.assertFalse(
+            any(PROMPT_MARKER in t.lower() for t in texts),
+            "the bind prompt fired on JOIN - it must wait for real "
+            f"activity in the group: {texts!r}",
+        )
+        D.db.get_welcome_settings(CHAT)  # touch: keep the DB honest
+
+    async def test_join_message_itself_is_not_gated(self):
+        """The join service message must survive the gate untouched."""
+        bdb.upsert_binding(
+            CHAT, CHANNEL,
+            channel_title="Gate Channel",
+            channel_username=None,
+            channel_link=None,
+            bound_by=1,
+        )
+        bdb.update_field(CHAT, "force_join", 1)
+        self.addCleanup(bdb.remove_binding, CHAT)
+
+        uid = self.next_user()
+        bot = self.bot(member=False, uid=uid)
+        await self.feed(bot, self._join(5024, uid), 6024)
+
+        self.assertEqual(
+            self.user_deletes(bot), [],
+            "the gate deleted the join service message",
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

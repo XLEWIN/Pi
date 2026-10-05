@@ -18,7 +18,7 @@ from aiogram.enums import ParseMode
 from aiogram.types import Message
 
 from bot.emojis import E
-from bot.pipeline import StopChain
+from bot.pipeline import StopChain, is_service_update
 from bot.reply import reply_text
 
 from . import database as bdb
@@ -357,6 +357,12 @@ async def gate_message_handler(message: Message, bot: Bot) -> None:
         return
     user = message.from_user
     if user is None:
+        return
+    # Join/leave/pin notices are not chat activity: force-join fires when
+    # the member actually says something.  Belt and braces alongside the
+    # ~SERVICE registration filter — StopChain on a status update would
+    # starve welcome/goodbye, which read that same message in group 10.
+    if is_service_update(message):
         return
 
     chat_id = chat.id

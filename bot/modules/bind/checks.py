@@ -7,6 +7,8 @@ from typing import Any, Dict, Optional, Set, Tuple
 from aiogram.enums import ChatMemberStatus
 from aiogram.types import Message, User
 
+from bot.pipeline import is_service_update
+
 from .config import FAIL_STATUSES, MEMBERSHIP_CACHE_TTL, PASS_STATUSES
 
 logger = logging.getLogger(__name__)
@@ -350,6 +352,14 @@ def should_enforce(
     if user is None:
         return False
     if getattr(user, "is_bot", False):
+        return False
+
+    # Status updates are not activity: force-join asks people to talk to
+    # us, so it must wait until they actually say or send something.
+    # Gating a join/leave/pin notice would delete the notice, and since
+    # the gate raises StopChain it would also starve welcome/goodbye,
+    # which read that very same update in group 10.
+    if is_service_update(message):
         return False
 
     if bool(int(settings.get("admin_bypass") or 1)) and is_admin:
