@@ -35,7 +35,7 @@ from .checks import (
     pop_leave,
     should_enforce,
 )
-from .config import PLACEHOLDERS_HELP
+from .config import GATES, PLACEHOLDERS_HELP
 from .keyboards import bind_main_menu, force_join_keyboard, help_bind_text, replace_confirm_menu
 from .utils import (
     channel_display,
@@ -336,6 +336,26 @@ def _record_gate_fail(chat_id: int, user_id: int) -> list:
         return []
 
 
+def _member_seen(chat_id: int, user_id: int) -> list:
+    """Blocking "this person is a member" bookkeeping — worker thread.
+
+    Records the (first-seen) join stamp for grace math and hands back the
+    ids of any force-join prompt still on screen for them, so the caller
+    can retire it.  Without that second half a card sent *before* they
+    joined the channel stays in the group forever: the member's next
+    message takes the allow path, which never ran the sweep.
+    """
+    try:
+        bdb.record_join(chat_id, user_id)
+    except Exception as e:
+        logger.debug(f"bind record_join: {e}")
+    try:
+        return bdb.take_warnings(chat_id, user_id) or []
+    except Exception as e:
+        logger.debug(f"bind member prompt sweep: {e}")
+        return []
+
+
 async def gate_message_handler(message: Message, bot: Bot) -> None:
     """Enforce force-join / message-type gates on incoming group messages.
 
@@ -343,6 +363,8 @@ async def gate_message_handler(message: Message, bot: Bot) -> None:
     ``HANDLER_GROUP`` for *every* group message in *every* chat.  Ordering
     inside it is therefore deliberate:
 
+    0. the pure attribute rejections (private chat, bots, sender_chat,
+       service updates) — free, and they skip everything below,
     1. one ``to_thread`` read (settings + join stamp together — the old
        code issued three separate blocking round trips, one of them a
        no-op), then
@@ -357,6 +379,17 @@ async def gate_message_handler(message: Message, bot: Bot) -> None:
         return
     user = message.from_user
     if user is None:
+        return
+    # Bots never chat — and this check must run *before* the blocking
+    # settings read, otherwise every bot message in every group pays a
+    # Mongo round trip just to be discarded.  GroupAnonymousBot lands
+    # here too (is_bot=True).
+    if user.is_bot:
+        return
+    # Linked-channel posts and other sender_chat traffic carry no human
+    # member, so there is nobody to prompt; deleting them would also
+    # strip channel posts out of discussion groups.
+    if getattr(message, "sender_chat", None) is not None:
         return
     # Join/leave/pin notices are not chat activity: force-join fires when
     # the member actually says something.  Belt and braces alongside the
@@ -379,8 +412,8 @@ async def gate_message_handler(message: Message, bot: Bot) -> None:
         gate_enabled(settings, g) for g in message_gates(message)
     ):
         return
-    if user.is_bot:
-        return
+    # user.is_bot / sender_chat already handled at the top of the
+    # function (before the settings read) — see above.
     grace_ok = in_grace(join_ts, int(settings.get("grace_minutes") or 0))
     if grace_ok:
         return
@@ -407,8 +440,14 @@ async def gate_message_handler(message: Message, bot: Bot) -> None:
         # through; bot_can_verify already logged the actionable warning.
         return
     if state == MEMBERSHIP_MEMBER:
-        # Allow, and persist the join for future grace math.
-        await adb(bdb.record_join(chat_id, user.id))
+        # Allow, persist the join for future grace math, and retire any
+        # "join the channel" card from before they actually joined — a
+        # member must never see a stale prompt again.
+        for mid in await asyncio.to_thread(_member_seen, chat_id, user.id):
+            try:
+                await bot.delete_message(chat_id, mid)
+            except Exception:
+                pass
         return
 
     # Not a member → gate: delete + ask them to join again.
@@ -523,8 +562,54 @@ def _track_joins(
         bdb.clear_join(chat_id, left_member.id)
 
 
+async def _warm_membership(bot: Bot, chat_id: int, members) -> None:
+    """Ask the bound channel, once per group join, who of these is already in.
+
+    The gate is lazy: it only learns about a member on their first
+    message, which costs a ``getChatMember`` round trip and — for anyone
+    who joined the channel long ago — used to be the moment a prompt
+    could flash.  Warming here means the very first message a
+    pre-existing channel member sends resolves from cache, so they are
+    never prompted at all.
+
+    Never blocks the join path: every failure just leaves the cache empty
+    and lets the gate ask again later.  ``unknown`` is deliberately not
+    cached by ``membership_state`` either, so a bot that cannot see the
+    channel still behaves exactly as it did before.
+    """
+    if not members:
+        return
+    try:
+        settings = await adb(bdb.get_settings(chat_id))
+    except Exception as e:
+        logger.debug(f"bind warm settings: {e}")
+        return
+    if not settings or not settings.get("channel_id"):
+        return
+    # Only worth an API call when the gate can actually fire.
+    if not int(settings.get("force_join") or 0) and not any(
+        int(settings.get(col) or 0) for col in GATES.values()
+    ):
+        return
+    channel_id = settings["channel_id"]
+    for member in members:
+        if member.is_bot or member.id == bot.id:
+            continue
+        try:
+            state = await membership_state(bot, channel_id, member.id, fresh=True)
+        except Exception as e:
+            logger.debug(f"bind warm {channel_id}/{member.id}: {e}")
+            continue
+        if state == MEMBERSHIP_MEMBER:
+            await adb(bdb.record_join(chat_id, member.id))
+            logger.debug(
+                "bind: %s is already in channel %s — force-join prompt skipped",
+                member.id, channel_id,
+            )
+
+
 async def join_tracker(message: Message, bot: Bot) -> None:
-    """Record group-join timestamps for grace period math."""
+    """Record group-join timestamps and pre-warm force-join membership."""
     if not message or not message.chat or message.chat.type == "private":
         return
 
@@ -546,6 +631,11 @@ async def join_tracker(message: Message, bot: Bot) -> None:
         bot.id,
         time.time(),
     )
+    if members:
+        try:
+            await _warm_membership(bot, message.chat.id, members)
+        except Exception as e:
+            logger.debug(f"bind membership warm failed: {e}")
 
 
 async def waiting_text_handler(message: Message, bot: Bot, chat_data: dict) -> None:

@@ -475,6 +475,11 @@ class Database:
         "get_filters": ("filters",),
         "get_blocklist": ("blocklist",),
         "is_blocklist_exempt": ("blocklist_exemptions",),
+        # blacklist module (bot/modules/blacklist.py) — words, stickers
+        # and the per-chat mode are all read on every group message.
+        "get_blacklist_words": ("blacklist_words",),
+        "get_blacklist_stickers": ("blacklist_stickers",),
+        "get_blacklist_mode": ("blacklist_settings",),
         "get_watch_words": ("watch_words",),
         "get_all_watch_words": ("watch_words",),
         "get_watch_mode": ("watch_words",),
@@ -853,6 +858,17 @@ class Database:
             ],
             "blocklist_exemptions": [
                 ({"chat_id": 1, "user_id": 1}, {"unique": True}),
+            ],
+            "blacklist_words": [
+                ({"chat_id": 1, "word": 1}, {"unique": True}),
+                ({"chat_id": 1}, {}),
+            ],
+            "blacklist_stickers": [
+                ({"chat_id": 1, "sticker_id": 1}, {"unique": True}),
+                ({"chat_id": 1}, {}),
+            ],
+            "blacklist_settings": [
+                ({"chat_id": 1}, {"unique": True}),
             ],
             "sudo_users": [
                 ({"user_id": 1}, {"unique": True}),
@@ -1930,6 +1946,155 @@ class Database:
             ))
         except Exception:
             return False
+
+    # ── Blacklist ─────────────────────────────────────────────
+    #
+    # Distinct from ``blocklist`` above: that one stores a per-word
+    # action/reason and matches by substring; this one is boa's model —
+    # whole-word regex matching plus a blacklisted *sticker* set and a
+    # single per-chat mode (off/del/warn/mute/kick/ban).  Three
+    # collections, because words and stickers are lists and the mode is
+    # one row, and they are invalidated independently.
+
+    async def add_blacklist_word(self, chat_id: int, word: str) -> bool:
+        try:
+            word = (word or "").strip().lower()
+            if not word:
+                return False
+            res = await self._mongo["blacklist_words"].update_one(
+                {"chat_id": chat_id, "word": word},
+                {"$setOnInsert": {
+                    "chat_id": chat_id,
+                    "word": word,
+                    "id": await self._next_id("blacklist_words"),
+                }},
+                upsert=True,
+            )
+            # False when the word already existed — mirrors remove_*.
+            return bool(getattr(res, "upserted_id", None))
+        except Exception as e:
+            logger.error(f"Error adding blacklist word: {e}")
+            return False
+
+    async def get_blacklist_words(self, chat_id: int) -> List[str]:
+        try:
+            async def _load():
+                rows = await self._find(
+                    "blacklist_words", {"chat_id": chat_id}, sort=[("id", 1)]
+                )
+                return [r["word"] for r in rows if r.get("word")]
+
+            return await self._cached_read(
+                "get_blacklist_words", (chat_id,), _load
+            )
+        except Exception as e:
+            logger.error(f"Error getting blacklist words: {e}")
+            return []
+
+    async def remove_blacklist_word(self, chat_id: int, word: str) -> bool:
+        try:
+            res = await self._mongo["blacklist_words"].delete_one(
+                {"chat_id": chat_id, "word": (word or "").strip().lower()}
+            )
+            return res.deleted_count > 0
+        except Exception as e:
+            logger.error(f"Error removing blacklist word: {e}")
+            return False
+
+    async def clear_blacklist_words(self, chat_id: int) -> int:
+        try:
+            res = await self._mongo["blacklist_words"].delete_many(
+                {"chat_id": chat_id}
+            )
+            return int(res.deleted_count or 0)
+        except Exception as e:
+            logger.error(f"Error clearing blacklist words: {e}")
+            return 0
+
+    async def add_blacklist_sticker(self, chat_id: int, sticker_id: str) -> bool:
+        try:
+            sticker_id = (sticker_id or "").strip()
+            if not sticker_id:
+                return False
+            res = await self._mongo["blacklist_stickers"].update_one(
+                {"chat_id": chat_id, "sticker_id": sticker_id},
+                {"$setOnInsert": {
+                    "chat_id": chat_id,
+                    "sticker_id": sticker_id,
+                    "id": await self._next_id("blacklist_stickers"),
+                }},
+                upsert=True,
+            )
+            # False when the sticker was already blacklisted.
+            return bool(getattr(res, "upserted_id", None))
+        except Exception as e:
+            logger.error(f"Error adding blacklist sticker: {e}")
+            return False
+
+    async def get_blacklist_stickers(self, chat_id: int) -> List[str]:
+        try:
+            async def _load():
+                rows = await self._find(
+                    "blacklist_stickers", {"chat_id": chat_id}, sort=[("id", 1)]
+                )
+                return [r["sticker_id"] for r in rows if r.get("sticker_id")]
+
+            return await self._cached_read(
+                "get_blacklist_stickers", (chat_id,), _load
+            )
+        except Exception as e:
+            logger.error(f"Error getting blacklist stickers: {e}")
+            return []
+
+    async def remove_blacklist_sticker(self, chat_id: int, sticker_id: str) -> bool:
+        try:
+            res = await self._mongo["blacklist_stickers"].delete_one(
+                {"chat_id": chat_id, "sticker_id": (sticker_id or "").strip()}
+            )
+            return res.deleted_count > 0
+        except Exception as e:
+            logger.error(f"Error removing blacklist sticker: {e}")
+            return False
+
+    async def set_blacklist_mode(
+        self, chat_id: int, mode: str, duration: int = 0
+    ) -> None:
+        """``mode``: off | del | warn | mute | kick | ban.
+
+        ``duration`` only matters for the timed variants; it is stored
+        regardless so turning a mode on and off keeps the value.
+        """
+        try:
+            await self._mongo["blacklist_settings"].update_one(
+                {"chat_id": chat_id},
+                {"$set": {
+                    "chat_id": chat_id,
+                    "mode": mode,
+                    "duration": int(duration or 0),
+                }},
+                upsert=True,
+            )
+        except Exception as e:
+            logger.error(f"Error setting blacklist mode: {e}")
+
+    async def get_blacklist_mode(self, chat_id: int) -> Dict[str, Any]:
+        """Always returns ``{"mode": ..., "duration": ...}``; unset = off."""
+        try:
+            async def _load():
+                row = await self._find_one("blacklist_settings", {"chat_id": chat_id})
+                if not row:
+                    return {"mode": "off", "duration": 0}
+                return {
+                    "mode": row.get("mode") or "off",
+                    "duration": int(row.get("duration") or 0),
+                }
+
+            return await self._cached_read(
+                "get_blacklist_mode", (chat_id,), _load
+            )
+        except Exception as e:
+            logger.error(f"Error getting blacklist mode: {e}")
+            return {"mode": "off", "duration": 0}
 
     # ── Sudo users ────────────────────────────────────────
     async def add_sudo_user(self, user_id: int, added_by: int = None) -> bool:

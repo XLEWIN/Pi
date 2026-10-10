@@ -6,13 +6,25 @@ Works in both private chats and groups. Uses Bot API 9.4+ button styling.
 import asyncio
 import re
 from html import escape
+from typing import Any, Dict, List
 
 from aiogram import Bot, F
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, Message
 
-from bot.constants import BOT_DESCRIPTION, LOG_CHANNEL_ID, START_TEXT, URL_ADD_TO_GROUP, URL_OFFICIAL_CHANNEL, URL_NETWORK
+from bot import rich as R
+from bot import richsend as rs
+from bot.constants import (
+    BOT_DESCRIPTION,
+    LOG_CHANNEL_ID,
+    START_HINT_LINE,
+    START_TEXT,
+    START_TITLE_LINE,
+    URL_ADD_TO_GROUP,
+    URL_OFFICIAL_CHANNEL,
+    URL_NETWORK,
+)
 from bot.database import db
 from bot.emojis import E
 from bot.keyboards.colored import btn_primary, btn_url, build_keyboard
@@ -185,12 +197,33 @@ def build_start_keyboard(icons: bool = True):
     return build_keyboard(buttons)
 
 
+def build_start_blocks(username: str) -> List[Dict[str, Any]]:
+    """Rich twin of :data:`bot.constants.START_TEXT`.
+
+    Assembled from the *same* three named pieces the HTML string is
+    assembled from — ``START_TITLE_LINE``, ``BOT_DESCRIPTION`` and
+    ``START_HINT_LINE`` — so the two renderers cannot drift apart.
+
+    The keyboard deliberately stays in ``reply_markup`` instead of
+    becoming an in-body ``buttons`` block: ``RichMessageButton`` carries
+    no ``icon_custom_emoji_id``, so moving it would keep the colours but
+    silently drop the owner's custom-emoji icons.  Same keyboard, same
+    colours, on both paths — the fallback stays invisible.
+    """
+    return [
+        R.heading(R.html_to_rich(
+            START_TITLE_LINE.format(fire=E.FIRE, username=f"@{username}")
+        ), 2),
+        R.paragraph(R.html_to_rich(BOT_DESCRIPTION)),
+        R.paragraph(R.html_to_rich(START_HINT_LINE.format(arrow=E.ARROW))),
+    ]
+
+
 async def _safe_delete(message) -> None:
     try:
         await message.delete()
     except Exception:
         pass
-
 
 async def _finish_start(bot: Bot, user, chat) -> None:
     """Background work after the user already has their reply."""
@@ -249,6 +282,30 @@ async def start_command(message: Message, bot: Bot, bot_data: dict, args: list) 
     )
     keyboard = build_start_keyboard()
     plain_keyboard = build_start_keyboard(icons=False)
+
+    # Rich first — same three blocks, same keyboard (colours + icons
+    # intact).  A timeout is terminal here: falling through to HTML would
+    # stack a second full RTT on top of the dead one, which is the
+    # multi-second stall this command is guarded against.  Only a fast
+    # rejection (unsupported block / style enum) earns the HTML retry.
+    blocks = rs.build_blocks(build_start_blocks, username)
+    if blocks:
+        try:
+            await asyncio.wait_for(
+                R.send_rich(bot, chat.id, blocks, reply_markup=keyboard),
+                timeout=REPLY_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.error("Start reply timed out (network/API)")
+            return
+        except Exception as e:
+            logger.debug(f"Start rich send rejected ({e}); using HTML")
+        else:
+            # Rich is on screen — only now do delete / DB / channel log.
+            if message:
+                _spawn(_safe_delete(message))
+            _spawn(_finish_start(bot, user, chat))
+            return
 
     # Exactly one attempt for the brand payload. Timeouts must not stack
     # (that was the multi-second stall). Only a fast BadRequest gets a

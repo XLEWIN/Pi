@@ -285,7 +285,14 @@ def re_search_link(text: str) -> bool:
 
 
 def message_gates(message: Message) -> set:
-    """Which gate keys this message matches (text/media/link/document/gif/audio/sticker)."""
+    """Which gate keys this message matches.
+
+    Covers every type Telegram can send: the specific gates
+    (text/media/link/document/gif/audio/sticker) plus ``other``, the
+    catch-all for polls, contacts, venues, locations, dice, games,
+    invoices, giveaways and stories.  ``other`` only fires when nothing
+    else matched, so a photo-with-caption never flips it too.
+    """
     gates = set()
     m = message
 
@@ -310,6 +317,12 @@ def message_gates(message: Message) -> set:
     elif _has_link(m):
         gates.add("link")
 
+    # Catch-all: nothing above matched, so this is a type with no gate of
+    # its own.  Without it a gate-only chat gated text and let a poll
+    # through.
+    if not gates:
+        gates.add("other")
+
     return gates
 
 
@@ -322,6 +335,7 @@ def gate_enabled(settings: Dict[str, Any], gate_key: str) -> bool:
         "gif": "gate_gif",
         "audio": "gate_audio",
         "sticker": "gate_sticker",
+        "other": "gate_other",
     }.get(gate_key)
     if not col:
         return False
@@ -340,12 +354,22 @@ def should_enforce(
 
     Rules:
       • No binding / force_join off and no matching gate → False
+      • Channel / anonymous senders (sender_chat set) → False
       • Bots always ignored → False
       • Admin bypass ON + admin → False
       • Grace period → False
       • force_join master OR any matching enabled gate → True
     """
     if not settings or not settings.get("channel_id"):
+        return False
+
+    # A sender_chat means the message came from a channel or from an
+    # admin posting anonymously — there is no human member behind it to
+    # prompt, and deleting it would just strip a linked-channel post out
+    # of the discussion group.  from_user for those is either the
+    # channel itself or GroupAnonymousBot, both of which would otherwise
+    # fall through to the bot check below and be "gated" every time.
+    if getattr(message, "sender_chat", None) is not None:
         return False
 
     # Bots (including this bot) are never gated.

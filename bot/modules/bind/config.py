@@ -37,6 +37,14 @@ GRACE_OPTIONS = (0, 1, 5, 10, 15, 30, 60)
 AUTO_DELETE_OPTIONS = (0, 5, 10, 15, 30)
 
 # Toggleable message gates → column name on bind_settings.
+# ``other`` is the catch-all: polls, contacts, venues, locations, dice,
+# games, invoices, giveaways, stories and anything Telegram adds next.
+# Without it ``message_gates()`` returned an empty set for those, so a
+# gate-only chat (force_join OFF) let them straight through while text
+# was blocked.  Every key here must also exist in ``_DEFAULTS`` /
+# ``_INT_COLS`` / ``_update_field``'s allow-list in database.py and in
+# the ``gate_enabled`` map in checks.py — the menu and the status line
+# read GATES/GATE_LABELS directly, so they pick new keys up by themselves.
 GATES = {
     "text": "gate_text",
     "media": "gate_media",
@@ -45,6 +53,7 @@ GATES = {
     "gif": "gate_gif",
     "audio": "gate_audio",
     "sticker": "gate_sticker",
+    "other": "gate_other",
 }
 
 GATE_LABELS = {
@@ -55,6 +64,7 @@ GATE_LABELS = {
     "gif": "GIF / Animation",
     "audio": "Audio / Voice",
     "sticker": "Stickers",
+    "other": "Other (polls, contacts, dice)",
 }
 
 # Statuses that count as a valid channel member.

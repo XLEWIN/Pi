@@ -32,10 +32,16 @@ BOT_DESCRIPTION = (
     "Leveling, moderation, giveaways, custom commands, and so much more."
 )
 
+# The three pieces of the start screen, named so the rich renderer
+# (bot/modules/start.py) builds the same three blocks instead of
+# re-writing the sentence a second time.  START_TEXT is derived from
+# them, so the two can never drift.
+START_TITLE_LINE = "{fire} {username}"
+START_HINT_LINE = "{arrow} /help for the full command list."
 START_TEXT = (
-    "{fire} {username}\n"
+    START_TITLE_LINE + "\n"
     "{description}\n\n"
-    "{arrow} /help for the full command list."
+    + START_HINT_LINE
 )
 
 # ── Help menu data ───────────────────────────────────────────────
@@ -246,6 +252,27 @@ HELP_MENU: list[dict] = [
             ]),
         ],
         "notes": [],
+    },
+    {
+        "key": "blacklist",
+        "icon": E.LOCK,
+        "title": "Blacklist",
+        "sections": [
+            (None, [
+                "/blacklist — Open the blacklist menu (admin)",
+                "/addblacklist &lt;word...&gt; — Add words; reply to a message to add its words (admin)",
+                "/unblacklist &lt;word...&gt; — Remove words (admin)",
+                "/blacklistmode &lt;off|del|warn|mute|kick|ban&gt; — Set the action (admin)",
+                "/blsticker — List blacklisted stickers (admin)",
+                "/addblsticker — Blacklist the sticker you reply to (admin)",
+                "/unblsticker — Remove a sticker by reply or file_unique_id (admin)",
+            ]),
+        ],
+        "notes": [
+            "<b>Matching:</b> whole words only, case-insensitive, in text "
+            "and captions; stickers match by file_unique_id · "
+            "admins are never affected"
+        ],
     },
     {
         "key": "watchwords",

@@ -111,7 +111,8 @@ class FakeMessage:
         self.message_id = message_id
         self.chat = SimpleNamespace(id=chat_id, type=chat_type, title=title)
         self.from_user = SimpleNamespace(
-            id=user_id, is_bot=is_bot, first_name=first_name, username=username
+            id=user_id, is_bot=is_bot, first_name=first_name, username=username,
+            last_name=None,
         )
         self.caption = kw.pop("caption", None)
         self.reply_to_message = kw.pop("reply_to_message", None)

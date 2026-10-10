@@ -40,6 +40,7 @@ _DEFAULTS: Dict[str, Any] = {
     "gate_gif": 0,
     "gate_audio": 0,
     "gate_sticker": 0,
+    "gate_other": 0,
     "admin_bypass": 1,
     "grace_minutes": 0,
     "auto_delete_seconds": 0,
@@ -57,6 +58,7 @@ _INT_COLS = (
     "gate_gif",
     "gate_audio",
     "gate_sticker",
+    "gate_other",
     "admin_bypass",
 )
 
@@ -244,6 +246,7 @@ async def _upsert_binding(
                     "gate_gif": 0,
                     "gate_audio": 0,
                     "gate_sticker": 0,
+                    "gate_other": 0,
                     "admin_bypass": 1,
                     "grace_minutes": 0,
                     "auto_delete_seconds": 0,
@@ -299,6 +302,7 @@ async def _update_field(chat_id: int, field: str, value: Any) -> Optional[Dict[s
         "gate_gif",
         "gate_audio",
         "gate_sticker",
+        "gate_other",
         "admin_bypass",
         "grace_minutes",
         "auto_delete_seconds",
