@@ -113,10 +113,10 @@ polls, so use a **worker** service with no port/healthcheck.
   every restart). Empty snapshot on a bot that had data → `MONGO_URI`
   points at the wrong cluster/database.
 
-One-time MTProto login (online presence + sticker tools): run
-`python scripts/mtproto_login.py`, then put the printed
-`TELETHON_SESSION` value in `.env` locally and in Railway Service
-Variables.
+One-time MTProto login (online presence only — sticker packs are pure
+Bot API now): run `python scripts/mtproto_login.py`, then put the
+printed `TELETHON_SESSION` value in `.env` locally and in Railway
+Service Variables.
 
 Notes: video/GIF kangs use the bundled `imageio-ffmpeg` binary — no
 system ffmpeg needed. Runtime state writes to `LOCALAPPDATA` when set,

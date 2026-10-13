@@ -349,8 +349,9 @@ HELP_MENU: list[dict] = [
             ]),
         ],
         "notes": [
-            "Kangs need MTProto (TAG_MTPROTO=1); GIF/video conversion needs "
-            "ffmpeg. Packs are named a&lt;#&gt;_yourid_by_&lt;bot&gt;.",
+            "Kangs run over the Bot API \u2014 no MTProto setup; GIF/video "
+            "conversion needs ffmpeg. Packs are named "
+            "a&lt;#&gt;_yourid_by_&lt;bot&gt;.",
         ],
     },
     {

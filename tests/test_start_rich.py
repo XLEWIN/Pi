@@ -88,6 +88,40 @@ def markup_pairs(markup):
     ]
 
 
+def body_pairs(blocks):
+    """In-body ``buttons`` blocks → markup_pairs-shaped tuples.
+
+    ``(label, target, style, custom_emoji_id)`` — same shape as the
+    inline-keyboard extractor so the rich body and the HTML keyboard
+    can be compared entry for entry.
+    """
+    pairs = []
+    for blk in blocks:
+        if blk.get("type") != "buttons":
+            continue
+        for b in blk.get("buttons", []):
+            emoji = None
+            text = b.get("text")
+            if isinstance(text, list):
+                emoji = next(
+                    (node.get("custom_emoji_id") for node in text
+                     if isinstance(node, dict)
+                     and node.get("type") == "custom_emoji"),
+                    None,
+                )
+                # Label only: the icon's alternative_text is dropped so
+                # it compares cleanly against the plain keyboard text.
+                label = "".join(part for part in text
+                                if isinstance(part, str)).strip()
+            else:
+                label = (text or "").strip()
+            pairs.append((label,
+                          b.get("callback_data") or b.get("url"),
+                          b.get("style"),
+                          emoji))
+    return pairs
+
+
 class _RichBot:
     """Accepts raw TelegramMethod instances the way ``Bot.__call__`` does."""
 
@@ -206,12 +240,31 @@ class TestConstants(StartTestCase):
 
 
 class TestBlocks(StartTestCase):
-    def test_three_blocks_in_order(self):
+    def test_body_and_menu_blocks_in_order(self):
         blocks = start_mod.build_start_blocks(USERNAME)
-        self.assertEqual(len(blocks), 3)
         self.assertEqual([b["type"] for b in blocks],
-                         ["heading", "paragraph", "paragraph"])
+                         ["heading", "paragraph", "paragraph", "divider",
+                          "buttons", "buttons", "buttons"])
         self.assertEqual(blocks[0]["size"], 2)
+        # The five menu entries live in the body, row for row.
+        self.assertEqual([len(b["buttons"]) for b in blocks[4:]],
+                         [2, 1, 2])
+
+    def test_body_menu_matches_the_keyboard(self):
+        """Same five entries, same row order, same labels and colours."""
+        body = [(label, target, style)
+                for label, target, style, _ in body_pairs(
+                    start_mod.build_start_blocks(USERNAME))]
+        kb = [(text, target, style)
+              for text, target, style, _ in markup_pairs(
+                  start_mod.build_start_keyboard())]
+        self.assertEqual(body, kb)
+
+    def test_every_body_button_carries_a_premium_emoji(self):
+        ids = [emoji for *_ , emoji in body_pairs(
+            start_mod.build_start_blocks(USERNAME))]
+        self.assertEqual(len(ids), 5)
+        self.assertTrue(all(ids), f"icon dropped from a menu button: {ids}")
 
     def test_blocks_validate(self):
         self.assertIsNotNone(rs.build_blocks(start_mod.build_start_blocks,
@@ -249,20 +302,24 @@ class TestSendPath(StartTestCase):
         self.assertEqual(self._send_calls(msg), [],
                          "rich must not also send an HTML copy")
 
-    def test_rich_carries_the_start_keyboard(self):
+    def test_rich_carries_no_inline_keyboard(self):
+        """The menu is in the body now — an attached keyboard would
+        duplicate all five entries."""
         msg = self._message()
         bot = _RichBot()
         self._start(msg, bot)
-        self.assertEqual(
-            markup_pairs(self._rich_kb(bot)),
-            markup_pairs(start_mod.build_start_keyboard()),
+        self.assertIsNone(
+            bot.rich.reply_markup,
+            "rich path must not attach a keyboard to the start screen",
         )
 
-    def test_rich_and_html_keyboards_are_identical(self):
+    def test_body_menu_equals_the_html_keyboard(self):
+        """The rich body's buttons and the HTML path's keyboard are the
+        same five entries — same labels, targets and colours."""
         rich_msg = self._message()
         rich_bot = _RichBot()
         self._start(rich_msg, rich_bot)
-        rich_pairs = markup_pairs(self._rich_kb(rich_bot))
+        rich_pairs = body_pairs(rich_bot.rich.rich_message["blocks"])
 
         saved = rs.RICH_ENABLED
         rs.RICH_ENABLED = False
@@ -272,8 +329,13 @@ class TestSendPath(StartTestCase):
         finally:
             rs.RICH_ENABLED = saved
 
-        self.assertEqual(markup_pairs(self._html_kb(html_msg)), rich_pairs,
-                         "the two render paths must carry the same keyboard")
+        self.assertEqual(
+            [(t, u, s) for t, u, s, _ in rich_pairs],
+            [(t, u, s) for t, u, s, _ in markup_pairs(self._html_kb(html_msg))],
+            "the two render paths must offer the same menu",
+        )
+        self.assertTrue(all(e for *_ , e in rich_pairs),
+                        "a body button lost its premium emoji")
 
     def test_html_fallback_after_a_rich_rejection(self):
         msg = self._message()

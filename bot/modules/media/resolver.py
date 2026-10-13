@@ -45,6 +45,10 @@ def base_ydl_opts() -> Dict[str, Any]:
         "skip_download": True,
         "ignoreerrors": False,
         "nocheckcertificate": False,
+        # Photo posts carry no *video* formats at all — yt-dlp raises
+        # "No video formats found!" for them. Keep the info dict so
+        # _assets_from_entry can fall back to the image thumbnail.
+        "ignore_no_formats_error": True,
     }
     # Optional egress proxy — TikTok blocks many datacenter IPs outright.
     from .config import ig_config as _cfg
@@ -201,6 +205,31 @@ def _is_merge_pair(assets: List[MediaAsset]) -> bool:
     return len(assets) == 2 and {a.merge_role for a in assets} == {"v", "a"}
 
 
+def _ext_from_url(url: str, default: str = "jpg") -> str:
+    """Image extension from a URL path (query strings stripped)."""
+    path = (url or "").split("?", 1)[0].split("#", 1)[0].lower()
+    for ext in ("jpeg", "jpg", "png", "webp", "gif", "bmp", "avif"):
+        if path.endswith("." + ext):
+            return ext
+    return default
+
+
+def _still_image(entry: Dict[str, Any]) -> Optional[str]:
+    """Best still-image URL on *entry* — Instagram's photo-post payload.
+
+    A photo post (single image or one carousel slide) has no playable
+    ``formats``: yt-dlp hands the image back as ``thumbnail`` instead.
+    """
+    thumbs = entry.get("thumbnails")
+    if isinstance(thumbs, list):
+        for cand in reversed(thumbs):
+            u = cand.get("url") if isinstance(cand, dict) else None
+            if u:
+                return u
+    u = entry.get("thumbnail")
+    return u if isinstance(u, str) and u.startswith(("http://", "https://")) else None
+
+
 def _assets_from_entry(
     entry: Dict[str, Any], prefer_video: bool, pair_audio: bool = True
 ) -> List[MediaAsset]:
@@ -252,6 +281,22 @@ def _assets_from_entry(
                     audio_fmt = _best_audio_only(req)
 
     if not url:
+        # Photo posts — single images and every carousel slide — carry no
+        # formats at all; yt-dlp returns the image itself as ``thumbnail``.
+        # Treat it as the media (this is the "photos don't download" bug).
+        photo = _still_image(entry)
+        if not photo or not host_allowed(photo):
+            return assets
+        assets.append(
+            MediaAsset(
+                url=photo,
+                kind=MediaKind.PHOTO,
+                width=entry.get("width"),
+                height=entry.get("height"),
+                filesize=None,
+                ext=_ext_from_url(photo),
+            )
+        )
         return assets
 
     kind = _classify_vcodec(vcodec, acodec, ext)
@@ -323,6 +368,8 @@ class YtDlpResolver(BaseResolver):
             "skip_download": True,
             "ignoreerrors": False,
             "nocheckcertificate": False,
+            # Photo/carousel posts have no video formats; see base_ydl_opts.
+            "ignore_no_formats_error": True,
         }
 
     async def resolve(self, url: str) -> ResolvedPost:
@@ -422,6 +469,8 @@ class FallbackResolver(BaseResolver):
                 "socket_timeout": 15,
                 "retries": 1,
                 "skip_download": True,
+                # Photo posts have no video formats (see base_ydl_opts).
+                "ignore_no_formats_error": True,
             }
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:

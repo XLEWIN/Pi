@@ -15,23 +15,18 @@ Ported from boabot ``Yumeko/modules/sticker.py`` with Pi branding
 
 Design
 ------
-* Downloads/sends use the Bot API (PTB). Pack operations
-  (GetStickerSet / CreateStickerSet / Add / Remove) run over the shared
-  MTProto session that tagging already maintains (``TAG_MTPROTO=1``)
-  through ``PresenceManager.raw_client()`` — no second session file.
+* Everything runs over the Bot API (PTB) — downloads, pack lookups,
+  create/add/remove.  No MTProto session, no ``TAG_MTPROTO`` switch, no
+  log-channel minting: ``uploadStickerFile`` returns a file_id that
+  ``createNewStickerSet`` / ``addStickerToSet`` consume directly, and
+  ``deleteStickerFromSet`` takes the replied sticker's file_id.
 * Pack short names follow boabot: ``<prefix><#>_<user_id>_by_<bot>``
   where prefix is ``a`` / ``anim`` / ``vid``. The ``_<user_id>_``
   segment is what ``/unkang`` matches for ownership.
-* Pack ownership: always the kang user — resolved by @username, or
-  from the MTProto entity cache that their own /kang message primes
-  via passive updates. Telegram rejects bot-owned sets (USER_IS_BOT),
-  so there is no fall-back to the bot: if the requester can't be
-  resolved the card says so and asks for a @username. boabot's
-  ``PeerIdInvalid`` start-button flow isn't needed because the cache
-  is primed by the same message that triggered the command.
-* Source bytes are uploaded once to the log channel to mint a real
-  ``InputDocument`` (or, for /unkang, the sticker is re-sent there by
-  file_id) and the log message is deleted afterwards.
+* Pack ownership: always the kang user — passed as ``user_id`` on every
+  Bot API call. Telegram rejects bot-owned sets (USER_IS_BOT), and the
+  Bot API takes a plain user id, so no @username lookup (and no
+  entity-cache race) is needed at all.
 * Fixing boabot on the way: ``-b:v:``/``-preset`` ffmpeg bugs (GIF kangs
   silently failed), video-pack limit 50 (not 120), consistent pack-name
   numbering, ``split(";", 1)`` (2+ semicolons crashed /mmf), LANCZOS
@@ -55,31 +50,10 @@ from PIL import Image, ImageDraw, ImageFont
 from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import FSInputFile, Message
-
-from telethon.errors import (
-    RPCError,
-    StickerpackStickersTooMuchError,
-    StickersetInvalidError,
-)
-from telethon.tl.functions.messages import GetStickerSetRequest
-from telethon.tl.functions.stickers import (
-    AddStickerToSetRequest,
-    CreateStickerSetRequest,
-    RemoveStickerFromSetRequest,
-)
-from telethon.tl.types import (
-    InputDocument,
-    InputPeerSelf,
-    InputStickerSetItem,
-    InputStickerSetShortName,
-    InputUser,
-    InputUserSelf,
-)
+from aiogram.types import FSInputFile, InputSticker, Message
 
 from bot.command_handler import parse_command
 from bot.config import settings
-from bot.constants import LOG_CHANNEL_ID
 from bot.emojis import E, EID
 from bot.keyboards.colored import btn_url, build_keyboard
 from bot.logger import logger
@@ -87,10 +61,6 @@ from bot.pipeline import cmd, on
 from bot.reply import (reply_animation, reply_document, reply_sticker,
                        reply_text, reply_video)
 from bot.responses import action_card, field_extra, plain_error
-
-#: Log GC (from bot.constants, same as main.py) — kang sources land
-#: here to mint an InputDocument; the log message is deleted right
-#: after the pack op.
 
 #: Sticker emoji used when neither the sticker nor the command gives one.
 DEFAULT_EMOJI = "\u2714\ufe0f"  # ✔️ (boabot's default)
@@ -283,19 +253,6 @@ def find_url(msg) -> Optional[str]:
     for tok in tokens:
         if tok.lower().startswith(("http://", "https://")):
             return tok
-    return None
-
-
-def _peer_to_input_user(peer):
-    """InputPeer from get_input_entity → the InputUser CreateStickerSet wants."""
-    if peer is None:
-        return None
-    if isinstance(peer, InputPeerSelf):
-        return InputUserSelf()
-    uid = getattr(peer, "user_id", None)
-    ah = getattr(peer, "access_hash", None)
-    if uid and ah is not None:
-        return InputUser(user_id=uid, access_hash=ah)
     return None
 
 
@@ -532,61 +489,88 @@ class Memify:
 
 
 # ═════════════════════════════════════════════════════════════════
-# MTProto access (lazy — avoids importing tagging at module import)
+# Bot API sticker-set access (no MTProto, no log-channel minting)
 # ═════════════════════════════════════════════════════════════════
 
-async def _mtproto_client():
-    """Shared Telethon client from the tagging presence manager, or None."""
-    from bot.modules.tagging.presence.manager import get_manager
+def sticker_format(path: str, kind: str = "resize") -> str:
+    """``uploadStickerFile`` / ``InputSticker.format`` for *path*.
 
-    return await get_manager().raw_client()
-
-
-async def _resolve_owner(client, user):
-    """InputUser for the kang user — @username first, then the entity cache.
-
-    Telethon exposes ``get_input_entity`` — boabot's ``resolve_peer`` is a
-    pyrogram API and does not exist here (calling it raised AttributeError
-    into the old bare excepts, which silently returned None and pushed
-    every kang onto the bot-self fallback → USER_IS_BOT).
-
-    The numeric path is cache-only: Telethon populates that cache from
-    passive MTProto updates, so the very /kang message usually primes it
-    before this runs; the caller wait-retries once to cover the race.
+    Derived from the processed file itself (``resize_image`` → .webp,
+    ``convert_video`` → .webm), with the source *kind* as the tie-break
+    for passthrough downloads (``.tgs`` animated, ``.webm`` video).
     """
-    username = getattr(user, "username", None)
-    if username:
-        try:
-            got = _peer_to_input_user(await client.get_input_entity(username))
-            if got is not None:
-                return got
-        except Exception:  # noqa: BLE001 — unknown username → try the id
-            pass
-    try:
-        got = _peer_to_input_user(await client.get_input_entity(user.id))
-        if got is not None:
-            return got
-    except Exception:  # noqa: BLE001 — not cached yet → caller retries
-        pass
-    return None
+    ext = os.path.splitext(path or "")[1].lower()
+    if ext in (".webm", ".mp4", ".mkv", ".mov"):
+        return "video"
+    if ext == ".tgs":
+        return "animated"
+    if kind in ("convert", "video"):
+        return "video"
+    if kind == "animated":
+        return "animated"
+    return "static"
+
+
+def _set_missing(e: Exception) -> bool:
+    """``getStickerSet`` says this short name doesn't exist yet.
+
+    Telegram answers with ``STICKERSET_INVALID`` / ``STICKERS_INVALID``
+    or a plain "not found" string depending on the Bot API version — all
+    three mean "create it", which is the only call this runs on.
+    """
+    text = str(e).lower()
+    if "not found" in text:
+        return True
+    # "STICKERSET_INVALID" / "STICKERS_INVALID" / "sticker set is invalid"
+    return "sticker" in text and "invalid" in text
 
 
 async def _resolve_pack(
-    client, prefix: str, user_id: int, start_num: int, bot_username: str, max_stickers: int
+    bot, prefix: str, user_id: int, start_num: int, bot_username: str, max_stickers: int
 ) -> Tuple[str, bool]:
-    """Walk numbered packs until one exists with room (or must be created)."""
+    """Walk numbered packs until one exists with room (or must be created).
+
+    Bot API edition of the old MTProto walk: ``getStickerSet`` by short
+    name, whose BadRequest-on-missing is precisely the create signal.
+    """
     num = start_num
     for _ in range(PACK_SEARCH_LIMIT):
         name = pack_name(prefix, user_id, num, bot_username)
         try:
-            rs = await client(GetStickerSetRequest(InputStickerSetShortName(name), hash=0))
-        except StickersetInvalidError:
-            return name, False
-        if (rs.set.count or 0) >= max_stickers:
+            rs = await bot.get_sticker_set(name)
+        except TelegramBadRequest as e:
+            if _set_missing(e):
+                return name, False
+            raise
+        if len(getattr(rs, "stickers", None) or []) >= max_stickers:
             num += 1
             continue
         return name, True
     raise KangError("All your numbered packs are full — try a much higher pack number.")
+
+
+async def _upload_sticker(bot: Bot, user_id: int, path: str, kind: str
+                          ) -> Tuple[str, str]:
+    """``uploadStickerFile`` → ``(file_id, format)``.
+
+    The returned file_id is what ``createNewStickerSet`` /
+    ``addStickerToSet`` store — no document minting, no second upload.
+    """
+    fmt = sticker_format(path, kind)
+    uploaded = await bot.upload_sticker_file(
+        user_id=user_id, sticker=FSInputFile(path), sticker_format=fmt
+    )
+    file_id = getattr(uploaded, "file_id", None)
+    if not file_id:
+        raise KangError("Telegram didn't return a file for that sticker — try again.")
+    return file_id, fmt
+
+
+def _pack_full(e: Exception) -> bool:
+    """BadRequest text meaning "this set already holds 120/50 stickers"."""
+    text = str(e).lower()
+    return ("too much" in text or "too_much" in text
+            or "too many" in text or "full" in text)
 
 
 async def _fetch_url(url: str, dest_base: str) -> str:
@@ -614,14 +598,6 @@ async def _fetch_url(url: str, dest_base: str) -> str:
     with open(path, "wb") as fh:
         fh.write(resp.content)
     return path
-
-
-_MTProto_OFF = "Sticker packs need MTProto (set TAG_MTPROTO=1 and restart)."
-
-# The /kang MTProto update can land a hair after the Bot API update that
-# triggered us — _resolve_owner's numeric path reads that cache, so give
-# it one beat before declaring the requester unresolvable. Patchable in tests.
-_OWNER_RETRY_WAIT = 1.0
 
 
 # ── Send seams: Pi cards carry <tg-emoji> markup, so every reply in
@@ -684,13 +660,7 @@ async def kang_command(message: Message, bot: Bot) -> None:
     prefix, max_stickers, needs_ffmpeg = pack_profile(kind)
     prog = await _send_reply(msg, f"{E.SPARKLE} Processing your request\u2026")
 
-    client = await _mtproto_client()
-    if client is None:
-        await _edit_reply(prog, plain_error(_MTProto_OFF))
-        return
-
     tmp = tempfile.mkdtemp(prefix="pi_kang_")
-    log_msg = None
     try:
         # 1. source bytes ─────────────────────────────────────────
         if url is not None:
@@ -722,56 +692,37 @@ async def kang_command(message: Message, bot: Bot) -> None:
 
         # 3. pack resolution ──────────────────────────────────────
         packname, exists = await _resolve_pack(
-            client, prefix, user.id, packnum, settings.bot_username, max_stickers
+            bot, prefix, user.id, packnum, settings.bot_username, max_stickers
         )
 
-        # 4. mint a real InputDocument via the log channel ────────
-        log_msg = await client.send_file(LOG_CHANNEL_ID, path, force_document=True)
-        doc = getattr(log_msg.media, "document", None) if log_msg.media else None
-        if doc is None:
-            raise KangError("Couldn't prepare the sticker file for upload.")
-        item = InputStickerSetItem(
-            document=InputDocument(
-                id=doc.id,
-                access_hash=doc.access_hash,
-                file_reference=doc.file_reference or b"",
-            ),
-            emoji=sticker_emoji,
-        )
+        # 4. upload once → file_id (no log-channel minting) ───────
+        file_id, fmt = await _upload_sticker(bot, user.id, path, kind)
+        item = InputSticker(sticker=file_id, format=fmt, emoji_list=[sticker_emoji])
 
         # 5. add to the existing pack, or create it ───────────────
         if exists:
             await _edit_reply(prog, f"{E.ADD} Adding to your existing pack\u2026")
             try:
-                await client(AddStickerToSetRequest(
-                    stickerset=InputStickerSetShortName(packname), sticker=item
-                ))
-            except StickerpackStickersTooMuchError as e:
-                raise KangError(
-                    "That pack is full \u2014 kang into another one, e.g. /kang 2"
-                ) from e
+                await bot.add_sticker_to_set(
+                    user_id=user.id, name=packname, sticker=item
+                )
+            except TelegramBadRequest as e:
+                if _pack_full(e):
+                    raise KangError(
+                        "That pack is full \u2014 kang into another one, e.g. /kang 2"
+                    ) from e
+                raise
         else:
             await _edit_reply(prog, f"{E.ADD} Creating a new sticker pack\u2026")
-            title = pack_title(user, prefix, packnum)
-            # Owner must be the requester: Telegram rejects bot-owned sets
-            # (USER_IS_BOT — our MTProto session IS the bot). The entity
-            # cache is primed by this very message; one wait-retry covers
-            # the arrival race, then fail with a clear card.
-            owner = await _resolve_owner(client, user)
-            if owner is None:
-                await asyncio.sleep(_OWNER_RETRY_WAIT)
-                owner = await _resolve_owner(client, user)
-            if owner is None:
-                raise KangError(
-                    "Couldn't resolve your account for the sticker pack \u2014 "
-                    "set a @username and try again."
-                )
-            await client(CreateStickerSetRequest(
-                user_id=owner,
-                title=title,
-                short_name=packname,
+            # The Bot API takes the owner as a plain user_id, so there is
+            # nothing to resolve: user.id IS the owner (Telegram rejects
+            # bot-owned sets — USER_IS_BOT — and this is never the bot).
+            await bot.create_new_sticker_set(
+                user_id=user.id,
+                name=packname,
+                title=pack_title(user, prefix, packnum),
                 stickers=[item],
-            ))
+            )
 
         # 6. success ──────────────────────────────────────────────
         markup = build_keyboard([[
@@ -790,18 +741,13 @@ async def kang_command(message: Message, bot: Bot) -> None:
 
     except KangError as e:
         await _edit_reply(prog, plain_error(escape(str(e))))
-    except RPCError as e:
-        logger.warning("kang RPC failure: %s: %s", type(e).__name__, e)
+    except TelegramBadRequest as e:
+        logger.warning("kang Bot API failure: %s: %s", type(e).__name__, e)
         await _edit_reply(prog, plain_error(f"Telegram rejected the sticker: {escape(str(e))}"))
     except Exception as e:  # noqa: BLE001 — last-resort card, never a crash
         logger.exception("kang failed unexpectedly")
         await _edit_reply(prog, plain_error(f"Something went wrong ({type(e).__name__})."))
     finally:
-        if log_msg is not None:
-            try:
-                await client.delete_messages(LOG_CHANNEL_ID, [log_msg.id])
-            except Exception:  # noqa: BLE001 — cleanup is best-effort
-                pass
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -831,31 +777,13 @@ async def unkang_command(message: Message, bot: Bot) -> None:
         return
 
     prog = await _send_reply(msg, f"{E.SPARKLE} Removing sticker from your pack\u2026")
-    client = await _mtproto_client()
-    if client is None:
-        await _edit_reply(prog, plain_error(_MTProto_OFF))
-        return
-
-    log_msg = None
     try:
-        # Re-send by file_id → the log channel holds the SAME document,
-        # giving us id/access_hash/file_reference without a file_id decode.
-        log_msg = await bot.send_sticker(LOG_CHANNEL_ID, sticker=st.file_id)
-        fetched = await client.get_messages(LOG_CHANNEL_ID, ids=log_msg.message_id)
-        doc = getattr(fetched.media, "document", None) if fetched is not None and fetched.media else None
-        if doc is None:
-            raise KangError("Couldn't read that sticker's file reference.")
-        await client(RemoveStickerFromSetRequest(
-            sticker=InputDocument(
-                id=doc.id,
-                access_hash=doc.access_hash,
-                file_reference=doc.file_reference or b"",
-            )
-        ))
-    except KangError as e:
-        await _edit_reply(prog, plain_error(escape(str(e))))
-    except RPCError as e:
-        logger.warning("unkang RPC failure: %s: %s", type(e).__name__, e)
+        # deleteStickerFromSet takes the file_id straight off the replied
+        # sticker — ownership was already proven by the _<user.id>_ match
+        # on the set name, so no lookup (and no MTProto session) is needed.
+        await bot.delete_sticker_from_set(sticker=st.file_id)
+    except TelegramBadRequest as e:
+        logger.warning("unkang Bot API failure: %s: %s", type(e).__name__, e)
         await _edit_reply(prog, plain_error(f"Telegram rejected the removal: {escape(str(e))}"))
     except Exception as e:  # noqa: BLE001
         logger.exception("unkang failed unexpectedly")
@@ -867,12 +795,6 @@ async def unkang_command(message: Message, bot: Bot) -> None:
             icon=E.CHECK,
         )
         await _edit_reply(prog, card, parse_mode=ParseMode.HTML)
-    finally:
-        if log_msg is not None:
-            try:
-                await bot.delete_message(LOG_CHANNEL_ID, log_msg.message_id)
-            except Exception:  # noqa: BLE001
-                pass
 
 
 # ═════════════════════════════════════════════════════════════════

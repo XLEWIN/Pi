@@ -615,12 +615,34 @@ class TestEditPath(unittest.TestCase):
         data = [b.callback_data for row in markup.inline_keyboard for b in row]
         self.assertTrue(any(d.startswith("help:open:") for d in data), data)
 
-    def test_start_screen_stays_html(self):
-        # /start is not part of the rich menu — it keeps its HTML text.
+    def test_start_screen_edits_rich_without_a_keyboard(self):
+        # help:start rewrites the message as the /start screen — rich,
+        # with the whole five-entry menu in the body and no inline
+        # keyboard riding along to duplicate it.
         bot, q = _RichBot(), _Query("help:start")
         run(help_mod.help_callback(q, bot, {"username": BOT_USERNAME}))
-        self.assertEqual(bot.calls, [])
-        self.assertTrue(q.message.edits)
+        self.assertEqual(bot.api_methods, ["editMessageText"])
+        call = bot.calls[0]
+        blocks = call.rich_message["blocks"]
+        R.validate(blocks)
+        self.assertIsNone(call.reply_markup, "rich start screen keeps its keyboard off")
+        btns = [b for blk in blocks if blk.get("type") == "buttons"
+                for b in blk.get("buttons", [])]
+        self.assertEqual(len(btns), 5, "the five menu entries must be in the body")
+        labels = []
+        for b in btns:
+            text = b["text"]
+            self.assertIsInstance(text, list, f"icon dropped from {text!r}")
+            self.assertTrue(
+                any(n.get("type") == "custom_emoji" for n in text
+                    if isinstance(n, dict)),
+                f"no premium emoji on {text!r}",
+            )
+            labels.append("".join(p for p in text if isinstance(p, str)).strip())
+        self.assertIn("Help Menu", labels)
+        self.assertIn("Dashboard", labels)
+        # The HTML fallback still carries the keyboard.
+        self.assertFalse(q.message.edits)
 
 
 if __name__ == "__main__":

@@ -172,6 +172,11 @@ async def send_newuser_log(bot, user, chat_title: str = None) -> None:
         logger.warning(f"#newuser plain log send failed: {e}")
 
 
+#: Dashboard link — shared by the rich body and the HTML keyboard so
+#: the two renderers cannot drift apart.
+URL_DASHBOARD = "https://piweb-teal.vercel.app/"
+
+
 def build_start_keyboard(icons: bool = True):
     """Start menu keyboard with colored buttons; icons=False = plain retry."""
     from bot.emojis import EID
@@ -184,7 +189,7 @@ def build_start_keyboard(icons: bool = True):
                         icon_emoji_id=EID.INFO if icons else None),
         ],
         [
-            btn_url("Dashboard", "https://piweb-teal.vercel.app/",
+            btn_url("Dashboard", URL_DASHBOARD,
                     icon_emoji_id=EID.WEB if icons else None),
         ],
         [
@@ -204,11 +209,13 @@ def build_start_blocks(username: str) -> List[Dict[str, Any]]:
     assembled from — ``START_TITLE_LINE``, ``BOT_DESCRIPTION`` and
     ``START_HINT_LINE`` — so the two renderers cannot drift apart.
 
-    The keyboard deliberately stays in ``reply_markup`` instead of
-    becoming an in-body ``buttons`` block: ``RichMessageButton`` carries
-    no ``icon_custom_emoji_id``, so moving it would keep the colours but
-    silently drop the owner's custom-emoji icons.  Same keyboard, same
-    colours, on both paths — the fallback stays invisible.
+    The menu itself lives IN the body, exactly like /help's module
+    grid: the same five entries as :func:`build_start_keyboard`, the
+    same row order, the same colours and the owner's custom-emoji
+    icons inline in each label (Bot API 10.3 puts the premium emoji in
+    the button's RichText, not an ``icon_custom_emoji_id`` field).  The
+    rich path therefore attaches NO keyboard — the HTML fallback still
+    does, so nothing is lost on an old API server.
     """
     return [
         R.heading(R.html_to_rich(
@@ -216,6 +223,26 @@ def build_start_blocks(username: str) -> List[Dict[str, Any]]:
         ), 2),
         R.paragraph(R.html_to_rich(BOT_DESCRIPTION)),
         R.paragraph(R.html_to_rich(START_HINT_LINE.format(arrow=E.ARROW))),
+        R.divider(),
+        R.buttons_block(
+            [
+                R.button("Bot To Chat", url=URL_ADD_TO_GROUP, icon=E.ADD),
+                R.button("Help Menu", callback_data="start:help",
+                         style="primary", icon=E.INFO),
+            ],
+            align="center",
+        ),
+        R.buttons_block(
+            [R.button("Dashboard", url=URL_DASHBOARD, icon=E.WEB)],
+            align="center",
+        ),
+        R.buttons_block(
+            [
+                R.button("Channel", url=URL_OFFICIAL_CHANNEL, icon=E.ANNOUNCE),
+                R.button("Network", url=URL_NETWORK, icon=E.TRAVEL),
+            ],
+            align="center",
+        ),
     ]
 
 
@@ -283,24 +310,34 @@ async def start_command(message: Message, bot: Bot, bot_data: dict, args: list) 
     keyboard = build_start_keyboard()
     plain_keyboard = build_start_keyboard(icons=False)
 
-    # Rich first — same three blocks, same keyboard (colours + icons
-    # intact).  A timeout is terminal here: falling through to HTML would
+    # Rich first — same three blocks, the whole menu in the body.  The
+    # message carries NO reply_markup: the five entries are in-body
+    # buttons now, so an attached keyboard would duplicate every one of
+    # them.  A timeout is terminal here: falling through to HTML would
     # stack a second full RTT on top of the dead one, which is the
     # multi-second stall this command is guarded against.  Only a fast
     # rejection (unsupported block / style enum) earns the HTML retry.
     blocks = rs.build_blocks(build_start_blocks, username)
     if blocks:
-        try:
-            await asyncio.wait_for(
-                R.send_rich(bot, chat.id, blocks, reply_markup=keyboard),
-                timeout=REPLY_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            logger.error("Start reply timed out (network/API)")
-            return
-        except Exception as e:
-            logger.debug(f"Start rich send rejected ({e}); using HTML")
-        else:
+        attempts = [blocks]
+        if R.has_styled_buttons(blocks):
+            attempts.append(R.unstyle(blocks))
+        for i, attempt in enumerate(attempts):
+            try:
+                await asyncio.wait_for(
+                    R.send_rich(bot, chat.id, attempt),
+                    timeout=REPLY_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.error("Start reply timed out (network/API)")
+                return
+            except Exception as e:
+                logger.debug(
+                    "Start rich send attempt %s/%s failed (%s); %s",
+                    i + 1, len(attempts), e,
+                    "using HTML" if i == len(attempts) - 1 else "retrying",
+                )
+                continue
             # Rich is on screen — only now do delete / DB / channel log.
             if message:
                 _spawn(_safe_delete(message))

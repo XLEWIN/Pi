@@ -368,6 +368,10 @@ def _rich_main_blocks(page: int) -> list[dict]:
                         mod["title"],
                         callback_data=f"{_CB}:open:{mod['key']}:{page}:0",
                         style="primary",
+                        # Same custom-emoji icon the keyboard variant
+                        # carries (RichMessageButton has no
+                        # icon_custom_emoji_id — it rides in the label).
+                        icon=mod["icon"],
                     )
                     for mod in mods[i : i + COLS]
                 ],
@@ -425,7 +429,8 @@ def _rich_group_blocks(username: str) -> list[dict]:
         R.paragraph(R.html_to_rich(f"{E.ARROW} Tap the button below to continue")),
         R.divider(),
         R.buttons_block(
-            [R.button("Open in DM", url=f"https://t.me/{username}?start=help")],
+            [R.button("Open in DM", url=f"https://t.me/{username}?start=help",
+                      icon=E.USER)],
             align="center",
         ),
     ]
@@ -819,12 +824,16 @@ async def help_callback(callback_query: CallbackQuery, bot: Bot, bot_data: dict)
 
     if action == "start":
         # Local import — start.py delegates back to us inside its callback.
-        from bot.modules.start import build_start_keyboard
+        from bot.modules.start import build_start_blocks, build_start_keyboard
 
+        username = _bot_username(bot, bot_data)
         await _answer(query)
-        await _safe_edit(
+        await _safe_edit_rich(
+            bot,
             query,
-            _build_start_message(_bot_username(bot, bot_data)),
+            _blocks(build_start_blocks, username),
+            None,  # rich body carries the whole menu (no inline keyboard)
+            _build_start_message(username),
             build_start_keyboard(),
             build_start_keyboard(icons=False),
         )

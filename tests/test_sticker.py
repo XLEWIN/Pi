@@ -11,9 +11,11 @@ Environment isolation (BEFORE any bot import):
     * LOCALAPPDATA points at a temp dir so any DB touch stays isolated.
 
 No network: pure helpers are called directly; handlers run against
-fakes and the MTProto client seam (``_mtproto_client``) is patched, so
-no Telegram or ffmpeg call ever happens. The one real dependency is
-PIL, used by the resize round-trip test.
+fakes and the Bot API sticker-set seam (``get_sticker_set`` /
+``upload_sticker_file`` / ``create_new_sticker_set`` /
+``add_sticker_to_set`` / ``delete_sticker_from_set``) is implemented by
+``_WorkingBot``, so no Telegram, MTProto or ffmpeg call ever happens.
+The one real dependency is PIL, used by the resize round-trip test.
 
 Handlers are aiogram-era: ``await call(fn, event, bot=...)`` passes
 only the deps each real signature declares.
@@ -45,6 +47,7 @@ atexit.register(shutil.rmtree, _TEST_DIR, ignore_errors=True)
 
 # ── Imports (after env) ───────────────────────────────────────────
 from aiofakes import call, command_filters  # noqa: E402
+from aiogram.exceptions import TelegramBadRequest  # noqa: E402
 from bot import pipeline  # noqa: E402
 from bot.constants import HELP_MENU  # noqa: E402
 from bot.modules import sticker as sm  # noqa: E402
@@ -158,6 +161,27 @@ class _FakeBot:
     async def delete_message(self, chat_id, message_id, **kw):
         self.calls.append(("delete_message", chat_id, message_id))
 
+    # ── sticker-set seam: a pack call here is an unexpected call ──
+    async def get_sticker_set(self, name):
+        self.calls.append(("get_sticker_set", name))
+        raise AssertionError("pack lookup attempted in unit test")
+
+    async def upload_sticker_file(self, **kw):
+        self.calls.append(("upload_sticker_file", kw))
+        raise AssertionError("sticker upload attempted in unit test")
+
+    async def create_new_sticker_set(self, **kw):
+        self.calls.append(("create_new_sticker_set", kw))
+        raise AssertionError("pack create attempted in unit test")
+
+    async def add_sticker_to_set(self, **kw):
+        self.calls.append(("add_sticker_to_set", kw))
+        raise AssertionError("pack add attempted in unit test")
+
+    async def delete_sticker_from_set(self, sticker=None, **kw):
+        self.calls.append(("delete_sticker_from_set", sticker))
+        raise AssertionError("pack remove attempted in unit test")
+
 
 def _sticker(file_id="STFILE", set_name="a_42_by_PiModulerBot", emoji="🔥",
              animated=False, video=False, file_name="sticker.webp",
@@ -176,11 +200,10 @@ def _reply(sticker=None, photo=None, animation=None, video=None, document=None):
     )
 
 
-def _no_mtproto():
-    """Patch the client seam to 'MTProto off' for handler tests."""
-    async def _none():
-        return None
-    return mock.patch.object(sm, "_mtproto_client", _none)
+def _bad_request(message: str) -> "TelegramBadRequest":
+    """aiogram BadRequest shaped like the real one (needs a method)."""
+    method = SimpleNamespace(__api_method__="getStickerSet")
+    return TelegramBadRequest(method=method, message=message)
 
 
 def _style(btn):
@@ -451,29 +474,33 @@ class TestKangValidation(unittest.IsolatedAsyncioTestCase):
         await call(sm.kang_command, msg, bot=_FakeBot())
         self.assertIn("Unable to kang", msg.last["text"])
 
-    async def test_photo_reply_mtproto_off_error(self):
+    async def test_photo_reply_kangs_over_bot_api(self):
         msg = _Msg(text="/kang", reply=_reply(photo=[SimpleNamespace(file_id="P")]))
-        with _no_mtproto():
-            await call(sm.kang_command, msg, bot=_FakeBot())
+        bot = _WorkingBot()
+        await call(sm.kang_command, msg, bot=bot)
+
         self.assertIn("Processing", msg.replies[0]["text"])
-        # the failure was edited onto the progress message, not re-sent
+        # every step was edited onto the single progress message
         self.assertEqual(len(msg.replies), 1)
-        self.assertTrue(msg.prog.edits)
-        self.assertIn("MTProto", msg.prog.last["text"])
+        self.assertIn("successfully", msg.prog.last["text"].lower())
+        self.assertEqual(bot.created["user_id"], USER_ID)
+        self.assertTrue(bot.created["name"].startswith("a_42_by_"))
+        self.assertEqual([u["format"] for u in bot.uploads], ["static"])
 
-    async def test_url_kang_reaches_mtproto_check(self):
+    async def test_url_kang_uses_the_same_bot_api_path(self):
         msg = _Msg(text="/kang https://example.com/a.png")
-        seen = {}
+        bot = _WorkingBot()
 
-        async def _rec():
-            seen["hit"] = True
-            return None
+        async def _local(url, dest_base):
+            path = dest_base + ".png"
+            Image.new("RGB", (32, 32), (1, 2, 3)).save(path, "PNG")
+            return path
 
-        with mock.patch.object(sm, "_mtproto_client", _rec):
-            await call(sm.kang_command, msg, bot=_FakeBot())
-        self.assertTrue(seen.get("hit"))
+        with mock.patch.object(sm, "_fetch_url", _local):
+            await call(sm.kang_command, msg, bot=bot)
         self.assertIn("Processing", msg.replies[0]["text"])
-        self.assertIn("MTProto", msg.prog.last["text"])
+        self.assertIsNotNone(bot.created, "the URL path must reach pack create")
+        self.assertTrue(bot.created["name"].startswith("a_42_by_"))
 
     async def test_pack_number_and_emoji_parsed(self):
         # Exercise the pure pipeline the handler uses: URL + number + emoji
@@ -488,53 +515,31 @@ class TestKangValidation(unittest.IsolatedAsyncioTestCase):
 # /kang create path — owner resolution (regression: USER_IS_BOT)
 # ═════════════════════════════════════════════════════════════════
 
-from telethon.errors import StickersetInvalidError  # noqa: E402
-from telethon.tl.types import InputPeerUser, InputUser  # noqa: E402
-
 from PIL import Image  # noqa: E402 — module-level: _WorkingBot writes real PNGs
 
 
-class _FakeMtClient:
-    """Telethon stand-in for the kang create path.
+class _WorkingBot(_FakeBot):
+    """Bot API seam: downloads write a real image, pack ops are recorded.
 
-    Deliberately exposes ONLY ``get_input_entity`` — if production ever
-    regresses to boabot's pyrogram-only ``resolve_peer``, these tests
-    fail instead of silently returning None (that AttributeError was
-    swallowed by bare excepts and pushed every kang onto the bot-self
-    fallback → USER_IS_BOT).
+    ``set_exists=False`` makes ``get_sticker_set`` raise the BadRequest
+    the real API answers with for an unknown short name — the "create
+    it" signal production keys off. ``full_then_missing=True`` answers
+    one full pack and then "missing", which is the walk-to-the-next-
+    number scenario. Every pack method also records into ``calls`` so
+    tests can assert what was NOT touched.
     """
 
-    def __init__(self, owner_peer=None):
-        self.owner_peer = owner_peer          # None → resolver keeps missing
-        self.resolve_calls: list = []
-        self.requests: list = []
+    def __init__(self, *, set_exists=False, stickers=(),
+                 full_then_missing=False):
+        super().__init__()
+        self.set_exists = set_exists
+        self.stickers = list(stickers)
+        self.full_then_missing = full_then_missing
+        self.set_lookups: list = []
+        self.uploads: list = []
         self.created = None
-
-    async def get_input_entity(self, ref):
-        self.resolve_calls.append(ref)
-        if self.owner_peer is None:
-            raise ValueError("Could not find the entity")
-        return self.owner_peer
-
-    async def __call__(self, request):
-        self.requests.append(request)
-        name = type(request).__name__
-        if name == "GetStickerSetRequest":
-            raise StickersetInvalidError(request=None)  # pack doesn't exist yet
-        if name == "CreateStickerSetRequest":
-            self.created = request
-        return None
-
-    async def send_file(self, chat_id, path, force_document=False):
-        doc = SimpleNamespace(id=111, access_hash=222, file_reference=b"ref")
-        return SimpleNamespace(id=7, media=SimpleNamespace(document=doc))
-
-    async def delete_messages(self, chat_id, ids):
-        self.requests.append(("delete_messages", chat_id, tuple(ids)))
-
-
-class _WorkingBot(_FakeBot):
-    """Bot API seam: get_file + download_file write a real image."""
+        self.added: list = []
+        self.deleted: list = []
 
     async def get_file(self, file_id):
         self.calls.append(("get_file", file_id))
@@ -546,90 +551,207 @@ class _WorkingBot(_FakeBot):
             Image.new("RGB", (64, 64), (10, 20, 30)).save(destination, "PNG")
         return b""
 
+    async def get_sticker_set(self, name):
+        self.set_lookups.append(name)
+        if self.full_then_missing:
+            if len(self.set_lookups) == 1:
+                return SimpleNamespace(
+                    name=name, stickers=[object()] * 120)  # "resize" cap
+            raise _bad_request("Bad Request: STICKERSET_INVALID")
+        if not self.set_exists:
+            raise _bad_request("Bad Request: STICKERSET_INVALID")
+        return SimpleNamespace(name=name, stickers=list(self.stickers))
 
-class TestKangOwnerResolution(unittest.IsolatedAsyncioTestCase):
-    async def test_resolve_owner_prefers_username_via_telethon_api(self):
-        calls = []
+    async def upload_sticker_file(self, user_id, sticker, sticker_format):
+        self.uploads.append({
+            "user_id": user_id, "format": sticker_format,
+            "path": str(getattr(sticker, "path", "")),
+        })
+        return SimpleNamespace(file_id="UPLOADED_FILE_ID")
 
-        class _C:
-            async def get_input_entity(self, ref):
-                calls.append(ref)
-                return InputPeerUser(USER_ID, 77)
+    async def create_new_sticker_set(self, user_id, name, title, stickers, **kw):
+        self.created = {"user_id": user_id, "name": name, "title": title,
+                        "stickers": list(stickers)}
+        self.calls.append(("create_new_sticker_set", name))
+        return True
 
-        got = await sm._resolve_owner(
-            _C(), SimpleNamespace(id=USER_ID, username="lewin"))
-        self.assertEqual(calls, ["lewin"])
-        self.assertIsInstance(got, InputUser)
-        self.assertEqual((got.user_id, got.access_hash), (USER_ID, 77))
+    async def add_sticker_to_set(self, user_id, name, sticker):
+        self.added.append({"user_id": user_id, "name": name, "sticker": sticker})
+        self.calls.append(("add_sticker_to_set", name))
+        return True
 
-    async def test_resolve_owner_numeric_cache_fallback(self):
-        calls = []
+    async def delete_sticker_from_set(self, sticker=None, **kw):
+        self.deleted.append(sticker)
+        self.calls.append(("delete_sticker_from_set", sticker))
+        return True
 
-        class _C:
-            async def get_input_entity(self, ref):
-                calls.append(ref)
-                if isinstance(ref, str):
-                    raise ValueError("no such username")
-                return InputPeerUser(ref, 99)
 
-        got = await sm._resolve_owner(
-            _C(), SimpleNamespace(id=USER_ID, username=None))
-        self.assertEqual(calls, [USER_ID])
-        self.assertEqual(got.access_hash, 99)
+class TestKangPackFlow(unittest.IsolatedAsyncioTestCase):
+    """Bot API create/add path — the owner is the requester's user id.
 
-    async def test_resolve_owner_not_cached_is_none(self):
-        class _C:
-            async def get_input_entity(self, ref):
-                raise ValueError("Could not find the entity")
-
-        self.assertIsNone(await sm._resolve_owner(
-            _C(), SimpleNamespace(id=USER_ID, username=None)))
+    Regression shield for USER_IS_BOT: the pack owner must be the
+    requester, never the bot, and the Bot API takes it as a plain id so
+    no @username (and no MTProto entity cache) is required — the fake
+    message deliberately has ``username=None``.
+    """
 
     async def test_create_uses_requester_owner_not_self(self):
         msg = _Msg(text="/kang", reply=_reply(
             photo=[SimpleNamespace(file_id="P")]))
-        client = _FakeMtClient(owner_peer=InputPeerUser(USER_ID, 1234))
+        bot = _WorkingBot()
+        await call(sm.kang_command, msg, bot=bot)
 
-        async def _give():
-            return client
+        self.assertIsNotNone(bot.created)
+        self.assertEqual(bot.created["user_id"], USER_ID)   # requester…
+        self.assertNotEqual(bot.created["user_id"], 1)       # …not the bot
+        self.assertTrue(bot.created["name"].startswith("a_42_by_"))
 
-        with mock.patch.object(sm, "_mtproto_client", _give):
-            await call(sm.kang_command, msg, bot=_WorkingBot())
-        self.assertIsNotNone(client.created)
-        owner = client.created.user_id
-        self.assertIsInstance(owner, InputUser)
-        self.assertNotIsInstance(owner, sm.InputUserSelf)
-        self.assertEqual((owner.user_id, owner.access_hash), (USER_ID, 1234))
-        self.assertTrue(client.created.short_name.startswith("a_42_by_"))
+        # one upload → file_id, format derived from the processed file
+        self.assertEqual([u["format"] for u in bot.uploads], ["static"])
+        item = bot.created["stickers"][0]
+        self.assertEqual(item.sticker, "UPLOADED_FILE_ID")
+        self.assertEqual(item.format, "static")
+        self.assertEqual(item.emoji_list, ["\u2714\ufe0f"])  # DEFAULT_EMOJI
+
+        # no log-channel minting / cleanup round trip
+        self.assertFalse([c for c in bot.calls
+                          if c[0] in ("send_sticker", "delete_message")])
+
         # success card was edited onto the single progress message
         self.assertEqual(len(msg.replies), 1)
         self.assertIn("successfully", msg.prog.last["text"].lower())
         self.assertEqual(msg.prog.last.get("parse_mode"), "HTML")
-        # colored "View Sticker Pack" button (success/green)
         markup = msg.prog.last.get("reply_markup")
         self.assertIsNotNone(markup)
-        view_btn = markup.inline_keyboard[0][0]
-        self.assertEqual(_style(view_btn), "success")
-        # log-channel source upload cleaned up
-        self.assertIn(("delete_messages", sm.LOG_CHANNEL_ID, (7,)),
-                      client.requests)
+        self.assertEqual(_style(markup.inline_keyboard[0][0]), "success")
+        urls = [b.url for row in markup.inline_keyboard for b in row]
+        self.assertIn(
+            f"https://t.me/addstickers/{bot.created['name']}", urls)
 
-    async def test_unresolvable_owner_clear_error_no_create(self):
+    async def test_existing_pack_adds_instead_of_creating(self):
         msg = _Msg(text="/kang", reply=_reply(
             photo=[SimpleNamespace(file_id="P")]))
-        client = _FakeMtClient(owner_peer=None)
+        bot = _WorkingBot(set_exists=True, stickers=[object()] * 3)
+        await call(sm.kang_command, msg, bot=bot)
 
-        async def _give():
-            return client
+        self.assertIsNone(bot.created, "an existing pack must not be recreated")
+        self.assertEqual(len(bot.added), 1)
+        self.assertEqual(bot.added[0]["user_id"], USER_ID)
+        self.assertEqual(bot.added[0]["name"], "a_42_by_PiModulerBot")
+        self.assertEqual(bot.added[0]["sticker"].sticker, "UPLOADED_FILE_ID")
+        seen = " ".join(str(e.get("text", "")).lower()
+                        for e in msg.prog.edits)
+        self.assertIn("existing pack", seen)
 
-        with mock.patch.object(sm, "_mtproto_client", _give), \
-                mock.patch.object(sm, "_OWNER_RETRY_WAIT", 0):
-            await call(sm.kang_command, msg, bot=_WorkingBot())
-        self.assertIsNone(client.created)            # create never attempted
-        self.assertEqual(len(client.resolve_calls), 2)  # one wait-retry
-        last = msg.prog.last["text"]
-        self.assertIn("resolve your account", last)
-        self.assertIn("@username", last)
+    async def test_full_pack_walks_to_the_next_number(self):
+        msg = _Msg(text="/kang", reply=_reply(
+            photo=[SimpleNamespace(file_id="P")]))
+        bot = _WorkingBot(full_then_missing=True)
+        await call(sm.kang_command, msg, bot=bot)
+
+        self.assertEqual(bot.set_lookups,
+                         ["a_42_by_PiModulerBot", "a1_42_by_PiModulerBot"])
+        self.assertIsNotNone(bot.created)
+        self.assertEqual(bot.created["name"], "a1_42_by_PiModulerBot")
+
+    async def test_every_pack_full_is_a_clear_error(self):
+        msg = _Msg(text="/kang", reply=_reply(
+            photo=[SimpleNamespace(file_id="P")]))
+        bot = _WorkingBot(set_exists=True, stickers=[object()] * 120)
+        with mock.patch.object(sm, "PACK_SEARCH_LIMIT", 3):
+            await call(sm.kang_command, msg, bot=bot)
+
+        self.assertIsNone(bot.created)
+        self.assertEqual(bot.uploads, [], "nothing should upload for a full walk")
+        self.assertIn("numbered packs are full", msg.prog.last["text"])
+
+    async def test_full_pack_on_add_is_a_clear_error(self):
+        msg = _Msg(text="/kang", reply=_reply(
+            photo=[SimpleNamespace(file_id="P")]))
+        bot = _WorkingBot(set_exists=True, stickers=[object()] * 2)
+
+        async def _full(**kw):
+            raise _bad_request("Bad Request: STICKERS_TOO_MUCH")
+
+        bot.add_sticker_to_set = _full
+        await call(sm.kang_command, msg, bot=bot)
+
+        self.assertIn("That pack is full", msg.prog.last["text"])
+        self.assertIn("/kang 2", msg.prog.last["text"])
+
+    async def test_other_bad_request_is_surfaced(self):
+        msg = _Msg(text="/kang", reply=_reply(
+            photo=[SimpleNamespace(file_id="P")]))
+        bot = _WorkingBot()
+
+        async def _boom(**kw):
+            raise _bad_request("Bad Request: PEER_ID_INVALID")
+
+        bot.create_new_sticker_set = _boom
+        await call(sm.kang_command, msg, bot=bot)
+        self.assertIn("Telegram rejected the sticker", msg.prog.last["text"])
+
+
+class TestStickerFormat(unittest.TestCase):
+    """uploadStickerFile/InputSticker format is derived from the file."""
+
+    def test_processed_outputs(self):
+        self.assertEqual(sm.sticker_format("x/webp_out.webp"), "static")
+        self.assertEqual(sm.sticker_format("x/clip.webm"), "video")
+        self.assertEqual(sm.sticker_format("x/sticker.tgs"), "animated")
+
+    def test_source_kind_is_the_tie_breaker(self):
+        # Passthrough downloads keep their kind even before conversion.
+        self.assertEqual(sm.sticker_format("x/src.jpg", "resize"), "static")
+        self.assertEqual(sm.sticker_format("x/src.mp4", "convert"), "video")
+        self.assertEqual(sm.sticker_format("x/src.webm", "video"), "video")
+        self.assertEqual(sm.sticker_format("x/src.tgs", "animated"), "animated")
+
+    def test_unknown_extension_falls_back_to_the_kind(self):
+        self.assertEqual(sm.sticker_format("x/noext", "convert"), "video")
+        self.assertEqual(sm.sticker_format("x/noext", "resize"), "static")
+
+
+class TestBadRequestParsing(unittest.IsolatedAsyncioTestCase):
+    """Which BadRequests mean 'pack missing', 'pack full', 'other'."""
+
+    def test_missing_set_signals_create(self):
+        for text in ("Bad Request: STICKERSET_INVALID",
+                     "Bad Request: STICKERS_INVALID",
+                     "Bad Request: sticker set not found",
+                     "Bad Request: invalid sticker set name"):
+            with self.subTest(text=text):
+                self.assertTrue(sm._set_missing(_bad_request(text)))
+
+    def test_missing_set_ignores_unrelated_errors(self):
+        for text in ("Bad Request: PEER_ID_INVALID",
+                     "Bad Request: STICKERS_TOO_MUCH"):
+            with self.subTest(text=text):
+                self.assertFalse(sm._set_missing(_bad_request(text)))
+
+    def test_pack_full_detection(self):
+        for text in ("Bad Request: STICKERS_TOO_MUCH",
+                     "Bad Request: pack is full"):
+            with self.subTest(text=text):
+                self.assertTrue(sm._pack_full(_bad_request(text)))
+        self.assertFalse(sm._pack_full(_bad_request("Bad Request: PEER_ID_INVALID")))
+
+    async def test_resolve_pack_missing_raises_create_signal(self):
+        bot = _WorkingBot(set_exists=False)
+        name, exists = await sm._resolve_pack(
+            bot, "a", USER_ID, 0, "PiModulerBot", 120)
+        self.assertEqual(name, "a_42_by_PiModulerBot")
+        self.assertFalse(exists)
+
+    async def test_resolve_pack_rejects_unrelated_bad_request(self):
+        bot = _WorkingBot(set_exists=True)
+
+        async def _boom(name):
+            raise _bad_request("Bad Request: FLOOD_WAIT_4")
+
+        bot.get_sticker_set = _boom
+        with self.assertRaises(TelegramBadRequest):
+            await sm._resolve_pack(bot, "a", USER_ID, 0, "B", 120)
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -651,22 +773,26 @@ class TestUnkangValidation(unittest.IsolatedAsyncioTestCase):
         msg = _Msg(text="/unkang", reply=_reply(
             sticker=_sticker(set_name="a_999_by_OtherBot")
         ))
-        await call(sm.unkang_command, msg, bot=_FakeBot())
+        bot = _FakeBot()
+        await call(sm.unkang_command, msg, bot=bot)
         self.assertIn("isn't in your pack", msg.last["text"])
-        # refused BEFORE any MTProto call — the seam must not be touched
-        with mock.patch.object(
-            sm, "_mtproto_client",
-            mock.AsyncMock(side_effect=AssertionError("should not be called")),
-        ):
-            await call(sm.unkang_command, msg, bot=_FakeBot())
+        # refused BEFORE any pack call — deleteStickerFromSet never runs
+        self.assertFalse([c for c in bot.calls
+                          if c[0] == "delete_sticker_from_set"],
+                         f"pack remove attempted: {bot.calls}")
 
-    async def test_own_pack_mtproto_off(self):
+    async def test_own_pack_removes_over_bot_api(self):
         msg = _Msg(text="/unkang", reply=_reply(sticker=_sticker()))
-        with _no_mtproto():
-            await call(sm.unkang_command, msg, bot=_FakeBot())
+        bot = _WorkingBot()
+        await call(sm.unkang_command, msg, bot=bot)
+
         self.assertIn("Removing", msg.replies[0]["text"])
         self.assertEqual(len(msg.replies), 1)
-        self.assertIn("MTProto", msg.prog.last["text"])
+        self.assertEqual(bot.deleted, ["STFILE"])
+        self.assertIn("removed successfully", msg.prog.last["text"].lower())
+        # no log-channel re-send / message deletion round trip
+        self.assertFalse([c for c in bot.calls
+                          if c[0] in ("send_sticker", "delete_message")])
 
 
 # ═════════════════════════════════════════════════════════════════

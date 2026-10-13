@@ -387,11 +387,30 @@ def table(rows: Sequence[Sequence[Dict[str, Any]]], *,
 
 
 def button(text, *, callback_data: Optional[str] = None,
-           url: Optional[str] = None, style: Optional[str] = None) -> Dict[str, Any]:
-    """A ``RichMessageButton`` (10.3): exactly one action field."""
+           url: Optional[str] = None, style: Optional[str] = None,
+           icon: Optional[str] = None) -> Dict[str, Any]:
+    """A ``RichMessageButton`` (10.3): exactly one action field.
+
+    ``text`` is a RichText — a plain string or a ready-made list of
+    entities.  ``icon`` takes an ``<tg-emoji emoji-id="…">`` tag (any
+    ``E.*`` constant) and prepends it as a ``RichTextCustomEmoji``:
+    Bot API 10.3 allows only plain text, custom emoji and datetime
+    entities inside a button label, so the premium emoji rides *in*
+    the label rather than an ``icon_custom_emoji_id`` field.
+    """
     if not callback_data and not url:
         raise ValueError("rich button needs callback_data or url")
-    node: Dict[str, Any] = {"text": text}
+    label: Any = text
+    if icon:
+        icon_node = icon_rich(icon)
+        if icon_node is not None:
+            rest: List[Any] = list(text) if isinstance(text, list) else [text]
+            if rest and isinstance(rest[0], str):
+                rest[0] = f" {rest[0]}" if rest[0] else " "
+            else:
+                rest.insert(0, " ")
+            label = [icon_node] + rest
+    node: Dict[str, Any] = {"text": label}
     if style in {"primary", "success", "danger", "link"}:
         node["style"] = style
     if url:

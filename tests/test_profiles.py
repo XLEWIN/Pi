@@ -355,6 +355,47 @@ class TestFetchTikTok(unittest.IsolatedAsyncioTestCase):
             prof = await pm._fetch_tiktok(client, "messi")
         self.assertEqual(prof["handle"], "@messi")
 
+    async def test_info_path_keeps_its_trailing_slash(self):
+        """tikwm's Cloudflare WAF challenges the exact path
+        ``/api/user/info`` and answers 200 JSON for ``/api/user/info/``.
+        Dropping the slash silently turns every lookup into an infinite
+        HTML-challenge retry, so pin it here."""
+        ok = _Resp(200, data={
+            "code": 0,
+            "data": {"user": {"uniqueId": "messi"},
+                     "stats": {"followerCount": 1}},
+        })
+        client = _StubClient([ok])
+        await pm._fetch_tiktok(client, "messi")
+        self.assertTrue(client.calls[0].endswith("/api/user/info/"),
+                        f"tikwm info URL lost its trailing slash: "
+                        f"{client.calls[0]!r}")
+
+    async def test_tikwm_invalid_unique_id_means_not_found(self):
+        """tikwm reports missing accounts as ``unique_id is invalid``,
+        not "not found" — that must map to ProfileError, not retries."""
+        nf = _Resp(200, data={"code": -1, "msg": "unique_id is invalid"})
+        client = _StubClient([nf])
+        with mock.patch.object(pm, "_RETRY_DELAY", 0):
+            with self.assertRaises(pm.ProfileError) as ctx:
+                await pm._fetch_tiktok(client, "ghost")
+        self.assertEqual(str(ctx.exception), "user not found")
+        self.assertEqual(len(client.calls), 1)
+
+    async def test_rate_limit_code_is_retried(self):
+        busy = _Resp(200, data={"code": -1,
+                                "msg": "Free Api Limit: 1 request/second."})
+        ok = _Resp(200, data={
+            "code": 0,
+            "data": {"user": {"uniqueId": "messi"},
+                     "stats": {"followerCount": 7}},
+        })
+        client = _StubClient([busy, ok])
+        with mock.patch.object(pm, "_RETRY_DELAY", 0):
+            prof = await pm._fetch_tiktok(client, "messi")
+        self.assertEqual(prof["handle"], "@messi")
+        self.assertEqual(len(client.calls), 2)
+
 
 class TestFetchX(unittest.IsolatedAsyncioTestCase):
     async def test_fxtwitter_wins_and_syndication_skipped(self):

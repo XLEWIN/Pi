@@ -434,13 +434,17 @@ async def _json(client: httpx.AsyncClient, url: str, **kwargs: Any) -> Dict[str,
 async def _fetch_tiktok(client: httpx.AsyncClient, user: str) -> Dict[str, Any]:
     """tikwm user/info with paced retries.
 
-    This is the host the media module already reaches from Railway.
-    www.tiktok.com's own /api/user/detail answers with an HTML app
-    shell (200) unless browser cookies are present, so it is useless
-    as a data source — rate-limit codes and flaky pages are retried
-    instead, then a friendly "busy" error is raised.
+    The path MUST keep its trailing slash: Cloudflare's WAF on tikwm
+    serves a "Just a moment..." challenge for the exact path
+    ``/api/user/info`` (every UA, every TLS fingerprint, GET and POST)
+    while ``/api/user/info/`` answers 200 JSON — verified live.  The
+    media module already reaches this host for video downloads, so this
+    is the one source that works from servers with no browser at all.
+
+    Free tier is 1 request/second, so rate-limit codes are paged and
+    retried, then a friendly "busy" error is raised.
     """
-    url = "https://www.tikwm.com/api/user/info"
+    url = "https://www.tikwm.com/api/user/info/"
     headers = {"Referer": "https://www.tikwm.com/", "Accept": "application/json"}
     timeout = httpx.Timeout(5.0, connect=4.0)
     for attempt in range(3):
@@ -462,7 +466,8 @@ async def _fetch_tiktok(client: httpx.AsyncClient, user: str) -> Dict[str, Any]:
         if data.get("code") == 0:
             return _parse_tikwm(data)
         msg = str(data.get("msg") or "").lower()
-        if "not found" in msg or "exist" in msg:
+        if ("not found" in msg or "exist" in msg
+                or "invalid" in msg or "does not" in msg):
             raise ProfileError("user not found")
         # any other non-zero code = busy / rate limit → pace and retry
     raise ProfileError("TikTok is not responding right now — try again "
